@@ -136,6 +136,45 @@ function transformToolMessage(message: Extract<LanguageModelV3Message, { role: "
   });
 }
 
+function normalizeToolExchanges(messages: QoderMessage[]): QoderMessage[] {
+  const normalized: QoderMessage[] = [];
+  let pendingToolCallIDs: string[] = [];
+  let fallbackID = 0;
+
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      pendingToolCallIDs = [];
+      if (!message.tool_calls?.length) {
+        normalized.push(message);
+        continue;
+      }
+
+      const toolCalls = message.tool_calls.map((toolCall) => {
+        const id = toolCall.id?.trim() || `call_qoder_${fallbackID++}`;
+        pendingToolCallIDs.push(id);
+        return id === toolCall.id ? toolCall : { ...toolCall, id };
+      });
+      normalized.push({ ...message, tool_calls: toolCalls });
+      continue;
+    }
+
+    if (message.role === "tool") {
+      const id = message.tool_call_id?.trim();
+      const matchIndex = id ? pendingToolCallIDs.indexOf(id) : pendingToolCallIDs.length > 0 ? 0 : -1;
+      if (matchIndex === -1) continue;
+
+      const [matchedID] = pendingToolCallIDs.splice(matchIndex, 1);
+      normalized.push(matchedID === message.tool_call_id ? message : { ...message, tool_call_id: matchedID });
+      continue;
+    }
+
+    pendingToolCallIDs = [];
+    normalized.push(message);
+  }
+
+  return normalized;
+}
+
 export function transformPrompt(prompt: LanguageModelV3Prompt): TransformedPrompt {
   const system: string[] = [];
   const messages: QoderMessage[] = [];
@@ -156,14 +195,15 @@ export function transformPrompt(prompt: LanguageModelV3Prompt): TransformedPromp
     if (message.role === "tool") messages.push(...transformToolMessage(message));
   }
 
+  const normalizedMessages = normalizeToolExchanges(messages);
   let lastUserText = "";
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role !== "user") continue;
-    lastUserText = textFromContent(messages[i].content);
+  for (let i = normalizedMessages.length - 1; i >= 0; i--) {
+    if (normalizedMessages[i].role !== "user") continue;
+    lastUserText = textFromContent(normalizedMessages[i].content);
     break;
   }
 
-  return { system: system.join("\n\n"), messages, lastUserText };
+  return { system: system.join("\n\n"), messages: normalizedMessages, lastUserText };
 }
 
 export function transformTools(tools: LanguageModelV3CallOptions["tools"]): { tools: QoderTool[]; ignoredTools: number } {

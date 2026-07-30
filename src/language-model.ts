@@ -525,7 +525,7 @@ export class QoderLanguageModel implements LanguageModelV3 {
                       started: false,
                       finished: false,
                     });
-                  if (toolCallDelta.id) state.id = toolCallDelta.id;
+                  if (toolCallDelta.id && !state.started) state.id = toolCallDelta.id;
                   if (toolCallDelta.function?.name) state.name = toolCallDelta.function.name;
                   if (!state.started && state.name) {
                     state.started = true;
