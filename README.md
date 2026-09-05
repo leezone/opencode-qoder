@@ -29,11 +29,13 @@ The plugin registers provider `qoder` and bundles these models: `auto`, `ultimat
 
 ## Model discovery
 
-The live model list is fetched at startup and refreshed every 15 minutes; when it changes, opencode's catalog reloads automatically. The last live list is cached at `~/.cache/opencode/opencode-qoder-models.json` across restarts. The bundled table is the fallback.
+The live model list is fetched at startup and refreshed every 15 minutes; when it changes, opencode's catalog reloads automatically. The last live list is cached at `~/.cache/opencode/opencode-qoder-models.json` across restarts. If both live and cache are unavailable, a static fallback table is used.
+
+The static fallback is a prefab JSON file shipped as `models.json` next to the plugin code, holding the current advertised models only. To edit it for a special case, drop your own copy at `~/.config/opencode/qoder-models.json` (honors `XDG_CONFIG_HOME`), or point `QODER_STATIC_MODELS` at any path. Precedence is env → user file → shipped file. Each is a JSON array (or `{"models": [...]}`) of entries with `id`, `name`, `reasoning`, `supportsEffort`, `input`, `contextWindow`, `maxTokens` (and optional `inputWindow` ≤ `contextWindow`); invalid entries are dropped individually so one typo never blanks the table. The live list is authoritative: models it stops advertising are hidden even when offline, so a manually added id shows up only in the fallback path, never overriding a live answer.
 
 Models advertising reasoning effort levels expose one variant per effort (e.g. `high`, `low`, `max` on `kmodel_latest`), selectable in opencode's model picker.
 
-Model names carry Qoder's credit multiplier, e.g. `(0.5x)`. Once credits run out, paid models gain an `Unavailable` suffix (e.g. `(0.5x, Unavailable)`) but stay selectable; zero-multiplier models are exempt. Both come from the live list, so neither appears while the bundled fallback is in use.
+Model names carry Qoder's credit multiplier, e.g. `(0.5x)`. Once credits run out, paid models gain an `Unavailable` suffix (e.g. `(0.5x, Unavailable)`) but stay selectable; zero-multiplier models are exempt. Both come from the live list, so neither appears while the static fallback is in use.
 
 | Variable | Purpose |
 | --- | --- |
@@ -41,6 +43,7 @@ Model names carry Qoder's credit multiplier, e.g. `(0.5x)`. Once credits run out
 | `QODER_MODEL_LIST_URL` | Override the model list endpoint |
 | `QODER_MODEL_CACHE_SECONDS` | Catalog TTL in seconds (default: 3600) |
 | `QODER_MODEL_DISK_CACHE` | Override the disk cache path |
+| `QODER_STATIC_MODELS` | Path to a custom static fallback table (JSON) |
 | `OPENCODE_QODER_LOG_FILE` | Append diagnostics (credit quota, catalog refreshes) to this path. Unset by default, which logs nothing |
 
 ## Authenticate

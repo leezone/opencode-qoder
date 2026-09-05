@@ -72,7 +72,6 @@ type ContextTier = { token_count?: unknown; is_default?: unknown };
 type ThinkingConfig = { enabled?: { efforts?: Record<string, unknown> } };
 
 let liveModels: DiscoveredModel[] = [];
-const disabledIDs = new Set<string>();
 let fetchedAt = 0;
 let expiresAt = 0;
 let source: CatalogStatus["source"] = "fallback";
@@ -254,11 +253,7 @@ function modelFromEntry(entry: CatalogEntry): DiscoveredModel | undefined {
   const id = pickString(entry, ["key", "id", "model"]);
   if (!id) return undefined;
   const enabled = pickBool(entry, ["enable", "enabled"]);
-  if (enabled === false) {
-    disabledIDs.add(id);
-    return undefined;
-  }
-  disabledIDs.delete(id);
+  if (enabled === false) return undefined;
   const isVL = pickBool(entry, ["is_vl", "isVL"]) ?? false;
   const declaredInput = pickInt(entry, 0, ["max_input_tokens", "context_window", "contextWindow"]);
   const tierTokens = defaultTierTokens(entry);
@@ -586,20 +581,16 @@ export async function refreshModels(
 
 // The table index.ts registers into opencode's catalog.
 //
-// Models that vanished upstream are kept (after the live ones) so a session
-// already running on one does not lose it mid-conversation, and so a
-// `model: qoder/<id>` pinned in someone's config keeps resolving.
+// The live list is authoritative: a model it no longer advertises is not
+// resurrected from the bundled table, so the picker never offers anything the
+// vendor itself stopped listing. (The two ids this used to keep alive --
+// qmodel_preview, gm51model -- still route, verified 2026-09-05, but they carry
+// no price_factor and only invited selection of a retired model. Anyone who
+// pinned one falls through getModelDefinition() to the default model.)
 //
-// "Vanished" means absent from the list response entirely -- a distinct state
-// from present-but-disabled, which modelFromEntry() records in disabledIDs and
-// which is NOT resurrected below.
-//
-// Absence is not retirement. Verified 2026-09-05 by running a real request
-// through each bundled-only id (qmodel_preview, gm51model): both completed
-// successfully, so the gateway still routes them. They render without a
-// multiplier because the annotation comes from price_factor, which only the live
-// list supplies -- and inventing one for a dead id is exactly the mistake the
-// note in constants.ts warns against.
+// The bundled table still shows whole while discovery is offline (source=
+// "fallback"), which is its job: something usable when there is no live data at
+// all.
 export function catalogModels(): DiscoveredModel[] {
   // "cache" (seeded from disk) must be honoured exactly like "qoder"; checking
   // only for "qoder" here would make the persisted snapshot dead weight and drop
@@ -607,11 +598,7 @@ export function catalogModels(): DiscoveredModel[] {
   if ((source !== "qoder" && source !== "cache") || liveModels.length === 0) {
     return QODER_MODELS.map(normalizeStatic);
   }
-  const seen = new Set(liveModels.map((model) => model.id));
-  const legacy = QODER_MODELS.filter(
-    (model) => !seen.has(model.id) && !disabledIDs.has(model.id),
-  ).map(normalizeStatic);
-  return [...liveModels, ...legacy];
+  return liveModels;
 }
 
 // Go: GetModelDefinition() -- live, then the bundled table, then a sane default.
