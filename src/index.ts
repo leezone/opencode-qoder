@@ -23,6 +23,7 @@ import {
   catalogSignature,
   type DiscoveredModel,
   discoveryDisabled,
+  displayName,
   refreshModels,
 } from "./model-catalog.js";
 
@@ -54,7 +55,9 @@ function shouldSetDefault(options?: PluginOptions): boolean {
 
 function legacyModelConfig(model: DiscoveredModel) {
   const config: Record<string, unknown> = {
-    name: model.name,
+    // Carries the credit multiplier and the exhausted marker -- see
+    // displayName(), which explains why it cannot be a description field.
+    name: displayName(model),
     reasoning: model.reasoning,
     tool_call: true,
     attachment: model.input.includes("image"),
@@ -143,7 +146,9 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
 
 function v2ModelConfig(model: DiscoveredModel) {
   return {
-    name: model.name,
+    // ConfigV2.Model has no description field either, so the annotation rides
+    // on name exactly as in the legacy path.
+    name: displayName(model),
     family: model.id,
     api: {
       id: model.id,

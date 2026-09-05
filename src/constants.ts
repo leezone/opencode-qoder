@@ -7,6 +7,7 @@ export const QODER_CENTER_URL = "https://center.qoder.sh";
 export const QODER_MANAGE_URL = "https://qoder.com";
 
 export const QODER_MODEL_LIST_URL = `${QODER_BASE_URL}algo/api/v2/model/list`;
+export const QODER_QUOTA_URL = `${QODER_OPENAPI_URL}/api/v2/quota/usage`;
 export const QODER_CHAT_URL = `${QODER_BASE_URL}algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
 export const QODER_EXCHANGE_URL = `${QODER_OPENAPI_URL}/api/v1/jobToken/exchange`;
 export const QODER_USERINFO_URL = `${QODER_OPENAPI_URL}/api/v1/userinfo`;
@@ -44,6 +45,16 @@ export type QoderModelDefinition = {
   // bundled entries; discovery fills it from max_input_tokens / context_config.
   inputWindow?: number;
   maxTokens: number;
+  // Credit multiplier Qoder bills for this model (qodercli: `price_factor`).
+  // Rendered into the model name as "(0.5x)" -- see displayName() in
+  // model-catalog.ts for why it cannot be a description field. Absent on the
+  // bundled table: promotions move it, so only live discovery reports it.
+  priceFactor?: number;
+  // Free-of-charge flag (`is_free`): keeps a model usable once credits run out.
+  isFree?: boolean;
+  // Upstream labels, e.g. ["limited_time_free"] which qodercli renders as "Free"
+  // instead of the credit multiplier.
+  tags?: string[];
 };
 
 export const QODER_MODELS: QoderModelDefinition[] = [

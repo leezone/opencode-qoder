@@ -97,4 +97,40 @@ describe("parseCatalog", () => {
     });
     expect(models.map((model) => model.id)).not.toContain("lite");
   });
+
+  it("carries the billing metadata the display name is built from", () => {
+    const models = parseCatalog({
+      chat: [
+        {
+          key: "kmodel_latest",
+          max_input_tokens: 180000,
+          price_factor: 0.5,
+          is_free: false,
+          tags: ["limited_time_free", ""],
+        },
+      ],
+    });
+    const model = models.find((entry) => entry.id === "kmodel_latest")!;
+    expect(model.priceFactor).toBe(0.5);
+    expect(model.isFree).toBe(false);
+    // Empty tags are dropped so they cannot render as a blank token.
+    expect(model.tags).toEqual(["limited_time_free"]);
+  });
+
+  it("accepts the camelCase spelling of the same fields", () => {
+    const models = parseCatalog({
+      chat: [{ key: "kmodel_latest", max_input_tokens: 180000, priceFactor: 2, isFree: true }],
+    });
+    const model = models.find((entry) => entry.id === "kmodel_latest")!;
+    expect(model.priceFactor).toBe(2);
+    expect(model.isFree).toBe(true);
+  });
+
+  it("leaves billing metadata absent rather than inventing a multiplier", () => {
+    const models = parseCatalog({ chat: [{ key: "kmodel_latest", max_input_tokens: 180000 }] });
+    const model = models.find((entry) => entry.id === "kmodel_latest")!;
+    // A guessed 1 would bill-display a multiplier Qoder never advertised.
+    expect(model.priceFactor).toBeUndefined();
+    expect(model.tags).toBeUndefined();
+  });
 });

@@ -5,6 +5,7 @@ import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
 import {
   QODER_MODEL_LIST_URL,
   QODER_MODELS,
+  QODER_QUOTA_URL,
   type QoderModelDefinition,
   USER_AGENT,
 } from "./constants.js";
@@ -207,6 +208,24 @@ function pickInt(entry: CatalogEntry, fallback: number, keys: string[]): number 
   return fallback;
 }
 
+// Fractional variant of pickInt for credit multipliers. pickInt floors, which
+// would collapse a 0.5x model to 0 and render it free. No magnitude guard here:
+// a factor is a small ratio, and clamping it would hide an upstream change.
+function pickNumber(entry: CatalogEntry, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = entry[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  }
+  return undefined;
+}
+
+function pickTags(entry: CatalogEntry): string[] | undefined {
+  const value = entry.tags;
+  if (!Array.isArray(value)) return undefined;
+  const tags = value.filter((tag): tag is string => typeof tag === "string" && tag !== "");
+  return tags.length > 0 ? tags : undefined;
+}
+
 // Qoder advertises several selectable context tiers per model, e.g.
 //   context_config: { "1M": {token_count: 1000000},
 //                     "200K": {token_count: 200000, is_default: true},
@@ -273,6 +292,9 @@ function modelFromEntry(entry: CatalogEntry): DiscoveredModel | undefined {
     maxTokens: pickInt(entry, DEFAULT_MAX_TOKENS, ["max_output_tokens", "max_tokens", "maxTokens"]),
     source: pickString(entry, ["source"]) || "system",
     origin: "qoder",
+    priceFactor: pickNumber(entry, ["price_factor", "priceFactor"]),
+    isFree: pickBool(entry, ["is_free", "isFree"]),
+    tags: pickTags(entry),
     // True only when at least one token budget came from a field we actually
     // recognise. parseCatalog() uses this to detect an upstream schema change:
     // ids would still parse, but every limit would silently fall back to
@@ -327,6 +349,114 @@ export function parseCatalog(payload: unknown): DiscoveredModel[] {
   return models;
 }
 
+// --- Credit quota -----------------------------------------------------------
+//
+// qodercli: getQuotaUsage() + OsA()/R7(). Plain Bearer auth -- unlike the model
+// list, this endpoint needs no COSY signing.
+
+let quotaExhausted = false;
+
+function bucketRemaining(usage: Record<string, unknown>, keys: string[]): number {
+  for (const key of keys) {
+    const bucket = usage[key];
+    if (bucket && typeof bucket === "object") {
+      const remaining = Number((bucket as Record<string, unknown>).remaining);
+      if (Number.isFinite(remaining)) return remaining;
+    }
+  }
+  return 0;
+}
+
+// qodercli: OsA(usage) -- the exceeded flag, or every bucket drained. The flag
+// falls back to total_usage_percentage >= 100 only when it is absent.
+export function isQuotaExhausted(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const usage = payload as Record<string, unknown>;
+  // normalizeQuotaUsage() rejects a response without user_id AND user_type.
+  // Skipping this guard would read a malformed or empty payload as "0
+  // remaining" and mark every paid model unavailable.
+  const userID = usage.user_id ?? usage.userId;
+  const userType = usage.user_type ?? usage.userType;
+  if (typeof userID !== "string" || userID === "" || typeof userType !== "string" || !userType) {
+    return false;
+  }
+  const flag = usage.is_quota_exceeded ?? usage.isQuotaExceeded;
+  const percentage = Number(usage.total_usage_percentage ?? usage.totalUsagePercentage);
+  const exceeded =
+    typeof flag === "boolean" ? flag : Number.isFinite(percentage) && percentage >= 100;
+  const remaining =
+    bucketRemaining(usage, ["user_quota", "userQuota"]) +
+    bucketRemaining(usage, ["add_on_quota", "addOnQuota"]) +
+    bucketRemaining(usage, [
+      "org_resource_package",
+      "orgResourcePackage",
+      "shared_quota",
+      "sharedQuota",
+    ]);
+  return exceeded || remaining <= 0;
+}
+
+// Fails open: an unreachable quota endpoint must not paint the whole catalog
+// unavailable. qodercli's vEu() returns false on error too.
+async function fetchQuotaExhausted(options: QoderProviderOptions): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const credentials = await resolveQoderCredentials(options);
+    const response = await fetch(QODER_QUOTA_URL, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": USER_AGENT,
+        Authorization: `Bearer ${credentials.access}`,
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) return false;
+    return isQuotaExhausted(await response.json());
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// --- Display name -----------------------------------------------------------
+
+// A model stays billable when credits run out if it costs nothing: an explicit
+// free flag, the limited_time_free tag, or a zero multiplier.
+function isFreeTier(model: DiscoveredModel): boolean {
+  return (
+    model.isFree === true ||
+    model.priceFactor === 0 ||
+    Boolean(model.tags?.includes("limited_time_free"))
+  );
+}
+
+// 0.5 rather than qodercli's 0.50 -- the picker has room for the compact form,
+// and Number() drops the trailing zeros toFixed() pads.
+function formatFactor(factor: number): string {
+  return `${Number(factor.toFixed(2))}x`;
+}
+
+// opencode has no per-model description field: Schema.Struct drops unknown keys,
+// verified with `opencode debug config` -- a `description` written by the config
+// hook does not reach the resolved config. `name` is the only string the model
+// picker renders, so the annotation rides there, the way opencode itself derives
+// its "(latest)" marker from the name.
+//
+// Credits drained: paid models are suffixed, NOT disabled. `disabled` does not
+// exist on the v1 model schema and `status: "deprecated"` filters the model out
+// of the list entirely; a suffix keeps it selectable so an in-flight session
+// holds its model and the gateway returns the real billing error.
+export function displayName(model: DiscoveredModel): string {
+  const parts: string[] = [];
+  // qodercli's W_l() precedence: the limited_time_free tag outranks the number.
+  if (model.tags?.includes("limited_time_free")) parts.push("Free");
+  else if (typeof model.priceFactor === "number") parts.push(formatFactor(model.priceFactor));
+  if (quotaExhausted && !isFreeTier(model)) parts.push("Unavailable");
+  return parts.length > 0 ? `${model.name} (${parts.join(", ")})` : model.name;
+}
+
 // Go: fetchLiveQoderModels()
 async function fetchModels(options: QoderProviderOptions): Promise<DiscoveredModel[]> {
   const credentials = await resolveQoderCredentials(options);
@@ -376,6 +506,10 @@ export async function refreshModels(
   if (!force && Date.now() < expiresAt) return catalogStatus();
   if (inflight) return inflight;
   inflight = (async () => {
+    // Quota rides along with the model list on the same cadence. Started before
+    // the await so both requests overlap, and awaited after the try/catch so a
+    // model-list failure cannot strand the quota result (and vice versa).
+    const quota = fetchQuotaExhausted(options);
     try {
       const models = await fetchModels(options);
       liveModels = models;
@@ -395,6 +529,7 @@ export async function refreshModels(
     } finally {
       inflight = undefined;
     }
+    quotaExhausted = await quota;
     return catalogStatus();
   })();
   return inflight;
@@ -442,6 +577,11 @@ export function catalogSignature(): string {
         model.reasoning,
         model.supportsEffort,
         model.input.join("+"),
+        // The inputs behind displayName()'s annotation -- name is already signed
+        // above, so signing the rendered string too would just repeat it.
+        model.priceFactor ?? "",
+        model.tags?.join(",") ?? "",
+        quotaExhausted,
       ].join(":"),
     )
     .join("|");
