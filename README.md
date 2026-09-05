@@ -33,7 +33,7 @@ The live model list is fetched at startup and refreshed every 15 minutes; when i
 
 Models advertising reasoning effort levels expose one variant per effort (e.g. `high`, `low`, `max` on `kmodel_latest`), selectable in opencode's model picker.
 
-Model names carry Qoder's credit multiplier, e.g. `(0.5x)`, or `(Free)` during a limited-time promotion. Once credits run out, paid models are marked `Unavailable` but stay selectable; free and zero-multiplier models are not. Both come from the live list, so neither appears while the bundled fallback is in use.
+Model names carry Qoder's credit multiplier, e.g. `(0.5x)`. Once credits run out, paid models gain an `Unavailable` suffix (e.g. `(0.5x, Unavailable)`) but stay selectable; zero-multiplier models are exempt. Both come from the live list, so neither appears while the bundled fallback is in use.
 
 | Variable | Purpose |
 | --- | --- |
@@ -41,6 +41,7 @@ Model names carry Qoder's credit multiplier, e.g. `(0.5x)`, or `(Free)` during a
 | `QODER_MODEL_LIST_URL` | Override the model list endpoint |
 | `QODER_MODEL_CACHE_SECONDS` | Catalog TTL in seconds (default: 3600) |
 | `QODER_MODEL_DISK_CACHE` | Override the disk cache path |
+| `OPENCODE_QODER_LOG_FILE` | Append diagnostics (credit quota, catalog refreshes) to this path. Unset by default, which logs nothing |
 
 ## Authenticate
 

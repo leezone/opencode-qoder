@@ -18,9 +18,11 @@ import {
 } from "./constants.js";
 import { getMachineId } from "./cosy.js";
 import { createQoder, QoderLanguageModel } from "./language-model.js";
+import { logPlugin } from "./log.js";
 import {
   catalogModels,
   catalogSignature,
+  catalogStatus,
   type DiscoveredModel,
   discoveryDisabled,
   displayName,
@@ -37,6 +39,31 @@ type QoderPluginOptions = PluginOptions & {
 
 const REFRESH_INTERVAL_MS = 15 * 60 * 1000;
 
+// Emitted from both registration paths, so the log shows where the names came
+// from whichever opencode version is driving. `source` is the field that
+// distinguishes a bundled fallback -- where no name carries a multiplier,
+// because the static table has no priceFactor -- from live or cached data.
+function logCatalogRegistration(path: "legacy" | "v2"): void {
+  const status = catalogStatus();
+  // pid tells whether the legacy and v2 hooks share a process -- if they do not,
+  // anything captured in one is invisible to the other.
+  logPlugin(
+    `catalog[${path}]: pid=${process.pid} registered ${status.total} models ` +
+      `(source=${status.source}, live=${status.live})`,
+  );
+}
+
+// Describes a credential without ever printing it. A log file is no place for a
+// PAT, but the shape is exactly what tells an unresolved `{file:...}` reference
+// apart from a real token, or from the option not reaching the plugin at all.
+function tokenShape(value: unknown): string {
+  if (typeof value !== "string" || value === "") return "absent";
+  if (value.startsWith("{file:")) return "file-ref";
+  if (value.startsWith("{env:")) return "env-ref";
+  if (value.startsWith("pt-")) return "pat";
+  return `opaque(${value.length})`;
+}
+
 function optionString(
   options: PluginOptions | undefined,
   key: keyof QoderPluginOptions,
@@ -44,6 +71,54 @@ function optionString(
   const value = options?.[key];
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
+
+// Credential channel between the two module instances of this plugin.
+//
+// opencode loads this file twice in one process: once for the legacy config
+// hooks, once for the v2 catalog hooks. Established by logging a per-instance
+// id alongside the pid -- same pid, different instance ids, and neither can
+// read the other's module state. A module-level `configuredApiKey` therefore
+// cannot work: the instance that sees the credential is not the instance that
+// runs discovery.
+//
+// They do share a realm, so globalThis is the one channel available. It carries
+// the token from the legacy config hook (which sees the user's provider options
+// already resolved from `{file:...}`) to discoveryOptions (whose ctx.options is
+// empty and whose ctx exposes no config or provider key).
+//
+// The value stays in process memory: never written to disk, never logged --
+// logPlugin only ever receives tokenShape() of it. The same token already lives
+// in this realm inside opencode's own config object, so this does not widen
+// exposure; the fixed key is a collision risk, not a leak.
+const CREDENTIAL_KEY = "__opencode_qoder_api_key";
+
+function sharedState(): Record<string, unknown> {
+  return globalThis as unknown as Record<string, unknown>;
+}
+
+function readSharedApiKey(): string | undefined {
+  const value = sharedState()[CREDENTIAL_KEY];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+// First writer wins: a later hook invocation must not replace a working token
+// with an empty one, and an unresolved `{file:...}` reference must not overwrite
+// a real token either.
+function writeSharedApiKey(apiKey: string): boolean {
+  if (readSharedApiKey() !== undefined) return false;
+  sharedState()[CREDENTIAL_KEY] = apiKey;
+  return true;
+}
+
+// Wired by setupV2 once refreshCatalog() exists, and invoked when a credential
+// first becomes available -- so discovery starts immediately rather than waiting
+// out the next 15-minute tick. Deferred rather than called directly because the
+// capture site is registered before refreshCatalog is defined, and a closure
+// over a not-yet-initialised const would throw.
+let onCredentialsCaptured: (() => void) | undefined;
+
+// Per instance, so the aisdk handler reports once rather than once per request.
+let aisdkHandlerLogged = false;
 
 function providerID(options?: PluginOptions): string {
   return optionString(options, "providerID") || PROVIDER_ID;
@@ -129,9 +204,31 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   current.env ??= [...QODER_PAT_ENV];
   current.npm ??= import.meta.url;
   current.options ??= {};
+  // Pristine state, before this hook adds baseURL. The user's provider options
+  // ARE visible here, and apiKey arrives already resolved from `{file:...}` into
+  // a usable token -- this is the only place in the whole plugin that sees it.
+  logPlugin(
+    `legacy: pid=${process.pid} providerOptions=${JSON.stringify(Object.keys(current.options))} ` +
+      `apiKey=${tokenShape(current.options.apiKey)}`,
+  );
   current.options.baseURL ??= QODER_BASE_URL;
   const apiKey = optionString(options, "apiKey");
   if (apiKey && current.options.apiKey === undefined) current.options.apiKey = apiKey;
+  // Captured after the assignment above so either source -- plugin options or
+  // the user's provider config -- is picked up, then handed across to the v2
+  // instance over globalThis, since module state does not reach it.
+  {
+    const configured = optionString(current.options, "apiKey");
+    if (configured && writeSharedApiKey(configured)) {
+      logPlugin(`legacy: published apiKey (${tokenShape(configured)}) for discovery`);
+      // opencode substitutes `{file:...}` before this hook runs. If a future
+      // version hands over the raw reference, discovery would send it as a
+      // bearer token and fail; say so rather than leaving a 401 to be guessed at.
+      if (configured.startsWith("{")) {
+        logPlugin("legacy: published apiKey is an unresolved reference, not a token");
+      }
+    }
+  }
   current.models ??= {};
 
   for (const model of catalogModels()) {
@@ -142,6 +239,7 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   }
 
   if (shouldSetDefault(options) && !cfg.model) cfg.model = `${id}/auto`;
+  logCatalogRegistration("legacy");
 }
 
 function v2ModelConfig(model: DiscoveredModel) {
@@ -238,6 +336,13 @@ async function authOptionsFromV2Connection(
 
 async function setupV2(ctx: PluginContext): Promise<void> {
   const id = providerID(ctx.options);
+  // Key names only. Records what this instance can see for itself -- ctx.options
+  // is empty and ctx exposes no config or provider key, which is why the
+  // credential has to arrive over the shared channel instead.
+  logPlugin(
+    `setup[v2]: pid=${process.pid} optionsKeys=${JSON.stringify(Object.keys(ctx.options ?? {}))} ` +
+      `sharedApiKey=${tokenShape(readSharedApiKey())}`,
+  );
   await ctx.integration.transform((integrations) => {
     integrations.update(id, (integration) => {
       integration.name = PROVIDER_NAME;
@@ -275,15 +380,45 @@ async function setupV2(ctx: PluginContext): Promise<void> {
 
     if (shouldSetDefault(ctx.options)) catalog.model.default.set(id, "auto");
   });
+  logCatalogRegistration("v2");
 
   await ctx.aisdk.language(async (event) => {
+    // Once per instance, not per request. Whether this handler is invoked at all
+    // is worth knowing -- on current opencode it never is, and requests are
+    // authenticated by opencode's own provider path instead -- but logging every
+    // request would bury the lines that matter.
+    if (!aisdkHandlerLogged) {
+      aisdkHandlerLogged = true;
+      logPlugin(
+        `aisdk: pid=${process.pid} handler invoked providerID=${event.model.providerID} ` +
+          `modelID=${String(event.model.api?.id ?? "?")} optionsApiKey=${tokenShape(event.options?.apiKey)}`,
+      );
+    }
     if (event.model.providerID !== id) return;
-    const connectionOptions = await authOptionsFromV2Connection(ctx, id);
+    // Was a bare await, so a rejection here killed the handler silently and
+    // opencode authenticated by its own path -- leaving no trace of why
+    // discovery never saw a credential.
+    const connectionOptions = await authOptionsFromV2Connection(ctx, id).catch((error) => {
+      logPlugin(
+        `aisdk: connection lookup failed (${error instanceof Error ? error.message : String(error)})`,
+      );
+      return {} as QoderProviderOptions;
+    });
+    const apiKey =
+      connectionOptions.apiKey || optionString(ctx.options, "apiKey") || event.options.apiKey;
+    // Second capture point, and a fallback rather than the working path: on
+    // current opencode this handler is never invoked at all (verified -- zero
+    // aisdk log lines across a completed request), so the credential normally
+    // arrives from the legacy config hook. Kept because an opencode version that
+    // does route requests through here would otherwise leave discovery blind.
+    if (typeof apiKey === "string" && apiKey.length > 0 && writeSharedApiKey(apiKey)) {
+      logPlugin(`aisdk: published apiKey (${tokenShape(apiKey)}) for discovery`);
+      onCredentialsCaptured?.();
+    }
     event.language = new QoderLanguageModel(String(event.model.api.id), {
       ...event.options,
       ...connectionOptions,
-      apiKey:
-        connectionOptions.apiKey || optionString(ctx.options, "apiKey") || event.options.apiKey,
+      apiKey,
     });
   });
 
@@ -297,24 +432,54 @@ async function setupV2(ctx: PluginContext): Promise<void> {
     const connection = await authOptionsFromV2Connection(ctx, id).catch(
       () => ({}) as QoderProviderOptions,
     );
-    return {
+    const resolved = {
       ...ctx.options,
       ...connection,
-      apiKey: connection.apiKey || optionString(ctx.options, "apiKey"),
+      // Order matters: an explicit connection (from `/connect qoder`) beats the
+      // plugin's own options, which beat the credential published by the legacy
+      // config hook. resolveQoderCredentials() still falls back to the
+      // QODER_PERSONAL_ACCESS_TOKEN env var after all of these.
+      apiKey: connection.apiKey || optionString(ctx.options, "apiKey") || readSharedApiKey(),
     };
+    // Shapes and key names only -- the values here can be a PAT. This is what
+    // distinguishes "discovery ran with no credentials" from "discovery ran and
+    // the endpoint refused", which otherwise look identical from the outside:
+    // both leave the catalog on the bundled fallback.
+    logPlugin(
+      `discovery: ctxOptions=${JSON.stringify(Object.keys(ctx.options ?? {}))} ` +
+        `connection=${JSON.stringify(Object.keys(connection))} ` +
+        `apiKey=${tokenShape(resolved.apiKey)}`,
+    );
+    return resolved;
   };
   const refreshCatalog = async (force: boolean): Promise<void> => {
     const before = catalogSignature();
     const status = await refreshModels(await discoveryOptions(), force);
     if (status.source !== "qoder" || catalogSignature() === before) return;
-    if (typeof ctx.catalog.reload === "function") await ctx.catalog.reload();
+    if (typeof ctx.catalog.reload === "function") {
+      // Fires exactly when a rendered name changed -- a new model, an edited
+      // multiplier, or the Unavailable suffix appearing/disappearing, since
+      // catalogSignature() signs quotaExhausted.
+      logPlugin("catalog: changed -- reloading opencode's model list");
+      await ctx.catalog.reload();
+    }
+  };
+  // A swallowed rejection here is how discovery ends up silently stuck on the
+  // bundled table, so both timers report instead of discarding.
+  const logRefreshFailure = (error: unknown): void => {
+    logPlugin(`refresh: failed (${error instanceof Error ? error.message : String(error)})`);
+  };
+  // Armed only now: the aisdk handler above is registered before refreshCatalog
+  // exists, so it fires this trigger rather than calling refreshCatalog directly.
+  onCredentialsCaptured = () => {
+    refreshCatalog(true).catch(logRefreshFailure);
   };
   const warm = setTimeout(() => {
-    refreshCatalog(true).catch(() => {});
+    refreshCatalog(true).catch(logRefreshFailure);
   }, 0);
   warm.unref?.();
   const timer = setInterval(() => {
-    refreshCatalog(false).catch(() => {});
+    refreshCatalog(false).catch(logRefreshFailure);
   }, REFRESH_INTERVAL_MS);
   timer.unref?.();
 }

@@ -10,6 +10,7 @@ import {
   USER_AGENT,
 } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
+import { logPlugin } from "./log.js";
 
 // Dynamic model discovery for Qoder.
 //
@@ -219,13 +220,6 @@ function pickNumber(entry: CatalogEntry, keys: string[]): number | undefined {
   return undefined;
 }
 
-function pickTags(entry: CatalogEntry): string[] | undefined {
-  const value = entry.tags;
-  if (!Array.isArray(value)) return undefined;
-  const tags = value.filter((tag): tag is string => typeof tag === "string" && tag !== "");
-  return tags.length > 0 ? tags : undefined;
-}
-
 // Qoder advertises several selectable context tiers per model, e.g.
 //   context_config: { "1M": {token_count: 1000000},
 //                     "200K": {token_count: 200000, is_default: true},
@@ -293,8 +287,6 @@ function modelFromEntry(entry: CatalogEntry): DiscoveredModel | undefined {
     source: pickString(entry, ["source"]) || "system",
     origin: "qoder",
     priceFactor: pickNumber(entry, ["price_factor", "priceFactor"]),
-    isFree: pickBool(entry, ["is_free", "isFree"]),
-    tags: pickTags(entry),
     // True only when at least one token budget came from a field we actually
     // recognise. parseCatalog() uses this to detect an upstream schema change:
     // ids would still parse, but every limit would silently fall back to
@@ -367,8 +359,7 @@ function bucketRemaining(usage: Record<string, unknown>, keys: string[]): number
   return 0;
 }
 
-// qodercli: OsA(usage) -- the exceeded flag, or every bucket drained. The flag
-// falls back to total_usage_percentage >= 100 only when it is absent.
+// qodercli: OsA(usage) -- the exceeded flag, or every bucket drained.
 export function isQuotaExhausted(payload: unknown): boolean {
   if (!payload || typeof payload !== "object") return false;
   const usage = payload as Record<string, unknown>;
@@ -381,9 +372,6 @@ export function isQuotaExhausted(payload: unknown): boolean {
     return false;
   }
   const flag = usage.is_quota_exceeded ?? usage.isQuotaExceeded;
-  const percentage = Number(usage.total_usage_percentage ?? usage.totalUsagePercentage);
-  const exceeded =
-    typeof flag === "boolean" ? flag : Number.isFinite(percentage) && percentage >= 100;
   const remaining =
     bucketRemaining(usage, ["user_quota", "userQuota"]) +
     bucketRemaining(usage, ["add_on_quota", "addOnQuota"]) +
@@ -393,7 +381,50 @@ export function isQuotaExhausted(payload: unknown): boolean {
       "shared_quota",
       "sharedQuota",
     ]);
-  return exceeded || remaining <= 0;
+  // total_usage_percentage is deliberately NOT consulted, though qodercli falls
+  // back to it. The live endpoint returns it as a fraction (1 == 100%), and it
+  // measures the plan quota alone: observed with userQuota at 3000/3000 while
+  // orgResourcePackage still held 229 and isQuotaExceeded was false. Reading it
+  // as ">= 100" would be wrong twice over -- wrong scale, and it would call an
+  // account exhausted that still has an org package to draw on.
+  if (typeof flag === "boolean") return flag || remaining <= 0;
+  return remaining <= 0;
+}
+
+// The buckets isQuotaExhausted() sums, labelled for the log.
+const QUOTA_BUCKETS: ReadonlyArray<readonly [label: string, keys: readonly string[]]> = [
+  ["userQuota", ["user_quota", "userQuota"]],
+  ["addOnQuota", ["add_on_quota", "addOnQuota"]],
+  ["orgPackage", ["org_resource_package", "orgResourcePackage", "shared_quota", "sharedQuota"]],
+];
+
+// Renders why isQuotaExhausted() decided what it did. Without this, a log of
+// "exhausted=false" cannot be told apart from "the quota call failed open" --
+// and both leave every paid model looking usable.
+function quotaSnapshot(usage: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const [label, keys] of QUOTA_BUCKETS) {
+    const bucket = keys
+      .map((key) => usage[key])
+      .find((value): value is Record<string, unknown> => !!value && typeof value === "object");
+    if (!bucket) continue;
+    const left = Number(bucket.remaining);
+    if (!Number.isFinite(left)) {
+      parts.push(`${label}=?`);
+      continue;
+    }
+    // The live payload spells the org package's ceiling `cap`, not `total`.
+    const cap = Number(bucket.total ?? bucket.cap);
+    parts.push(Number.isFinite(cap) ? `${label}=${left}/${cap}` : `${label}=${left}`);
+  }
+  if (parts.length === 0) parts.push("buckets=<none>");
+  const flag = usage.is_quota_exceeded ?? usage.isQuotaExceeded;
+  parts.push(`flag=${typeof flag === "boolean" ? flag : "absent"}`);
+  const pct = Number(usage.total_usage_percentage ?? usage.totalUsagePercentage);
+  // Shown as a percentage for readability. It is a fraction upstream and is
+  // deliberately not part of the decision -- see isQuotaExhausted().
+  if (Number.isFinite(pct)) parts.push(`planUsage=${(pct * 100).toFixed(1)}%`);
+  return parts.join(" ");
 }
 
 // Fails open: an unreachable quota endpoint must not paint the whole catalog
@@ -411,9 +442,19 @@ async function fetchQuotaExhausted(options: QoderProviderOptions): Promise<boole
       },
       signal: controller.signal,
     });
-    if (!response.ok) return false;
-    return isQuotaExhausted(await response.json());
-  } catch {
+    if (!response.ok) {
+      logPlugin(`quota: HTTP ${response.status} -- failing open, nothing marked Unavailable`);
+      return false;
+    }
+    const payload: unknown = await response.json();
+    const exhausted = isQuotaExhausted(payload);
+    const usage =
+      payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+    logPlugin(`quota: exhausted=${exhausted} ${quotaSnapshot(usage)}`);
+    return exhausted;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    logPlugin(`quota: ${reason} -- failing open, nothing marked Unavailable`);
     return false;
   } finally {
     clearTimeout(timer);
@@ -422,14 +463,16 @@ async function fetchQuotaExhausted(options: QoderProviderOptions): Promise<boole
 
 // --- Display name -----------------------------------------------------------
 
-// A model stays billable when credits run out if it costs nothing: an explicit
-// free flag, the limited_time_free tag, or a zero multiplier.
-function isFreeTier(model: DiscoveredModel): boolean {
-  return (
-    model.isFree === true ||
-    model.priceFactor === 0 ||
-    Boolean(model.tags?.includes("limited_time_free"))
-  );
+// Costs nothing, so it keeps working after the credit quota runs out.
+//
+// Judged on price_factor alone. The live list also carries `is_free`, but it is
+// set on models that DO bill -- observed true on Qwen3.8-Max at price_factor 0.5
+// and Qwen3.8-Flash at 0.1, with promotion.active false -- so honouring it would
+// leave paid models looking available once credits are gone. There is no `tags`
+// field upstream either, so qodercli's limited_time_free label has no source
+// here. The x0 models (Efficient, Lite) are the genuinely free ones.
+function isZeroCost(model: DiscoveredModel): boolean {
+  return model.priceFactor === 0;
 }
 
 // 0.5 rather than qodercli's 0.50 -- the picker has room for the compact form,
@@ -450,10 +493,8 @@ function formatFactor(factor: number): string {
 // holds its model and the gateway returns the real billing error.
 export function displayName(model: DiscoveredModel): string {
   const parts: string[] = [];
-  // qodercli's W_l() precedence: the limited_time_free tag outranks the number.
-  if (model.tags?.includes("limited_time_free")) parts.push("Free");
-  else if (typeof model.priceFactor === "number") parts.push(formatFactor(model.priceFactor));
-  if (quotaExhausted && !isFreeTier(model)) parts.push("Unavailable");
+  if (typeof model.priceFactor === "number") parts.push(formatFactor(model.priceFactor));
+  if (quotaExhausted && !isZeroCost(model)) parts.push("Unavailable");
   return parts.length > 0 ? `${model.name} (${parts.join(", ")})` : model.name;
 }
 
@@ -530,6 +571,14 @@ export async function refreshModels(
       inflight = undefined;
     }
     quotaExhausted = await quota;
+    // One line per refresh (every REFRESH_INTERVAL_MS, plus on demand). Reports
+    // the model-list half; fetchQuotaExhausted() logs the quota half in detail.
+    // `source` is what tells a missing multiplier apart from a zero one: names
+    // carry no annotation while the bundled fallback is in use.
+    logPlugin(
+      `refresh: source=${source} live=${liveModels.length} total=${catalogModels().length} ` +
+        `exhausted=${quotaExhausted}${lastError ? ` error=${lastError}` : ""}`,
+    );
     return catalogStatus();
   })();
   return inflight;
@@ -537,10 +586,20 @@ export async function refreshModels(
 
 // The table index.ts registers into opencode's catalog.
 //
-// Models that vanished upstream are kept (after the live ones) so a session that
-// is already running on such a model does not lose it mid-conversation -- the
-// gateway still accepts those ids today. Models upstream explicitly disabled are
-// NOT resurrected.
+// Models that vanished upstream are kept (after the live ones) so a session
+// already running on one does not lose it mid-conversation, and so a
+// `model: qoder/<id>` pinned in someone's config keeps resolving.
+//
+// "Vanished" means absent from the list response entirely -- a distinct state
+// from present-but-disabled, which modelFromEntry() records in disabledIDs and
+// which is NOT resurrected below.
+//
+// Absence is not retirement. Verified 2026-09-05 by running a real request
+// through each bundled-only id (qmodel_preview, gm51model): both completed
+// successfully, so the gateway still routes them. They render without a
+// multiplier because the annotation comes from price_factor, which only the live
+// list supplies -- and inventing one for a dead id is exactly the mistake the
+// note in constants.ts warns against.
 export function catalogModels(): DiscoveredModel[] {
   // "cache" (seeded from disk) must be honoured exactly like "qoder"; checking
   // only for "qoder" here would make the persisted snapshot dead weight and drop
@@ -580,7 +639,6 @@ export function catalogSignature(): string {
         // The inputs behind displayName()'s annotation -- name is already signed
         // above, so signing the rendered string too would just repeat it.
         model.priceFactor ?? "",
-        model.tags?.join(",") ?? "",
         quotaExhausted,
       ].join(":"),
     )

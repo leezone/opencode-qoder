@@ -33,7 +33,7 @@ pnpm build
 
 声明了推理力度档位的模型会为每档生成一个变体（如 `kmodel_latest` 的 `high`、`low`、`max`），可在 opencode 的模型选择器中切换。
 
-模型名称会带上 Qoder 的 credit 倍率，如 `(0.5x)`；限时促销期间显示 `(Free)`。credits 用尽后，付费模型标记为 `Unavailable` 但仍可选，免费和 0 倍率模型不标记。两者均来自线上列表，回落到内置表时不显示。
+模型名称会带上 Qoder 的 credit 倍率，如 `(0.5x)`。credits 用尽后，付费模型追加 `Unavailable` 后缀（如 `(0.5x, Unavailable)`）但仍可选，0 倍率模型不受影响。两者均来自线上列表，回落到内置表时不显示。
 
 | 环境变量 | 作用 |
 | --- | --- |
@@ -41,6 +41,7 @@ pnpm build
 | `QODER_MODEL_LIST_URL` | 覆盖模型列表端点 |
 | `QODER_MODEL_CACHE_SECONDS` | 目录缓存时长（秒，默认 3600） |
 | `QODER_MODEL_DISK_CACHE` | 覆盖磁盘缓存路径 |
+| `OPENCODE_QODER_LOG_FILE` | 将诊断信息（credit 配额、目录刷新）追加到该路径。默认未设置，即不记录任何日志 |
 
 ## 认证
 

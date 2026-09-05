@@ -50,11 +50,6 @@ export type QoderModelDefinition = {
   // model-catalog.ts for why it cannot be a description field. Absent on the
   // bundled table: promotions move it, so only live discovery reports it.
   priceFactor?: number;
-  // Free-of-charge flag (`is_free`): keeps a model usable once credits run out.
-  isFree?: boolean;
-  // Upstream labels, e.g. ["limited_time_free"] which qodercli renders as "Free"
-  // instead of the credit multiplier.
-  tags?: string[];
 };
 
 export const QODER_MODELS: QoderModelDefinition[] = [

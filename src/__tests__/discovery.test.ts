@@ -98,39 +98,44 @@ describe("parseCatalog", () => {
     expect(models.map((model) => model.id)).not.toContain("lite");
   });
 
-  it("carries the billing metadata the display name is built from", () => {
+  // Fixture mirrors the live payload observed from
+  // https://api3.qoder.sh/algo/api/v2/model/list: Qwen3.8-Max advertises
+  // price_factor 0.5 together with is_free true and an inactive promotion.
+  it("reads the credit multiplier the live list advertises", () => {
     const models = parseCatalog({
       chat: [
         {
-          key: "kmodel_latest",
+          key: "qmodel_38max",
+          display_name: "Qwen3.8-Max",
           max_input_tokens: 180000,
           price_factor: 0.5,
-          is_free: false,
-          tags: ["limited_time_free", ""],
+          is_free: true,
+          promotion: { active: false, before_promotion_price_factor: 0.5 },
         },
       ],
     });
-    const model = models.find((entry) => entry.id === "kmodel_latest")!;
+    const model = models.find((entry) => entry.id === "qmodel_38max")!;
     expect(model.priceFactor).toBe(0.5);
-    expect(model.isFree).toBe(false);
-    // Empty tags are dropped so they cannot render as a blank token.
-    expect(model.tags).toEqual(["limited_time_free"]);
   });
 
-  it("accepts the camelCase spelling of the same fields", () => {
+  it("accepts the camelCase spelling of the same field", () => {
     const models = parseCatalog({
-      chat: [{ key: "kmodel_latest", max_input_tokens: 180000, priceFactor: 2, isFree: true }],
+      chat: [{ key: "kmodel_latest", max_input_tokens: 180000, priceFactor: 0.8 }],
     });
-    const model = models.find((entry) => entry.id === "kmodel_latest")!;
-    expect(model.priceFactor).toBe(2);
-    expect(model.isFree).toBe(true);
+    expect(models.find((entry) => entry.id === "kmodel_latest")!.priceFactor).toBe(0.8);
   });
 
-  it("leaves billing metadata absent rather than inventing a multiplier", () => {
+  it("keeps a fractional multiplier instead of flooring it to zero", () => {
+    // GLM-5.3-Flash bills 0.05; pickInt would floor it and render it free.
+    const models = parseCatalog({
+      chat: [{ key: "gfmodel", max_input_tokens: 180000, price_factor: 0.05 }],
+    });
+    expect(models.find((entry) => entry.id === "gfmodel")!.priceFactor).toBe(0.05);
+  });
+
+  it("leaves the multiplier absent rather than inventing one", () => {
     const models = parseCatalog({ chat: [{ key: "kmodel_latest", max_input_tokens: 180000 }] });
-    const model = models.find((entry) => entry.id === "kmodel_latest")!;
-    // A guessed 1 would bill-display a multiplier Qoder never advertised.
-    expect(model.priceFactor).toBeUndefined();
-    expect(model.tags).toBeUndefined();
+    // A guessed 1 would display a multiplier Qoder never advertised.
+    expect(models.find((entry) => entry.id === "kmodel_latest")!.priceFactor).toBeUndefined();
   });
 });

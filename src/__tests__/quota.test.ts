@@ -41,11 +41,26 @@ async function loadCatalog(handlers: { models: unknown; quota?: unknown; quotaOk
 }
 
 // parseCatalog needs recognisable limits, so every fixture carries one.
+// Mirrors the live payload: two x0 models, and Qwen3.8-Max which advertises
+// is_free true while still billing 0.5x.
 const modelsFixture = {
   chat: [
-    { key: "paid", display_name: "Paid", max_input_tokens: 180000, price_factor: 0.5 },
+    {
+      key: "paid",
+      display_name: "Paid",
+      max_input_tokens: 180000,
+      price_factor: 0.5,
+      is_free: true,
+    },
     { key: "free", display_name: "Free", max_input_tokens: 180000, price_factor: 0 },
-    { key: "promo", display_name: "Promo", max_input_tokens: 180000, tags: ["limited_time_free"] },
+    {
+      key: "efficient",
+      display_name: "Efficient",
+      max_input_tokens: 180000,
+      price_factor: 0,
+      original_price_factor: 0.3,
+      is_free: true,
+    },
     { key: "bare", display_name: "Bare", max_input_tokens: 180000 },
   ],
 };
@@ -114,21 +129,29 @@ describe("isQuotaExhausted", () => {
     ).toBe(false);
   });
 
-  it("falls back to the usage percentage only when the flag is absent", async () => {
+  it("ignores the usage percentage, which is fractional and plan-only", async () => {
     const { catalog } = await loadCatalog({ models: modelsFixture });
-    expect(
-      catalog.isQuotaExhausted(
-        quota({ total_usage_percentage: 100, user_quota: { remaining: 9 } }),
-      ),
-    ).toBe(true);
-    // An explicit false outranks a full percentage bar, matching qodercli's
-    // `flag ?? percentage >= 100`.
+    // Observed live: totalUsagePercentage 1 (== 100%, not 1%) with userQuota
+    // drained to 0, yet orgResourcePackage still held 229 and isQuotaExceeded
+    // was false. Treating the percentage as exhaustion would mislabel an
+    // account that can still draw on its org package.
     expect(
       catalog.isQuotaExhausted(
         quota({
-          is_quota_exceeded: false,
-          total_usage_percentage: 100,
-          user_quota: { remaining: 9 },
+          totalUsagePercentage: 1,
+          isQuotaExceeded: false,
+          userQuota: { total: 3000, used: 3000, remaining: 0 },
+          orgResourcePackage: { used: 1771, remaining: 229, cap: 2000 },
+        }),
+      ),
+    ).toBe(false);
+    // And with the flag absent it still decides on remaining, not percentage.
+    expect(
+      catalog.isQuotaExhausted(
+        quota({
+          totalUsagePercentage: 1,
+          userQuota: { remaining: 0 },
+          orgResourcePackage: { remaining: 229 },
         }),
       ),
     ).toBe(false);
@@ -176,13 +199,6 @@ describe("displayName", () => {
     expect(catalog.displayName(model({ priceFactor: 1.25 }))).toBe("Paid (1.25x)");
   });
 
-  it("lets the limited-time-free tag outrank the multiplier", async () => {
-    const { catalog } = await loadCatalog({ models: modelsFixture });
-    expect(catalog.displayName(model({ priceFactor: 0.5, tags: ["limited_time_free"] }))).toBe(
-      "Paid (Free)",
-    );
-  });
-
   it("marks paid models unavailable once credits are drained", async () => {
     const { catalog } = await loadCatalog({
       models: modelsFixture,
@@ -190,10 +206,17 @@ describe("displayName", () => {
     });
     await catalog.refreshModels(options, true);
     const byID = new Map(catalog.catalogModels().map((entry) => [entry.id, entry]));
+    // `paid` advertises is_free true alongside price_factor 0.5, as Qwen3.8-Max
+    // does live. It bills, so it must be marked -- trusting is_free would leave
+    // a paid model looking usable after the credits are gone.
     expect(catalog.displayName(byID.get("paid")!)).toBe("Paid (0.5x, Unavailable)");
-    // Zero multiplier, free tag, and unknown price all stay usable.
+    // x0 models stay selectable.
     expect(catalog.displayName(byID.get("free")!)).toBe("Free (0x)");
-    expect(catalog.displayName(byID.get("promo")!)).toBe("Promo (Free)");
+    expect(catalog.displayName(byID.get("efficient")!)).toBe("Efficient (0x)");
+    // No advertised price is not evidence of being free. Every live entry
+    // carries price_factor, so this is the bundled-fallback case, whose models
+    // are all paid tiers -- marking them is correct.
+    expect(catalog.displayName(byID.get("bare")!)).toBe("Bare (Unavailable)");
   });
 
   it("keeps the model enabled -- the marker is a suffix, not a status change", async () => {
