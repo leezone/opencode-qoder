@@ -10,12 +10,12 @@ import type {
   LanguageModelV3Usage,
   SharedV3Warning,
 } from "@ai-sdk/provider";
-import { resolveQoderCredentials, type QoderProviderOptions } from "./auth.js";
-import { buildAuthHeaders } from "./cosy.js";
+import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
 import { QODER_CHAT_URL, USER_AGENT } from "./constants.js";
-import { getModelDefinition } from "./model-catalog.js";
+import { buildAuthHeaders } from "./cosy.js";
 import { qoderEncodeBody } from "./encoding.js";
-import { transformPrompt, transformTools, type QoderMessage, type QoderTool } from "./transform.js";
+import { getModelDefinition } from "./model-catalog.js";
+import { type QoderMessage, type QoderTool, transformPrompt, transformTools } from "./transform.js";
 
 type ToolCallState = {
   // Undefined until the upstream id arrives (or startToolCall fabricates one).
@@ -72,7 +72,12 @@ function stableHash(prefix: string, ...inputs: string[]): string {
   return hash.digest("hex").slice(0, 16);
 }
 
-function stableChatRecordID(model: string, messages: QoderMessage[], tools: QoderTool[], maxTokens: number): string {
+function stableChatRecordID(
+  model: string,
+  messages: QoderMessage[],
+  tools: QoderTool[],
+  maxTokens: number,
+): string {
   const hash = crypto.createHash("sha256");
   hash.update("qoder-record");
   hash.update("\0");
@@ -80,7 +85,10 @@ function stableChatRecordID(model: string, messages: QoderMessage[], tools: Qode
   for (const message of messages) {
     hash.update("\0");
     hash.update(message.role);
-    if (message.content) hash.update(typeof message.content === "string" ? message.content : JSON.stringify(message.content));
+    if (message.content)
+      hash.update(
+        typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+      );
     if (message.tool_calls) hash.update(JSON.stringify(message.tool_calls));
   }
   if (tools.length) {
@@ -92,8 +100,12 @@ function stableChatRecordID(model: string, messages: QoderMessage[], tools: Qode
   return hash.digest("hex").slice(0, 16);
 }
 
-function mapFinishReason(raw: string | undefined, hasToolCalls: boolean): LanguageModelV3FinishReason {
-  if (hasToolCalls || raw === "tool_calls" || raw === "function_call") return { unified: "tool-calls", raw };
+function mapFinishReason(
+  raw: string | undefined,
+  hasToolCalls: boolean,
+): LanguageModelV3FinishReason {
+  if (hasToolCalls || raw === "tool_calls" || raw === "function_call")
+    return { unified: "tool-calls", raw };
   if (raw === "length") return { unified: "length", raw };
   if (raw === "content_filter") return { unified: "content-filter", raw };
   if (!raw || raw === "stop") return { unified: "stop", raw };
@@ -106,7 +118,10 @@ function usageFromQoder(raw?: QoderChunk["usage"]): LanguageModelV3Usage {
   return {
     inputTokens: {
       total: promptTokens,
-      noCache: promptTokens !== undefined && cachedTokens !== undefined ? promptTokens - cachedTokens : undefined,
+      noCache:
+        promptTokens !== undefined && cachedTokens !== undefined
+          ? promptTokens - cachedTokens
+          : undefined,
       cacheRead: cachedTokens,
       cacheWrite: undefined,
     },
@@ -115,7 +130,7 @@ function usageFromQoder(raw?: QoderChunk["usage"]): LanguageModelV3Usage {
       text: undefined,
       reasoning: raw?.completion_tokens_details?.reasoning_tokens,
     },
-    raw: raw as any,
+    raw,
   };
 }
 
@@ -138,7 +153,8 @@ function getTrailingPossibleTagPrefixLength(text: string, tag: string): number {
 
 function getMaxTrailingPossibleTagPrefixLength(text: string, tags: string[]): number {
   let maxLength = 0;
-  for (const tag of tags) maxLength = Math.max(maxLength, getTrailingPossibleTagPrefixLength(text, tag));
+  for (const tag of tags)
+    maxLength = Math.max(maxLength, getTrailingPossibleTagPrefixLength(text, tag));
   return maxLength;
 }
 
@@ -269,7 +285,10 @@ class ThinkingTagParser {
       return;
     }
 
-    const trailingPrefixLength = getTrailingPossibleTagPrefixLength(this.textBuffer, this.activeEndTag);
+    const trailingPrefixLength = getTrailingPossibleTagPrefixLength(
+      this.textBuffer,
+      this.activeEndTag,
+    );
     const safeLen = this.textBuffer.length - trailingPrefixLength;
     if (safeLen > 0) {
       this.emitter.reasoning(this.textBuffer.slice(0, safeLen));
@@ -301,7 +320,9 @@ function resolveReasoningEffort(
 ): string | undefined {
   const supported = model?.efforts ?? [];
   if (supported.length === 0) return undefined;
-  const env = String(process.env.QODER_REASONING_EFFORT ?? "").trim().toLowerCase();
+  const env = String(process.env.QODER_REASONING_EFFORT ?? "")
+    .trim()
+    .toLowerCase();
   if (env) return (EFFORT_LADDER as readonly string[]).includes(env) ? env : undefined;
   const optionBag = options as Record<string, unknown>;
   const picked = String(optionBag?.reasoningEffort ?? optionBag?.reasoning_effort ?? "")
@@ -314,18 +335,25 @@ function resolveReasoningEffort(
   return supported.includes(picked) ? picked : undefined;
 }
 
-function buildRequestBody(modelID: string, options: LanguageModelV3CallOptions, userID: string): { body: Record<string, unknown>; warnings: SharedV3Warning[] } {
+function buildRequestBody(
+  modelID: string,
+  options: LanguageModelV3CallOptions,
+  userID: string,
+): { body: Record<string, unknown>; warnings: SharedV3Warning[] } {
   const model = getModelDefinition(modelID);
   const transformed = transformPrompt(options.prompt);
   const { tools, ignoredTools } = transformTools(options.tools);
   const warnings: SharedV3Warning[] = [];
 
   if (ignoredTools > 0) warnings.push({ type: "unsupported", feature: "provider-defined tools" });
-  if (options.stopSequences?.length) warnings.push({ type: "unsupported", feature: "stop sequences" });
-  if (options.responseFormat?.type === "json") warnings.push({ type: "unsupported", feature: "JSON response format" });
+  if (options.stopSequences?.length)
+    warnings.push({ type: "unsupported", feature: "stop sequences" });
+  if (options.responseFormat?.type === "json")
+    warnings.push({ type: "unsupported", feature: "JSON response format" });
 
   let maxTokens = model.maxTokens;
-  if (options.maxOutputTokens && options.maxOutputTokens < maxTokens) maxTokens = options.maxOutputTokens;
+  if (options.maxOutputTokens && options.maxOutputTokens < maxTokens)
+    maxTokens = options.maxOutputTokens;
 
   const recordID = stableChatRecordID(modelID, transformed.messages, tools, maxTokens);
   const sessionID = stableHash("qoder-session", userID, modelID);
@@ -441,24 +469,43 @@ export class QoderLanguageModel implements LanguageModelV3 {
         textByID.set(part.id, block);
         content.push(block);
       }
-      if (part.type === "text-delta") textByID.get(part.id)!.text += part.delta;
+      if (part.type === "text-delta") {
+        const block = textByID.get(part.id);
+        if (block) block.text += part.delta;
+      }
       if (part.type === "reasoning-start") {
         const block = { type: "reasoning" as const, text: "" };
         reasoningByID.set(part.id, block);
         content.push(block);
       }
-      if (part.type === "reasoning-delta") reasoningByID.get(part.id)!.text += part.delta;
+      if (part.type === "reasoning-delta") {
+        const block = reasoningByID.get(part.id);
+        if (block) block.text += part.delta;
+      }
       if (part.type === "tool-call") {
-        content.push({ type: "tool-call", toolCallId: part.toolCallId, toolName: part.toolName, input: part.input });
+        content.push({
+          type: "tool-call",
+          toolCallId: part.toolCallId,
+          toolName: part.toolName,
+          input: part.input,
+        });
       }
       if (part.type === "finish") {
         finishReason = part.finishReason;
         usage = part.usage;
       }
-      if (part.type === "error") throw part.error instanceof Error ? part.error : new Error(String(part.error));
+      if (part.type === "error")
+        throw part.error instanceof Error ? part.error : new Error(String(part.error));
     }
 
-    return { content, finishReason, usage, warnings, request: result.request, response: result.response };
+    return {
+      content,
+      finishReason,
+      usage,
+      warnings,
+      request: result.request,
+      response: result.response,
+    };
   }
 
   async doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
@@ -498,14 +545,23 @@ export class QoderLanguageModel implements LanguageModelV3 {
 
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
-      throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
+      throw new Error(
+        `Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`,
+      );
     }
 
     const stream = this.responseToStream(response, warnings);
-    return { stream, request: { body }, response: { headers: Object.fromEntries(response.headers.entries()) } };
+    return {
+      stream,
+      request: { body },
+      response: { headers: Object.fromEntries(response.headers.entries()) },
+    };
   }
 
-  private responseToStream(response: Response, warnings: SharedV3Warning[]): ReadableStream<LanguageModelV3StreamPart> {
+  private responseToStream(
+    response: Response,
+    warnings: SharedV3Warning[],
+  ): ReadableStream<LanguageModelV3StreamPart> {
     const modelID = this.modelId;
     return new ReadableStream<LanguageModelV3StreamPart>({
       async start(controller) {
@@ -522,24 +578,30 @@ export class QoderLanguageModel implements LanguageModelV3 {
         let rawUsage: QoderChunk["usage"];
         let sawToolCall = false;
 
-        const startToolCall = (state: ToolCallState) => {
-          if (state.started) return;
-          // Reached only when upstream never supplied an id for this call.
+        const startToolCall = (state: ToolCallState): string => {
           if (!state.id) state.id = crypto.randomUUID();
-          state.started = true;
-          controller.enqueue({ type: "tool-input-start", id: state.id, toolName: state.name });
-          for (const pendingDelta of state.pendingDeltas) {
-            controller.enqueue({ type: "tool-input-delta", id: state.id, delta: pendingDelta });
+          if (!state.started) {
+            state.started = true;
+            controller.enqueue({ type: "tool-input-start", id: state.id, toolName: state.name });
+            for (const pendingDelta of state.pendingDeltas) {
+              controller.enqueue({ type: "tool-input-delta", id: state.id, delta: pendingDelta });
+            }
+            state.pendingDeltas = [];
           }
-          state.pendingDeltas = [];
+          return state.id;
         };
 
         const finishToolCall = (state: ToolCallState) => {
           if (state.finished || !state.name) return;
           state.finished = true;
-          startToolCall(state);
-          controller.enqueue({ type: "tool-input-end", id: state.id! });
-          controller.enqueue({ type: "tool-call", toolCallId: state.id!, toolName: state.name, input: state.arguments });
+          const id = startToolCall(state);
+          controller.enqueue({ type: "tool-input-end", id });
+          controller.enqueue({
+            type: "tool-call",
+            toolCallId: id,
+            toolName: state.name,
+            input: state.arguments,
+          });
           sawToolCall = true;
         };
 
@@ -583,9 +645,9 @@ export class QoderLanguageModel implements LanguageModelV3 {
                 emitter.endReasoning();
                 for (const toolCallDelta of delta.tool_calls) {
                   const index = toolCallDelta.index ?? 0;
-                  const state =
-                    toolCalls[index] ??
-                    (toolCalls[index] = {
+                  let state = toolCalls[index];
+                  if (!state) {
+                    state = {
                       id: undefined,
                       upstreamID: false,
                       name: "",
@@ -593,7 +655,9 @@ export class QoderLanguageModel implements LanguageModelV3 {
                       started: false,
                       finished: false,
                       pendingDeltas: [],
-                    });
+                    };
+                    toolCalls[index] = state;
+                  }
                   // Adopt the upstream id whenever it shows up. Qoder's Kimi
                   // adapter can deliver it in a later chunk than the function
                   // name, and the previous `!state.started` guard threw it away
@@ -613,8 +677,12 @@ export class QoderLanguageModel implements LanguageModelV3 {
                   const argDelta = toolCallDelta.function?.arguments || "";
                   if (argDelta) {
                     state.arguments += argDelta;
-                    if (state.started) {
-                      controller.enqueue({ type: "tool-input-delta", id: state.id!, delta: argDelta });
+                    if (state.started && state.id) {
+                      controller.enqueue({
+                        type: "tool-input-delta",
+                        id: state.id,
+                        delta: argDelta,
+                      });
                     } else {
                       state.pendingDeltas.push(argDelta);
                     }
@@ -652,7 +720,9 @@ export class QoderLanguageModel implements LanguageModelV3 {
   }
 }
 
-export function createQoder(options: QoderProviderOptions = {}): { languageModel(modelID: string): LanguageModelV3 } {
+export function createQoder(options: QoderProviderOptions = {}): {
+  languageModel(modelID: string): LanguageModelV3;
+} {
   return {
     languageModel(modelID: string) {
       return new QoderLanguageModel(modelID, options);

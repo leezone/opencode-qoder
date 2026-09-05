@@ -33,10 +33,14 @@
   "scripts": {
     "build": "rm -rf ./dist && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run src"
+    "test": "vitest run src",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write ."
   },
   "devDependencies": {
     "@ai-sdk/provider": "3.0.8",
+    "@biomejs/biome": "^2.5.12",
     "@opencode-ai/plugin": "1.17.13",
     "@types/node": "^24.0.0",
     "typescript": "^5.8.2",

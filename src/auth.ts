@@ -1,6 +1,12 @@
 import crypto from "node:crypto";
+import {
+  QODER_EXCHANGE_URL,
+  QODER_PAT_ENV,
+  QODER_REFRESH_URL,
+  QODER_USERINFO_URL,
+  USER_AGENT,
+} from "./constants.js";
 import { getMachineId } from "./cosy.js";
-import { QODER_EXCHANGE_URL, QODER_PAT_ENV, QODER_REFRESH_URL, QODER_USERINFO_URL, USER_AGENT } from "./constants.js";
 
 export interface QoderCredentials {
   access: string;
@@ -25,7 +31,12 @@ export const PAT_REFRESH_PREFIX = "pat";
 
 const credentialsCache = new Map<string, Promise<QoderCredentials> | QoderCredentials>();
 
-export function encodePatRefresh(pat: string, jobRefreshToken: string, userID: string, machineID: string): string {
+export function encodePatRefresh(
+  pat: string,
+  jobRefreshToken: string,
+  userID: string,
+  machineID: string,
+): string {
   return [PAT_REFRESH_PREFIX, pat, jobRefreshToken, userID, machineID].join("|");
 }
 
@@ -44,11 +55,19 @@ export function decodePatRefresh(refresh: string): {
   };
 }
 
-export function encodeOAuthRefresh(refreshToken: string, userID: string, machineID: string): string {
+export function encodeOAuthRefresh(
+  refreshToken: string,
+  userID: string,
+  machineID: string,
+): string {
   return [refreshToken, userID, machineID].join("|");
 }
 
-export function decodeOAuthRefresh(refresh: string): { refreshToken: string; userID: string; machineID: string } {
+export function decodeOAuthRefresh(refresh: string): {
+  refreshToken: string;
+  userID: string;
+  machineID: string;
+} {
   const parts = refresh.split("|");
   return {
     refreshToken: parts[0] || "",
@@ -79,7 +98,9 @@ function parseExpiresAt(expiresAt?: string, expiresIn?: number): number {
   return Date.now() + 24 * 60 * 60 * 1000;
 }
 
-async function fetchUserInfo(jobToken: string): Promise<{ userID: string; email: string; name: string }> {
+async function fetchUserInfo(
+  jobToken: string,
+): Promise<{ userID: string; email: string; name: string }> {
   try {
     const res = await fetch(QODER_USERINFO_URL, {
       headers: {
@@ -91,7 +112,12 @@ async function fetchUserInfo(jobToken: string): Promise<{ userID: string; email:
       },
     });
     if (!res.ok) return { userID: "", email: "", name: "" };
-    const info = (await res.json()) as { id?: string; email?: string; name?: string; username?: string };
+    const info = (await res.json()) as {
+      id?: string;
+      email?: string;
+      name?: string;
+      username?: string;
+    };
     return {
       userID: info.id || "",
       email: info.email || "",
@@ -125,7 +151,9 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`Qoder PAT exchange failed: ${res.status} ${res.statusText}. ${text.slice(0, 200)}`);
+      throw new Error(
+        `Qoder PAT exchange failed: ${res.status} ${res.statusText}. ${text.slice(0, 200)}`,
+      );
     }
 
     const data = (await res.json()) as {
@@ -160,7 +188,9 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
   }
 }
 
-export async function refreshOAuthCredential(credential: QoderCredentials): Promise<QoderCredentials> {
+export async function refreshOAuthCredential(
+  credential: QoderCredentials,
+): Promise<QoderCredentials> {
   const { refreshToken, userID, machineID } = decodeOAuthRefresh(credential.refresh);
   if (!refreshToken) return credential;
 
@@ -176,23 +206,36 @@ export async function refreshOAuthCredential(credential: QoderCredentials): Prom
   });
 
   if (!response.ok) return credential;
-  const data = (await response.json()) as { token?: string; refresh_token?: string; expires_at?: string; expires_in?: number };
+  const data = (await response.json()) as {
+    token?: string;
+    refresh_token?: string;
+    expires_at?: string;
+    expires_in?: number;
+  };
   if (!data.token) return credential;
 
   return {
     ...credential,
     access: data.token,
-    refresh: encodeOAuthRefresh(data.refresh_token || refreshToken, userID || credential.userID, machineID || credential.machineID),
+    refresh: encodeOAuthRefresh(
+      data.refresh_token || refreshToken,
+      userID || credential.userID,
+      machineID || credential.machineID,
+    ),
     expires: parseExpiresAt(data.expires_at, data.expires_in) - 5 * 60 * 1000,
     userID: userID || credential.userID,
     machineID: machineID || credential.machineID,
   };
 }
 
-export async function resolveQoderCredentials(options: QoderProviderOptions = {}): Promise<QoderCredentials> {
+export async function resolveQoderCredentials(
+  options: QoderProviderOptions = {},
+): Promise<QoderCredentials> {
   const token = options.personalAccessToken || options.apiKey || getEnvPat();
   if (!token) {
-    throw new Error("Qoder credentials not set. Run `/connect qoder` in opencode or set QODER_PERSONAL_ACCESS_TOKEN.");
+    throw new Error(
+      "Qoder credentials not set. Run `/connect qoder` in opencode or set QODER_PERSONAL_ACCESS_TOKEN.",
+    );
   }
 
   if (token.startsWith("pt-")) return credentialsFromPat(token);

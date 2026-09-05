@@ -1,8 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { resolveQoderCredentials, type QoderProviderOptions } from "./auth.js";
-import { QODER_MODELS, QODER_MODEL_LIST_URL, type QoderModelDefinition, USER_AGENT } from "./constants.js";
+import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
+import {
+  QODER_MODEL_LIST_URL,
+  QODER_MODELS,
+  type QoderModelDefinition,
+  USER_AGENT,
+} from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
 
 // Dynamic model discovery for Qoder.
@@ -60,6 +65,10 @@ export type CatalogStatus = {
 
 type CatalogEntry = Record<string, unknown>;
 
+// Shapes we read out of untrusted catalog payloads.
+type ContextTier = { token_count?: unknown; is_default?: unknown };
+type ThinkingConfig = { enabled?: { efforts?: Record<string, unknown> } };
+
 let liveModels: DiscoveredModel[] = [];
 const disabledIDs = new Set<string>();
 let fetchedAt = 0;
@@ -69,7 +78,9 @@ let lastError = "";
 let inflight: Promise<CatalogStatus> | undefined;
 
 function envBool(name: string): boolean {
-  const value = String(process.env[name] ?? "").trim().toLowerCase();
+  const value = String(process.env[name] ?? "")
+    .trim()
+    .toLowerCase();
   return value === "1" || value === "true" || value === "yes";
 }
 
@@ -122,7 +133,11 @@ function saveDiskCache(models: DiscoveredModel[]): void {
   try {
     const file = diskCachePath();
     mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify({ version: DISK_CACHE_VERSION, fetchedAt: Date.now(), models }), "utf8");
+    writeFileSync(
+      file,
+      JSON.stringify({ version: DISK_CACHE_VERSION, fetchedAt: Date.now(), models }),
+      "utf8",
+    );
   } catch {
     // A read-only or missing cache directory must never break discovery.
   }
@@ -203,7 +218,7 @@ function defaultTierTokens(entry: CatalogEntry): number {
   const tiers = entry.context_config;
   if (!tiers || typeof tiers !== "object") return 0;
   let first = 0;
-  for (const tier of Object.values(tiers as Record<string, any>)) {
+  for (const tier of Object.values(tiers as Record<string, ContextTier>)) {
     const tokens = Number(tier?.token_count);
     if (!Number.isFinite(tokens) || tokens <= 0 || tokens > MAX_PLAUSIBLE_TOKENS) continue;
     if (tier?.is_default === true) return Math.floor(tokens);
@@ -215,7 +230,7 @@ function defaultTierTokens(entry: CatalogEntry): number {
 // Qoder exposes reasoning effort levels through thinking_config, e.g.
 // kmodel_latest -> { enabled: { efforts: { high:{}, low:{}, max:{} } } }.
 function thinkingEfforts(entry: CatalogEntry): string[] {
-  const efforts = (entry.thinking_config as any)?.enabled?.efforts;
+  const efforts = (entry.thinking_config as ThinkingConfig | undefined)?.enabled?.efforts;
   if (!efforts || typeof efforts !== "object") return [];
   return Object.keys(efforts);
 }
@@ -279,9 +294,9 @@ function normalizeStatic(model: QoderModelDefinition): DiscoveredModel {
 
 // Go: parseQoderModelCatalog() -- only the `chat` group feeds agent_chat_generation.
 export function parseCatalog(payload: unknown): DiscoveredModel[] {
-  const entries = payload && typeof payload === "object" && Array.isArray((payload as any).chat)
-    ? ((payload as any).chat as CatalogEntry[])
-    : [];
+  const chat =
+    payload && typeof payload === "object" ? (payload as Record<string, unknown>).chat : undefined;
+  const entries = Array.isArray(chat) ? (chat as CatalogEntry[]) : [];
   if (entries.length === 0) throw new Error("Qoder model list response is missing the chat array");
   const models: DiscoveredModel[] = [];
   const seen = new Set<string>();
@@ -300,7 +315,9 @@ export function parseCatalog(payload: unknown): DiscoveredModel[] {
   // Reject the batch instead and stay on the previous data (disk cache, then the
   // bundled table), which is at least known-good.
   if (!models.some((model) => model.limitsFromUpstream)) {
-    throw new Error("Qoder model list carried no recognisable token limits (upstream schema change?)");
+    throw new Error(
+      "Qoder model list carried no recognisable token limits (upstream schema change?)",
+    );
   }
   // Go: re-inject DefaultModel when upstream stopped advertising it.
   if (!seen.has(DEFAULT_MODEL)) {
@@ -344,7 +361,10 @@ async function fetchModels(options: QoderProviderOptions): Promise<DiscoveredMod
 }
 
 // Go: RefreshQoderModels(ctx, force)
-export async function refreshModels(options: QoderProviderOptions = {}, force = false): Promise<CatalogStatus> {
+export async function refreshModels(
+  options: QoderProviderOptions = {},
+  force = false,
+): Promise<CatalogStatus> {
   if (discoveryDisabled()) return catalogStatus();
   // expiresAt is stamped on BOTH success (TTL) and failure (error TTL), so this
   // single check throttles retries too. Go guards with `len(models) > 0` as
@@ -394,7 +414,9 @@ export function catalogModels(): DiscoveredModel[] {
     return QODER_MODELS.map(normalizeStatic);
   }
   const seen = new Set(liveModels.map((model) => model.id));
-  const legacy = QODER_MODELS.filter((model) => !seen.has(model.id) && !disabledIDs.has(model.id)).map(normalizeStatic);
+  const legacy = QODER_MODELS.filter(
+    (model) => !seen.has(model.id) && !disabledIDs.has(model.id),
+  ).map(normalizeStatic);
   return [...liveModels, ...legacy];
 }
 

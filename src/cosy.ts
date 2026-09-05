@@ -124,8 +124,13 @@ export function buildAuthHeaders(
   const bodyStr = body ? (Buffer.isBuffer(body) ? body.toString("utf8") : body) : "";
   const sigInput = `${payloadB64}\n${cosyKey}\n${timestamp}\n${bodyStr}\n${sigPath}`;
   const sig = crypto.createHash("md5").update(sigInput).digest("hex");
-  const bodyHash = crypto.createHash("md5").update(body || "").digest("hex");
-  const bodyLen = body ? (Buffer.isBuffer(body) ? body.length : Buffer.from(body).length).toString() : "0";
+  const bodyHash = crypto
+    .createHash("md5")
+    .update(body || "")
+    .digest("hex");
+  const bodyLen = body
+    ? (Buffer.isBuffer(body) ? body.length : Buffer.from(body).length).toString()
+    : "0";
   const machineID = creds.machineID || getMachineId();
 
   return {

@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it } from "vitest";
 import type { LanguageModelV3Prompt } from "@ai-sdk/provider";
-import { transformPrompt } from "../transform.js";
+import { afterEach, describe, expect, it } from "vitest";
 import { parseCatalog } from "../model-catalog.js";
+import { transformPrompt } from "../transform.js";
 
 const assistantWithToolCallOnly: LanguageModelV3Prompt = [
   { role: "user", content: [{ type: "text", text: "list the files" }] },
@@ -11,7 +11,14 @@ const assistantWithToolCallOnly: LanguageModelV3Prompt = [
   },
   {
     role: "tool",
-    content: [{ type: "tool-result", toolCallId: "call_1", toolName: "ls", output: { type: "text", value: "a.ts" } }],
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: "call_1",
+        toolName: "ls",
+        output: { type: "text", value: "a.ts" },
+      },
+    ],
   },
 ];
 

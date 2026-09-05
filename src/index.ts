@@ -7,7 +7,6 @@ import {
   type QoderCredentials,
   type QoderProviderOptions,
 } from "./auth.js";
-import { getMachineId } from "./cosy.js";
 import {
   PROVIDER_ID,
   PROVIDER_NAME,
@@ -17,14 +16,15 @@ import {
   USER_AGENT,
   ZERO_COST,
 } from "./constants.js";
+import { getMachineId } from "./cosy.js";
+import { createQoder, QoderLanguageModel } from "./language-model.js";
 import {
   catalogModels,
   catalogSignature,
+  type DiscoveredModel,
   discoveryDisabled,
   refreshModels,
-  type DiscoveredModel,
 } from "./model-catalog.js";
-import { createQoder, QoderLanguageModel } from "./language-model.js";
 
 export { createQoder, QoderLanguageModel };
 
@@ -36,7 +36,10 @@ type QoderPluginOptions = PluginOptions & {
 
 const REFRESH_INTERVAL_MS = 15 * 60 * 1000;
 
-function optionString(options: PluginOptions | undefined, key: keyof QoderPluginOptions): string | undefined {
+function optionString(
+  options: PluginOptions | undefined,
+  key: keyof QoderPluginOptions,
+): string | undefined {
   const value = options?.[key];
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -89,15 +92,36 @@ function legacyModelConfig(model: DiscoveredModel) {
   // empty {} and an unchanged payload.
   const efforts = model.efforts ?? [];
   if (efforts.length > 0) {
-    config.variants = Object.fromEntries(efforts.map((effort) => [effort, { reasoningEffort: effort }]));
+    config.variants = Object.fromEntries(
+      efforts.map((effort) => [effort, { reasoningEffort: effort }]),
+    );
   }
   return config;
 }
 
-function applyLegacyConfig(cfg: Record<string, any>, options?: PluginOptions): void {
+// Minimal shapes for the parts of opencode's legacy plugin config that this
+// plugin mutates. opencode's own config type is dynamically shaped, so we
+// declare only what we rely on instead of reaching through `any`.
+interface LegacyModelConfig {
+  [key: string]: unknown;
+}
+interface LegacyProviderConfig {
+  name?: string;
+  env?: string[];
+  npm?: string;
+  options?: Record<string, unknown>;
+  models?: Record<string, LegacyModelConfig>;
+}
+interface LegacyConfig {
+  provider?: Record<string, LegacyProviderConfig>;
+  model?: string;
+}
+
+function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   const id = providerID(options);
   cfg.provider ??= {};
-  const current = (cfg.provider[id] ??= {});
+  if (!cfg.provider[id]) cfg.provider[id] = {};
+  const current = cfg.provider[id];
   current.name ??= PROVIDER_NAME;
   current.env ??= [...QODER_PAT_ENV];
   current.npm ??= import.meta.url;
@@ -156,18 +180,39 @@ function v2ModelConfig(model: DiscoveredModel) {
   };
 }
 
-async function authOptionsFromV2Connection(ctx: PluginContext, id: string): Promise<QoderProviderOptions> {
+// Minimal shape of an opencode-stored credential. The plugin API returns it
+// untyped, so we declare the fields this plugin actually consumes.
+interface StoredCredential {
+  type?: string;
+  key?: string;
+  access?: string;
+  refresh?: string;
+  accountId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+function metadataString(metadata: Record<string, unknown> | undefined, field: string) {
+  const value = metadata?.[field];
+  return typeof value === "string" ? value : undefined;
+}
+
+async function authOptionsFromV2Connection(
+  ctx: PluginContext,
+  id: string,
+): Promise<QoderProviderOptions> {
   const connection = await ctx.integration.connection.active(id);
-  const credential = connection ? ((await ctx.integration.connection.resolve(connection)) as any) : undefined;
+  const credential = connection
+    ? ((await ctx.integration.connection.resolve(connection)) as StoredCredential)
+    : undefined;
   if (!credential) return {};
 
   if (credential.type === "key") {
     return {
       apiKey: credential.key,
-      qoderUserID: typeof credential.metadata?.userID === "string" ? credential.metadata.userID : undefined,
-      qoderEmail: typeof credential.metadata?.email === "string" ? credential.metadata.email : undefined,
-      qoderName: typeof credential.metadata?.name === "string" ? credential.metadata.name : undefined,
-      qoderMachineID: typeof credential.metadata?.machineID === "string" ? credential.metadata.machineID : undefined,
+      qoderUserID: metadataString(credential.metadata, "userID"),
+      qoderEmail: metadataString(credential.metadata, "email"),
+      qoderName: metadataString(credential.metadata, "name"),
+      qoderMachineID: metadataString(credential.metadata, "machineID"),
     };
   }
 
@@ -175,11 +220,11 @@ async function authOptionsFromV2Connection(ctx: PluginContext, id: string): Prom
     const decoded = decodeOAuthRefresh(credential.refresh || "");
     return {
       apiKey: credential.access,
-      qoderUserID: typeof credential.metadata?.userID === "string" ? credential.metadata.userID : credential.accountId || decoded.userID,
-      qoderEmail: typeof credential.metadata?.email === "string" ? credential.metadata.email : undefined,
-      qoderName: typeof credential.metadata?.name === "string" ? credential.metadata.name : undefined,
-      qoderMachineID:
-        typeof credential.metadata?.machineID === "string" ? credential.metadata.machineID : decoded.machineID,
+      qoderUserID:
+        metadataString(credential.metadata, "userID") || credential.accountId || decoded.userID,
+      qoderEmail: metadataString(credential.metadata, "email"),
+      qoderName: metadataString(credential.metadata, "name"),
+      qoderMachineID: metadataString(credential.metadata, "machineID") || decoded.machineID,
     };
   }
 
@@ -192,15 +237,26 @@ async function setupV2(ctx: PluginContext): Promise<void> {
     integrations.update(id, (integration) => {
       integration.name = PROVIDER_NAME;
     });
-    integrations.method.update({ integrationID: id, method: { type: "key", label: "Qoder Personal Access Token" } });
-    integrations.method.update({ integrationID: id, method: { type: "env", names: [...QODER_PAT_ENV] } });
+    integrations.method.update({
+      integrationID: id,
+      method: { type: "key", label: "Qoder Personal Access Token" },
+    });
+    integrations.method.update({
+      integrationID: id,
+      method: { type: "env", names: [...QODER_PAT_ENV] },
+    });
   });
 
   await ctx.catalog.transform((catalog) => {
     catalog.provider.update(id, (provider) => {
       provider.name = PROVIDER_NAME;
       provider.integrationID = id;
-      provider.api = { type: "aisdk", package: "@ai-sdk/openai-compatible", url: QODER_BASE_URL, settings: {} };
+      provider.api = {
+        type: "aisdk",
+        package: "@ai-sdk/openai-compatible",
+        url: QODER_BASE_URL,
+        settings: {},
+      };
       provider.request = { headers: {}, body: {} };
       const apiKey = optionString(ctx.options, "apiKey");
       if (apiKey) provider.request.body.apiKey = apiKey;
@@ -221,7 +277,8 @@ async function setupV2(ctx: PluginContext): Promise<void> {
     event.language = new QoderLanguageModel(String(event.model.api.id), {
       ...event.options,
       ...connectionOptions,
-      apiKey: connectionOptions.apiKey || optionString(ctx.options, "apiKey") || event.options.apiKey,
+      apiKey:
+        connectionOptions.apiKey || optionString(ctx.options, "apiKey") || event.options.apiKey,
     });
   });
 
@@ -232,7 +289,9 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   // pattern opencode's built-in console provider uses. The warmup timer runs at
   // the end of the event loop so setup() never blocks on the network.
   const discoveryOptions = async (): Promise<QoderProviderOptions> => {
-    const connection = await authOptionsFromV2Connection(ctx, id).catch(() => ({}) as QoderProviderOptions);
+    const connection = await authOptionsFromV2Connection(ctx, id).catch(
+      () => ({}) as QoderProviderOptions,
+    );
     return {
       ...ctx.options,
       ...connection,
@@ -259,7 +318,11 @@ function abortableDelay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function pollDeviceFlow(codeVerifier: string, nonce: string, machineID: string): Promise<QoderCredentials> {
+async function pollDeviceFlow(
+  codeVerifier: string,
+  nonce: string,
+  machineID: string,
+): Promise<QoderCredentials> {
   const pollURL = `${QODER_OPENAPI_URL}/api/v1/deviceToken/poll?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(codeVerifier)}&challenge_method=S256`;
 
   for (let attempt = 0; attempt < 90; attempt++) {
@@ -271,7 +334,9 @@ async function pollDeviceFlow(codeVerifier: string, nonce: string, machineID: st
     if (response.status === 202 || response.status === 404) continue;
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
-      throw new Error(`Device token poll failed: ${response.status} ${response.statusText}. Response: ${errText}`);
+      throw new Error(
+        `Device token poll failed: ${response.status} ${response.statusText}. Response: ${errText}`,
+      );
     }
 
     const tokenData = (await response.json()) as {
@@ -288,10 +353,18 @@ async function pollDeviceFlow(codeVerifier: string, nonce: string, machineID: st
     try {
       const userinfoRes = await fetch(`${QODER_OPENAPI_URL}/api/v1/userinfo`, {
         method: "GET",
-        headers: { Authorization: `Bearer ${tokenData.token}`, Accept: "application/json", "User-Agent": USER_AGENT },
+        headers: {
+          Authorization: `Bearer ${tokenData.token}`,
+          Accept: "application/json",
+          "User-Agent": USER_AGENT,
+        },
       });
       if (userinfoRes.ok) {
-        const userinfo = (await userinfoRes.json()) as { email?: string; name?: string; username?: string };
+        const userinfo = (await userinfoRes.json()) as {
+          email?: string;
+          name?: string;
+          username?: string;
+        };
         email = userinfo.email || "";
         name = userinfo.name || userinfo.username || "";
       }
@@ -303,7 +376,11 @@ async function pollDeviceFlow(codeVerifier: string, nonce: string, machineID: st
       : Date.now() + (tokenData.expires_in || 30 * 24 * 60 * 60) * 1000;
 
     return {
-      refresh: encodeOAuthRefresh(tokenData.refresh_token || "", tokenData.user_id || "", machineID),
+      refresh: encodeOAuthRefresh(
+        tokenData.refresh_token || "",
+        tokenData.user_id || "",
+        machineID,
+      ),
       access: tokenData.token,
       expires: expires - 5 * 60 * 1000,
       userID: tokenData.user_id || "qoder-user",
@@ -319,19 +396,19 @@ async function pollDeviceFlow(codeVerifier: string, nonce: string, machineID: st
 function legacyHooks(options?: PluginOptions): Hooks {
   const id = providerID(options);
   return {
-    config: async (cfg) => applyLegacyConfig(cfg as unknown as Record<string, any>, options),
+    config: async (cfg) => applyLegacyConfig(cfg as unknown as LegacyConfig, options),
     auth: {
       provider: id,
       loader: async (auth) => {
-        const stored = (await auth()) as any;
+        const stored = (await auth()) as StoredCredential | undefined;
         if (!stored) return {};
         if (stored.type === "api") {
           return {
             apiKey: stored.key,
-            qoderUserID: stored.metadata?.userID,
-            qoderEmail: stored.metadata?.email,
-            qoderName: stored.metadata?.name,
-            qoderMachineID: stored.metadata?.machineID,
+            qoderUserID: metadataString(stored.metadata, "userID"),
+            qoderEmail: metadataString(stored.metadata, "email"),
+            qoderName: metadataString(stored.metadata, "name"),
+            qoderMachineID: metadataString(stored.metadata, "machineID"),
           };
         }
         if (stored.type === "oauth") {

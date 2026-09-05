@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
 import type { LanguageModelV3Prompt } from "@ai-sdk/provider";
+import { describe, expect, it } from "vitest";
 import { transformPrompt, transformTools } from "../transform.js";
 
 describe("transformPrompt", () => {
@@ -18,7 +18,12 @@ describe("transformPrompt", () => {
       {
         role: "tool",
         content: [
-          { type: "tool-result", toolCallId: "call_1", toolName: "read", output: { type: "text", value: "contents" } },
+          {
+            type: "tool-result",
+            toolCallId: "call_1",
+            toolName: "read",
+            output: { type: "text", value: "contents" },
+          },
         ],
       },
     ];
@@ -32,7 +37,11 @@ describe("transformPrompt", () => {
           role: "assistant",
           content: "<thinking>thinking</thinking>\n\nI will call a tool.",
           tool_calls: [
-            { id: "call_1", type: "function", function: { name: "read", arguments: '{"file":"a.ts"}' } },
+            {
+              id: "call_1",
+              type: "function",
+              function: { name: "read", arguments: '{"file":"a.ts"}' },
+            },
           ],
         },
         { role: "tool", tool_call_id: "call_1", content: "contents" },
@@ -64,14 +73,22 @@ describe("transformPrompt", () => {
 describe("transformTools", () => {
   it("maps function tools and counts unsupported provider tools", () => {
     const result = transformTools([
-      { type: "function", name: "read", inputSchema: { type: "object" }, description: "Read a file" },
+      {
+        type: "function",
+        name: "read",
+        inputSchema: { type: "object" },
+        description: "Read a file",
+      },
       { type: "provider", id: "qoder.web_search", name: "web_search", args: {} },
     ]);
 
     expect(result).toEqual({
       ignoredTools: 1,
       tools: [
-        { type: "function", function: { name: "read", description: "Read a file", parameters: { type: "object" } } },
+        {
+          type: "function",
+          function: { name: "read", description: "Read a file", parameters: { type: "object" } },
+        },
       ],
     });
   });

@@ -63,9 +63,11 @@ function stringifyToolResultOutput(output: LanguageModelV3ToolResultOutput): str
         .map((part) => {
           if (part.type === "text") return part.text;
           if (part.type === "file-url") return part.url;
-          if (part.type === "file-id") return typeof part.fileId === "string" ? part.fileId : JSON.stringify(part.fileId);
+          if (part.type === "file-id")
+            return typeof part.fileId === "string" ? part.fileId : JSON.stringify(part.fileId);
           if (part.type === "image-url") return part.url;
-          if (part.type === "image-file-id") return typeof part.fileId === "string" ? part.fileId : JSON.stringify(part.fileId);
+          if (part.type === "image-file-id")
+            return typeof part.fileId === "string" ? part.fileId : JSON.stringify(part.fileId);
           return "mediaType" in part ? `[${part.mediaType}]` : `[${part.type}]`;
         })
         .join("\n");
@@ -78,7 +80,9 @@ function textFromContent(content: QoderContent | null): string {
   return content.map((part) => (part.type === "text" ? part.text : "")).join("");
 }
 
-function transformUserMessage(message: Extract<LanguageModelV3Message, { role: "user" }>): QoderMessage {
+function transformUserMessage(
+  message: Extract<LanguageModelV3Message, { role: "user" }>,
+): QoderMessage {
   const parts: Array<QoderTextPart | QoderImagePart> = [];
   let hasFile = false;
 
@@ -95,11 +99,15 @@ function transformUserMessage(message: Extract<LanguageModelV3Message, { role: "
 
   return {
     role: "user",
-    content: hasFile ? parts : parts.map((part) => (part.type === "text" ? part.text : "")).join(""),
+    content: hasFile
+      ? parts
+      : parts.map((part) => (part.type === "text" ? part.text : "")).join(""),
   };
 }
 
-function transformAssistantMessage(message: Extract<LanguageModelV3Message, { role: "assistant" }>): QoderMessage {
+function transformAssistantMessage(
+  message: Extract<LanguageModelV3Message, { role: "assistant" }>,
+): QoderMessage {
   let content = "";
   const toolCalls: QoderToolCall[] = [];
 
@@ -130,7 +138,9 @@ function transformAssistantMessage(message: Extract<LanguageModelV3Message, { ro
   return result;
 }
 
-function transformToolMessage(message: Extract<LanguageModelV3Message, { role: "tool" }>): QoderMessage[] {
+function transformToolMessage(
+  message: Extract<LanguageModelV3Message, { role: "tool" }>,
+): QoderMessage[] {
   return message.content.flatMap((part) => {
     if (part.type !== "tool-result") return [];
     return [
@@ -167,11 +177,17 @@ function normalizeToolExchanges(messages: QoderMessage[]): QoderMessage[] {
 
     if (message.role === "tool") {
       const id = message.tool_call_id?.trim();
-      const matchIndex = id ? pendingToolCallIDs.indexOf(id) : pendingToolCallIDs.length > 0 ? 0 : -1;
+      const matchIndex = id
+        ? pendingToolCallIDs.indexOf(id)
+        : pendingToolCallIDs.length > 0
+          ? 0
+          : -1;
       if (matchIndex === -1) continue;
 
       const [matchedID] = pendingToolCallIDs.splice(matchIndex, 1);
-      normalized.push(matchedID === message.tool_call_id ? message : { ...message, tool_call_id: matchedID });
+      normalized.push(
+        matchedID === message.tool_call_id ? message : { ...message, tool_call_id: matchedID },
+      );
       continue;
     }
 
@@ -213,7 +229,10 @@ export function transformPrompt(prompt: LanguageModelV3Prompt): TransformedPromp
   return { system: system.join("\n\n"), messages: normalizedMessages, lastUserText };
 }
 
-export function transformTools(tools: LanguageModelV3CallOptions["tools"]): { tools: QoderTool[]; ignoredTools: number } {
+export function transformTools(tools: LanguageModelV3CallOptions["tools"]): {
+  tools: QoderTool[];
+  ignoredTools: number;
+} {
   if (!tools?.length) return { tools: [], ignoredTools: 0 };
   const result: QoderTool[] = [];
   let ignoredTools = 0;
