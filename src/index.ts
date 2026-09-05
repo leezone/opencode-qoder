@@ -12,12 +12,18 @@ import {
   PROVIDER_ID,
   PROVIDER_NAME,
   QODER_BASE_URL,
-  QODER_MODELS,
   QODER_OPENAPI_URL,
   QODER_PAT_ENV,
   USER_AGENT,
   ZERO_COST,
 } from "./constants.js";
+import {
+  catalogModels,
+  catalogSignature,
+  discoveryDisabled,
+  refreshModels,
+  type DiscoveredModel,
+} from "./model-catalog.js";
 import { createQoder, QoderLanguageModel } from "./language-model.js";
 
 export { createQoder, QoderLanguageModel };
@@ -27,6 +33,8 @@ type QoderPluginOptions = PluginOptions & {
   setDefault?: boolean;
   apiKey?: string;
 };
+
+const REFRESH_INTERVAL_MS = 15 * 60 * 1000;
 
 function optionString(options: PluginOptions | undefined, key: keyof QoderPluginOptions): string | undefined {
   const value = options?.[key];
@@ -41,8 +49,8 @@ function shouldSetDefault(options?: PluginOptions): boolean {
   return options?.setDefault === true;
 }
 
-function legacyModelConfig(model: (typeof QODER_MODELS)[number]) {
-  return {
+function legacyModelConfig(model: DiscoveredModel) {
+  const config: Record<string, unknown> = {
     name: model.name,
     reasoning: model.reasoning,
     tool_call: true,
@@ -50,7 +58,9 @@ function legacyModelConfig(model: (typeof QODER_MODELS)[number]) {
     cost: ZERO_COST,
     limit: {
       context: model.contextWindow,
-      input: model.contextWindow,
+      // opencode's auto-compaction threshold derives from limit.input, so it
+      // must reflect the tier the gateway actually applies, not the largest one.
+      input: model.inputWindow ?? model.contextWindow,
       output: model.maxTokens,
     },
     modalities: {
@@ -58,6 +68,30 @@ function legacyModelConfig(model: (typeof QODER_MODELS)[number]) {
       output: ["text"],
     },
   };
+  // Thinking-strength picker.
+  //
+  // Declared as the v1 Record form ({ "<effort>": <body> }). opencode's config
+  // schema keeps `variants` on plugin-supplied provider models but strips
+  // `reasoning_options`, so the Record is the only one of the two that survives;
+  // /config/providers then renders it straight through. That endpoint is what
+  // Paseo reads to build its thinkingOptions list, so the body shape must match
+  // what opencode itself generates for @ai-sdk/openai-compatible, namely
+  // {reasoningEffort: value}.
+  //
+  // Deliberately does NOT touch `reasoning` above. That flag is dual-purpose: it
+  // also feeds `model_config.is_reasoning` in the wire payload (language-model.ts).
+  // It is not needed for the picker -- verified on opencode 1.18.27 that
+  // kmodel_latest exposes high/low/max while capabilities.reasoning stays false --
+  // so leaving it alone keeps the gateway request byte-identical to before.
+  //
+  // Efforts come from Qoder's live `thinking_config.enabled.efforts`, e.g.
+  // kmodel_latest -> [high, low, max]. Models without a thinking_config keep an
+  // empty {} and an unchanged payload.
+  const efforts = model.efforts ?? [];
+  if (efforts.length > 0) {
+    config.variants = Object.fromEntries(efforts.map((effort) => [effort, { reasoningEffort: effort }]));
+  }
+  return config;
 }
 
 function applyLegacyConfig(cfg: Record<string, any>, options?: PluginOptions): void {
@@ -73,7 +107,7 @@ function applyLegacyConfig(cfg: Record<string, any>, options?: PluginOptions): v
   if (apiKey && current.options.apiKey === undefined) current.options.apiKey = apiKey;
   current.models ??= {};
 
-  for (const model of QODER_MODELS) {
+  for (const model of catalogModels()) {
     current.models[model.id] = {
       ...legacyModelConfig(model),
       ...(current.models[model.id] ?? {}),
@@ -83,7 +117,7 @@ function applyLegacyConfig(cfg: Record<string, any>, options?: PluginOptions): v
   if (shouldSetDefault(options) && !cfg.model) cfg.model = `${id}/auto`;
 }
 
-function v2ModelConfig(model: (typeof QODER_MODELS)[number]) {
+function v2ModelConfig(model: DiscoveredModel) {
   return {
     name: model.name,
     family: model.id,
@@ -99,14 +133,24 @@ function v2ModelConfig(model: (typeof QODER_MODELS)[number]) {
       input: model.input,
       output: ["text"],
     },
-    variants: [],
+    // One variant per advertised thinking strength. v7 merges the selected
+    // variant's body into request.body, and the aisdk bridge spreads
+    // request.body into the QoderLanguageModel options, where
+    // resolveReasoningEffort() picks it up.
+    variants: (model.efforts ?? []).map((effort) => ({
+      id: effort,
+      headers: {},
+      body: { reasoningEffort: effort },
+    })),
     time: { released: 0 },
     cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
     status: "active" as const,
+    // Models upstream explicitly disabled never enter catalogModels() (they are
+    // filtered by disabledIDs), so everything registered here is enabled.
     enabled: true,
     limit: {
       context: model.contextWindow,
-      input: model.contextWindow,
+      input: model.inputWindow ?? model.contextWindow,
       output: model.maxTokens,
     },
   };
@@ -162,7 +206,7 @@ async function setupV2(ctx: PluginContext): Promise<void> {
       if (apiKey) provider.request.body.apiKey = apiKey;
     });
 
-    for (const model of QODER_MODELS) {
+    for (const model of catalogModels()) {
       catalog.model.update(id, model.id, (draft) => {
         Object.assign(draft, v2ModelConfig(model));
       });
@@ -180,6 +224,35 @@ async function setupV2(ctx: PluginContext): Promise<void> {
       apiKey: connectionOptions.apiKey || optionString(ctx.options, "apiKey") || event.options.apiKey,
     });
   });
+
+  if (discoveryDisabled()) return;
+
+  // Dynamic model discovery. Refresh the live model list in the background and
+  // reload opencode's catalog only when the table actually changed -- the same
+  // pattern opencode's built-in console provider uses. The warmup timer runs at
+  // the end of the event loop so setup() never blocks on the network.
+  const discoveryOptions = async (): Promise<QoderProviderOptions> => {
+    const connection = await authOptionsFromV2Connection(ctx, id).catch(() => ({}) as QoderProviderOptions);
+    return {
+      ...ctx.options,
+      ...connection,
+      apiKey: connection.apiKey || optionString(ctx.options, "apiKey"),
+    };
+  };
+  const refreshCatalog = async (force: boolean): Promise<void> => {
+    const before = catalogSignature();
+    const status = await refreshModels(await discoveryOptions(), force);
+    if (status.source !== "qoder" || catalogSignature() === before) return;
+    if (typeof ctx.catalog.reload === "function") await ctx.catalog.reload();
+  };
+  const warm = setTimeout(() => {
+    refreshCatalog(true).catch(() => {});
+  }, 0);
+  warm.unref?.();
+  const timer = setInterval(() => {
+    refreshCatalog(false).catch(() => {});
+  }, REFRESH_INTERVAL_MS);
+  timer.unref?.();
 }
 
 function abortableDelay(ms: number): Promise<void> {

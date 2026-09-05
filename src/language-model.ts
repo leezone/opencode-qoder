@@ -12,16 +12,22 @@ import type {
 } from "@ai-sdk/provider";
 import { resolveQoderCredentials, type QoderProviderOptions } from "./auth.js";
 import { buildAuthHeaders } from "./cosy.js";
-import { getModelDefinition, QODER_CHAT_URL, USER_AGENT } from "./constants.js";
+import { QODER_CHAT_URL, USER_AGENT } from "./constants.js";
+import { getModelDefinition } from "./model-catalog.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { transformPrompt, transformTools, type QoderMessage, type QoderTool } from "./transform.js";
 
 type ToolCallState = {
-  id: string;
+  // Undefined until the upstream id arrives (or startToolCall fabricates one).
+  id?: string;
+  // True once an id streamed in from upstream, as opposed to a fabricated one.
+  upstreamID: boolean;
   name: string;
   arguments: string;
   started: boolean;
   finished: boolean;
+  // Argument deltas received before the id was known; flushed on start.
+  pendingDeltas: string[];
 };
 
 type QoderChunk = {
@@ -272,6 +278,42 @@ class ThinkingTagParser {
   }
 }
 
+// The effort ladder qodercli itself uses when folding a max_thinking_tokens
+// budget into a level (its xRE(): <=0 none, <=1024 low, <=8192 medium,
+// <=24576 high, <=49152 xhigh, else max).
+const EFFORT_LADDER = ["none", "low", "medium", "high", "xhigh", "max"] as const;
+
+// Resolve the thinking strength to put on the wire.
+//
+// Precedence:
+//   1. QODER_REASONING_EFFORT -- env override, so the gateway field can be
+//      verified before the picker is trusted end to end
+//   2. options.reasoningEffort -- where opencode delivers the selected variant's
+//      body: v7 merges the variant body into request.body, and the aisdk bridge
+//      spreads request.body into the options object passed to this constructor
+//   3. options.reasoning_effort -- tolerate the snake_case spelling as well
+//
+// Returns undefined for models that advertise no efforts (no thinking_config), so
+// their payload stays byte-identical to before this change.
+function resolveReasoningEffort(
+  options: LanguageModelV3CallOptions,
+  model: ReturnType<typeof getModelDefinition>,
+): string | undefined {
+  const supported = model?.efforts ?? [];
+  if (supported.length === 0) return undefined;
+  const env = String(process.env.QODER_REASONING_EFFORT ?? "").trim().toLowerCase();
+  if (env) return (EFFORT_LADDER as readonly string[]).includes(env) ? env : undefined;
+  const optionBag = options as Record<string, unknown>;
+  const picked = String(optionBag?.reasoningEffort ?? optionBag?.reasoning_effort ?? "")
+    .trim()
+    .toLowerCase();
+  if (!picked) return undefined;
+  if (!(EFFORT_LADDER as readonly string[]).includes(picked)) return undefined;
+  // The picker only ever offers this model's own efforts, so anything else means
+  // stale metadata. Dropping it is safer than risking a gateway 400.
+  return supported.includes(picked) ? picked : undefined;
+}
+
 function buildRequestBody(modelID: string, options: LanguageModelV3CallOptions, userID: string): { body: Record<string, unknown>; warnings: SharedV3Warning[] } {
   const model = getModelDefinition(modelID);
   const transformed = transformPrompt(options.prompt);
@@ -290,6 +332,18 @@ function buildRequestBody(modelID: string, options: LanguageModelV3CallOptions, 
   const parameters: Record<string, unknown> = { max_tokens: maxTokens };
   if (typeof options.temperature === "number") parameters.temperature = options.temperature;
   if (typeof options.topP === "number") parameters.top_p = options.topP;
+  // Thinking strength.
+  //
+  // opencode delivers the selected variant as providerOptions.qoder.reasoningEffort
+  // (the body it generates for @ai-sdk/openai-compatible variants).
+  // Qoder's own CLI puts the value in parameters.reasoning_effort -- see
+  // qodercli's `parameters:{...A.parameters, reasoning_effort:"none",
+  // max_thinking_tokens:0}`. Ladder: none/low/medium/high/xhigh/max.
+  //
+  // Only sent when the model actually advertises efforts, so models without a
+  // thinking_config (e.g. lite) keep their payload byte-identical to before.
+  const effort = resolveReasoningEffort(options, model);
+  if (effort) parameters.reasoning_effort = effort;
 
   return {
     warnings,
@@ -468,11 +522,24 @@ export class QoderLanguageModel implements LanguageModelV3 {
         let rawUsage: QoderChunk["usage"];
         let sawToolCall = false;
 
+        const startToolCall = (state: ToolCallState) => {
+          if (state.started) return;
+          // Reached only when upstream never supplied an id for this call.
+          if (!state.id) state.id = crypto.randomUUID();
+          state.started = true;
+          controller.enqueue({ type: "tool-input-start", id: state.id, toolName: state.name });
+          for (const pendingDelta of state.pendingDeltas) {
+            controller.enqueue({ type: "tool-input-delta", id: state.id, delta: pendingDelta });
+          }
+          state.pendingDeltas = [];
+        };
+
         const finishToolCall = (state: ToolCallState) => {
-          if (!state.started || state.finished) return;
+          if (state.finished || !state.name) return;
           state.finished = true;
-          controller.enqueue({ type: "tool-input-end", id: state.id });
-          controller.enqueue({ type: "tool-call", toolCallId: state.id, toolName: state.name, input: state.arguments });
+          startToolCall(state);
+          controller.enqueue({ type: "tool-input-end", id: state.id! });
+          controller.enqueue({ type: "tool-call", toolCallId: state.id!, toolName: state.name, input: state.arguments });
           sawToolCall = true;
         };
 
@@ -519,22 +586,38 @@ export class QoderLanguageModel implements LanguageModelV3 {
                   const state =
                     toolCalls[index] ??
                     (toolCalls[index] = {
-                      id: toolCallDelta.id || crypto.randomUUID(),
-                      name: toolCallDelta.function?.name || "",
+                      id: undefined,
+                      upstreamID: false,
+                      name: "",
                       arguments: "",
                       started: false,
                       finished: false,
+                      pendingDeltas: [],
                     });
-                  if (toolCallDelta.id && !state.started) state.id = toolCallDelta.id;
-                  if (toolCallDelta.function?.name) state.name = toolCallDelta.function.name;
-                  if (!state.started && state.name) {
-                    state.started = true;
-                    controller.enqueue({ type: "tool-input-start", id: state.id, toolName: state.name });
+                  // Adopt the upstream id whenever it shows up. Qoder's Kimi
+                  // adapter can deliver it in a later chunk than the function
+                  // name, and the previous `!state.started` guard threw it away
+                  // because `started` flips true as soon as the name is seen --
+                  // so every Kimi tool call ended up with a fabricated UUID that
+                  // the upstream could not reconcile on the next turn.
+                  if (toolCallDelta.id) {
+                    state.id = toolCallDelta.id;
+                    state.upstreamID = true;
                   }
+                  if (toolCallDelta.function?.name) state.name = toolCallDelta.function.name;
+                  // Hold tool-input-start until the id is known so it is emitted
+                  // with the real upstream id; buffer argument deltas meanwhile.
+                  // If upstream never provides one, startToolCall() fabricates an
+                  // id when the call finishes.
+                  if (!state.started && state.name && state.upstreamID) startToolCall(state);
                   const argDelta = toolCallDelta.function?.arguments || "";
                   if (argDelta) {
                     state.arguments += argDelta;
-                    controller.enqueue({ type: "tool-input-delta", id: state.id, delta: argDelta });
+                    if (state.started) {
+                      controller.enqueue({ type: "tool-input-delta", id: state.id!, delta: argDelta });
+                    } else {
+                      state.pendingDeltas.push(argDelta);
+                    }
                   }
                   if (state.started && isParsableJson(state.arguments)) finishToolCall(state);
                 }

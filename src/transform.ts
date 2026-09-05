@@ -118,7 +118,14 @@ function transformAssistantMessage(message: Extract<LanguageModelV3Message, { ro
     }
   }
 
-  const result: QoderMessage = { role: "assistant", content: content || null };
+  // Never emit `content: null`. Kimi/Moonshot rejects an assistant turn that
+  // carries tool_calls with a null content: it fails to rebuild the tool_calls
+  // block, so the following role:"tool" message can no longer be matched and
+  // upstream answers 400 `Invalid request: tool_call_id  is not found`.
+  // Kimi is declared reasoning:false and often calls a tool without any prose,
+  // which is exactly when `content` stays empty. An empty string is accepted by
+  // every OpenAI-compatible upstream (and is what qoder-bridge already sends).
+  const result: QoderMessage = { role: "assistant", content };
   if (toolCalls.length > 0) result.tool_calls = toolCalls;
   return result;
 }
