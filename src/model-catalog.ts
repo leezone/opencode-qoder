@@ -9,6 +9,7 @@ import {
   type QoderModelDefinition,
 } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
+import { readEnv } from "./env.js";
 import { fetchWithTimeout, jsonHeaders, readErrorBody } from "./http.js";
 import { errorMessage, logPlugin } from "./log.js";
 
@@ -79,9 +80,7 @@ let lastError = "";
 let inflight: Promise<CatalogStatus> | undefined;
 
 function envBool(name: string): boolean {
-  const value = String(process.env[name] ?? "")
-    .trim()
-    .toLowerCase();
+  const value = readEnv(name).toLowerCase();
   return value === "1" || value === "true" || value === "yes";
 }
 
@@ -92,18 +91,17 @@ export function discoveryDisabled(): boolean {
 
 // Go: qoderModelListURL() / QODER_MODEL_LIST_URL
 function modelListURL(): string {
-  const value = String(process.env.QODER_MODEL_LIST_URL ?? "").trim();
-  return value || QODER_MODEL_LIST_URL;
+  return readEnv("QODER_MODEL_LIST_URL") || QODER_MODEL_LIST_URL;
 }
 
 // Go: modelCatalogTTL() / QODER_MODEL_CACHE_SECONDS
 function cacheTTLMs(): number {
-  const seconds = Number.parseInt(String(process.env.QODER_MODEL_CACHE_SECONDS ?? "").trim(), 10);
+  const seconds = Number.parseInt(readEnv("QODER_MODEL_CACHE_SECONDS"), 10);
   return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : DEFAULT_TTL_MS;
 }
 
 function diskCachePath(): string {
-  const override = String(process.env.QODER_MODEL_DISK_CACHE ?? "").trim();
+  const override = readEnv("QODER_MODEL_DISK_CACHE");
   if (override) return override;
   // Sits next to opencode's own models.dev cache.
   return join(homedir(), ".cache", "opencode", "opencode-qoder-models.json");

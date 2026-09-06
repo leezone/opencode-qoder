@@ -1,4 +1,5 @@
 import { appendFileSync } from "node:fs";
+import { readEnv } from "./env.js";
 
 // Opt-in diagnostics. Point OPENCODE_QODER_LOG_FILE at a path and every line is
 // appended there; leave it unset -- the default, and what a normal install runs
@@ -21,7 +22,7 @@ const LOG_FILE_ENV = "OPENCODE_QODER_LOG_FILE";
 const INSTANCE = Math.random().toString(36).slice(2, 8);
 
 export function logPlugin(message: string): void {
-  const file = String(process.env[LOG_FILE_ENV] ?? "").trim();
+  const file = readEnv(LOG_FILE_ENV);
   if (file === "") return;
   try {
     appendFileSync(file, `${new Date().toISOString()} [opencode-qoder:${INSTANCE}] ${message}\n`);

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readEnv } from "./env.js";
 import { logPlugin } from "./log.js";
 
 export const PROVIDER_ID = "qoder";
@@ -179,7 +180,7 @@ export function parseStaticModels(raw: string, origin: string): QoderModelDefini
 // obvious when a hand-edit "does not take".
 function loadStaticModels(): { models: QoderModelDefinition[]; origin: string } {
   const candidates: Array<{ path: string; origin: string }> = [];
-  const envPath = String(process.env.QODER_STATIC_MODELS ?? "").trim();
+  const envPath = readEnv("QODER_STATIC_MODELS");
   if (envPath) candidates.push({ path: envPath, origin: `env ${envPath}` });
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
   candidates.push({

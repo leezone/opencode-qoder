@@ -70,12 +70,19 @@ function tokenShape(value: unknown): string {
   return `opaque(${value.length})`;
 }
 
+// The "usable string" guard shared by option and globalThis reads: absent,
+// non-string and empty-string all collapse to undefined. (metadataString next
+// to credentialToOptions deliberately keeps a weaker guard -- it returns "" as
+// a real value -- so it is NOT folded in here.)
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 function optionString(
   options: PluginOptions | undefined,
   key: keyof QoderPluginOptions,
 ): string | undefined {
-  const value = options?.[key];
-  return typeof value === "string" && value.length > 0 ? value : undefined;
+  return nonEmptyString(options?.[key]);
 }
 
 // Credential channel between the two module instances of this plugin.
@@ -103,8 +110,7 @@ function sharedState(): Record<string, unknown> {
 }
 
 function readSharedApiKey(): string | undefined {
-  const value = sharedState()[CREDENTIAL_KEY];
-  return typeof value === "string" && value.length > 0 ? value : undefined;
+  return nonEmptyString(sharedState()[CREDENTIAL_KEY]);
 }
 
 // First writer wins: a later hook invocation must not replace a working token
@@ -134,6 +140,18 @@ function shouldSetDefault(options?: PluginOptions): boolean {
   return options?.setDefault === true;
 }
 
+// The `limit` triple is identical on both config surfaces; only the v1 legacy
+// path carried the explanation, so the comment now lives with the shape.
+function modelLimit(model: DiscoveredModel): { context: number; input: number; output: number } {
+  return {
+    context: model.contextWindow,
+    // opencode's auto-compaction threshold derives from limit.input, so it
+    // must reflect the tier the gateway actually applies, not the largest one.
+    input: model.inputWindow ?? model.contextWindow,
+    output: model.maxTokens,
+  };
+}
+
 function legacyModelConfig(model: DiscoveredModel) {
   const config: Record<string, unknown> = {
     // Carries the credit multiplier and the exhausted marker -- see
@@ -143,13 +161,7 @@ function legacyModelConfig(model: DiscoveredModel) {
     tool_call: true,
     attachment: model.input.includes("image"),
     cost: ZERO_COST,
-    limit: {
-      context: model.contextWindow,
-      // opencode's auto-compaction threshold derives from limit.input, so it
-      // must reflect the tier the gateway actually applies, not the largest one.
-      input: model.inputWindow ?? model.contextWindow,
-      output: model.maxTokens,
-    },
+    limit: modelLimit(model),
     modalities: {
       input: model.input,
       output: ["text"],
@@ -281,11 +293,7 @@ function v2ModelConfig(model: DiscoveredModel) {
     // Models upstream explicitly disabled never enter catalogModels() (they are
     // filtered by disabledIDs), so everything registered here is enabled.
     enabled: true,
-    limit: {
-      context: model.contextWindow,
-      input: model.inputWindow ?? model.contextWindow,
-      output: model.maxTokens,
-    },
+    limit: modelLimit(model),
   };
 }
 
@@ -499,7 +507,10 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   timer.unref?.();
 }
 
-function abortableDelay(ms: number): Promise<void> {
+// Plain sleep. It was called abortableDelay but never accepted a signal or
+// abort reason -- the device poll loop just awaits it between attempts. Named
+// for what it does.
+function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -511,7 +522,7 @@ async function pollDeviceFlow(
   const pollURL = `${QODER_OPENAPI_URL}/api/v1/deviceToken/poll?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(codeVerifier)}&challenge_method=S256`;
 
   for (let attempt = 0; attempt < 90; attempt++) {
-    await abortableDelay(2000);
+    await delay(2000);
     const response = await fetch(pollURL, { method: "GET", headers: jsonHeaders() });
     if (response.status === 202 || response.status === 404) continue;
     if (!response.ok) {

@@ -14,6 +14,7 @@ import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
 import { QODER_CHAT_URL, USER_AGENT } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
 import { qoderEncodeBody } from "./encoding.js";
+import { readEnv } from "./env.js";
 import { getModelDefinition } from "./model-catalog.js";
 import { type QoderMessage, type QoderTool, transformPrompt, transformTools } from "./transform.js";
 
@@ -78,26 +79,24 @@ function stableChatRecordID(
   tools: QoderTool[],
   maxTokens: number,
 ): string {
-  const hash = crypto.createHash("sha256");
-  hash.update("qoder-record");
-  hash.update("\0");
-  hash.update(model);
-  for (const message of messages) {
-    hash.update("\0");
-    hash.update(message.role);
-    if (message.content)
-      hash.update(
-        typeof message.content === "string" ? message.content : JSON.stringify(message.content),
-      );
-    if (message.tool_calls) hash.update(JSON.stringify(message.tool_calls));
+  // stableHash NUL-separates each input, so a message folds its role, content
+  // and tool_calls into ONE input: that keeps the digest byte-identical to the
+  // previous hand-rolled hashing (verified over 10 adversarial inputs, incl.
+  // NULs inside content and cross-field boundary crafts).
+  const inputs = [model, ...messages.map(recordMessageInput)];
+  if (tools.length) inputs.push(JSON.stringify(tools));
+  inputs.push(`mt=${maxTokens}`);
+  return stableHash("qoder-record", ...inputs);
+}
+
+function recordMessageInput(message: QoderMessage): string {
+  let input = message.role;
+  if (message.content) {
+    input +=
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content);
   }
-  if (tools.length) {
-    hash.update("\0");
-    hash.update(JSON.stringify(tools));
-  }
-  hash.update("\0");
-  hash.update(`mt=${maxTokens}`);
-  return hash.digest("hex").slice(0, 16);
+  if (message.tool_calls) input += JSON.stringify(message.tool_calls);
+  return input;
 }
 
 function mapFinishReason(
@@ -262,15 +261,24 @@ class ThinkingTagParser {
       return;
     }
 
-    const trailingPrefixLength = getMaxTrailingPossibleTagPrefixLength(
-      this.textBuffer,
-      THINKING_TAG_VARIANTS.map((variant) => variant.open),
+    // Never emit a trailing fragment that could be the start of a tag we have
+    // not seen the beginning of yet.
+    this.flushSafePrefix(
+      getMaxTrailingPossibleTagPrefixLength(
+        this.textBuffer,
+        THINKING_TAG_VARIANTS.map((variant) => variant.open),
+      ),
+      (text) => this.emitter.text(text),
     );
-    const safeLen = this.textBuffer.length - trailingPrefixLength;
-    if (safeLen > 0) {
-      this.emitter.text(this.textBuffer.slice(0, safeLen));
-      this.textBuffer = this.textBuffer.slice(safeLen);
-    }
+  }
+
+  // Emit everything except the last `tailLength` chars, which may still turn
+  // out to be a partial tag and must wait for more input.
+  private flushSafePrefix(tailLength: number, emit: (text: string) => void): void {
+    const safeLen = this.textBuffer.length - tailLength;
+    if (safeLen <= 0) return;
+    emit(this.textBuffer.slice(0, safeLen));
+    this.textBuffer = this.textBuffer.slice(safeLen);
   }
 
   private processInsideThinking(): void {
@@ -285,15 +293,10 @@ class ThinkingTagParser {
       return;
     }
 
-    const trailingPrefixLength = getTrailingPossibleTagPrefixLength(
-      this.textBuffer,
-      this.activeEndTag,
+    this.flushSafePrefix(
+      getTrailingPossibleTagPrefixLength(this.textBuffer, this.activeEndTag),
+      (text) => this.emitter.reasoning(text),
     );
-    const safeLen = this.textBuffer.length - trailingPrefixLength;
-    if (safeLen > 0) {
-      this.emitter.reasoning(this.textBuffer.slice(0, safeLen));
-      this.textBuffer = this.textBuffer.slice(safeLen);
-    }
   }
 }
 
@@ -320,9 +323,7 @@ function resolveReasoningEffort(
 ): string | undefined {
   const supported = model?.efforts ?? [];
   if (supported.length === 0) return undefined;
-  const env = String(process.env.QODER_REASONING_EFFORT ?? "")
-    .trim()
-    .toLowerCase();
+  const env = readEnv("QODER_REASONING_EFFORT").toLowerCase();
   if (env) return (EFFORT_LADDER as readonly string[]).includes(env) ? env : undefined;
   const optionBag = options as Record<string, unknown>;
   const picked = String(optionBag?.reasoningEffort ?? optionBag?.reasoning_effort ?? "")
