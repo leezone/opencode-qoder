@@ -3,22 +3,28 @@ import type { PluginContext } from "@opencode-ai/plugin/v2/promise";
 import {
   decodeOAuthRefresh,
   encodeOAuthRefresh,
+  fetchQoderUserInfo,
   generatePKCE,
   type QoderCredentials,
   type QoderProviderOptions,
+  type QoderTokenResponse,
+  withProfileDefaults,
 } from "./auth.js";
 import {
+  DEVICE_TOKEN_TTL_SECONDS,
   PROVIDER_ID,
   PROVIDER_NAME,
   QODER_BASE_URL,
+  QODER_MANAGE_URL,
   QODER_OPENAPI_URL,
   QODER_PAT_ENV,
-  USER_AGENT,
+  REFRESH_SKEW_MS,
   ZERO_COST,
 } from "./constants.js";
 import { getMachineId } from "./cosy.js";
+import { jsonHeaders, readErrorBody } from "./http.js";
 import { createQoder, QoderLanguageModel } from "./language-model.js";
-import { logPlugin } from "./log.js";
+import { errorMessage, logPlugin } from "./log.js";
 import {
   catalogModels,
   catalogSignature,
@@ -299,39 +305,50 @@ function metadataString(metadata: Record<string, unknown> | undefined, field: st
   return typeof value === "string" ? value : undefined;
 }
 
+// One mapping from a stored credential to provider options, shared by both
+// auth loaders. They previously carried four hand-copied blocks that had
+// already drifted: the legacy oauth branch dropped email/name and the metadata
+// userID/machineID, and the two key branches disagreed on the type tag.
+//
+// opencode names the personal-access-token credential "api" on the legacy path
+// and "key" on the v2 path, so both are treated identically here; the metadata
+// fields are read uniformly because the legacy store may begin carrying them.
+function credentialToOptions(credential: StoredCredential): QoderProviderOptions {
+  const metadata = credential.metadata;
+  if (credential.type === "oauth") {
+    const decoded = decodeOAuthRefresh(credential.refresh || "");
+    return {
+      apiKey: credential.access,
+      qoderUserID: metadataString(metadata, "userID") || credential.accountId || decoded.userID,
+      qoderEmail: metadataString(metadata, "email"),
+      qoderName: metadataString(metadata, "name"),
+      qoderMachineID: metadataString(metadata, "machineID") || decoded.machineID,
+    };
+  }
+  if (credential.type === "key" || credential.type === "api") {
+    return {
+      apiKey: credential.key,
+      qoderUserID: metadataString(metadata, "userID"),
+      qoderEmail: metadataString(metadata, "email"),
+      qoderName: metadataString(metadata, "name"),
+      qoderMachineID: metadataString(metadata, "machineID"),
+    };
+  }
+  return {};
+}
+
 async function authOptionsFromV2Connection(
   ctx: PluginContext,
   id: string,
 ): Promise<QoderProviderOptions> {
   const connection = await ctx.integration.connection.active(id);
-  const credential = connection
-    ? ((await ctx.integration.connection.resolve(connection)) as StoredCredential)
-    : undefined;
-  if (!credential) return {};
-
-  if (credential.type === "key") {
-    return {
-      apiKey: credential.key,
-      qoderUserID: metadataString(credential.metadata, "userID"),
-      qoderEmail: metadataString(credential.metadata, "email"),
-      qoderName: metadataString(credential.metadata, "name"),
-      qoderMachineID: metadataString(credential.metadata, "machineID"),
-    };
-  }
-
-  if (credential.type === "oauth") {
-    const decoded = decodeOAuthRefresh(credential.refresh || "");
-    return {
-      apiKey: credential.access,
-      qoderUserID:
-        metadataString(credential.metadata, "userID") || credential.accountId || decoded.userID,
-      qoderEmail: metadataString(credential.metadata, "email"),
-      qoderName: metadataString(credential.metadata, "name"),
-      qoderMachineID: metadataString(credential.metadata, "machineID") || decoded.machineID,
-    };
-  }
-
-  return {};
+  if (!connection) return {};
+  // resolve() answers undefined when the credential is gone behind the
+  // connection record.
+  const credential = (await ctx.integration.connection.resolve(connection)) as
+    | StoredCredential
+    | undefined;
+  return credential ? credentialToOptions(credential) : {};
 }
 
 async function setupV2(ctx: PluginContext): Promise<void> {
@@ -399,9 +416,7 @@ async function setupV2(ctx: PluginContext): Promise<void> {
     // opencode authenticated by its own path -- leaving no trace of why
     // discovery never saw a credential.
     const connectionOptions = await authOptionsFromV2Connection(ctx, id).catch((error) => {
-      logPlugin(
-        `aisdk: connection lookup failed (${error instanceof Error ? error.message : String(error)})`,
-      );
+      logPlugin(`aisdk: connection lookup failed (${errorMessage(error)})`);
       return {} as QoderProviderOptions;
     });
     const apiKey =
@@ -467,7 +482,7 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   // A swallowed rejection here is how discovery ends up silently stuck on the
   // bundled table, so both timers report instead of discarding.
   const logRefreshFailure = (error: unknown): void => {
-    logPlugin(`refresh: failed (${error instanceof Error ? error.message : String(error)})`);
+    logPlugin(`refresh: failed (${errorMessage(error)})`);
   };
   // Armed only now: the aisdk handler above is registered before refreshCatalog
   // exists, so it fires this trigger rather than calling refreshCatalog directly.
@@ -497,54 +512,31 @@ async function pollDeviceFlow(
 
   for (let attempt = 0; attempt < 90; attempt++) {
     await abortableDelay(2000);
-    const response = await fetch(pollURL, {
-      method: "GET",
-      headers: { Accept: "application/json", "User-Agent": USER_AGENT },
-    });
+    const response = await fetch(pollURL, { method: "GET", headers: jsonHeaders() });
     if (response.status === 202 || response.status === 404) continue;
     if (!response.ok) {
-      const errText = await response.text().catch(() => "");
       throw new Error(
-        `Device token poll failed: ${response.status} ${response.statusText}. Response: ${errText}`,
+        `Device token poll failed: ${response.status} ${response.statusText}. Response: ${await readErrorBody(response)}`,
       );
     }
 
-    const tokenData = (await response.json()) as {
-      token?: string;
-      user_id?: string;
-      refresh_token?: string;
-      expires_at?: string;
-      expires_in?: number;
-    };
+    const tokenData = (await response.json()) as QoderTokenResponse;
     if (!tokenData.token) throw new Error("Device token poll returned empty access token");
 
-    let email = "";
-    let name = "";
-    try {
-      const userinfoRes = await fetch(`${QODER_OPENAPI_URL}/api/v1/userinfo`, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${tokenData.token}`,
-          Accept: "application/json",
-          "User-Agent": USER_AGENT,
-        },
-      });
-      if (userinfoRes.ok) {
-        const userinfo = (await userinfoRes.json()) as {
-          email?: string;
-          name?: string;
-          username?: string;
-        };
-        email = userinfo.email || "";
-        name = userinfo.name || userinfo.username || "";
-      }
-    } catch {}
+    // Shared with the PAT exchange path. Adds two Cosy-* headers the old
+    // inline call omitted; userinfo is a plain Bearer GET that ignores them.
+    const profile = await fetchQoderUserInfo(tokenData.token);
 
+    // The device flow answers expires_in in SECONDS (see constants.ts). It
+    // cannot reuse parseExpiresAt in auth.ts, whose >7-days heuristic would
+    // read 30 days as milliseconds and expire the token in ~43 minutes.
     const parsedExpires = tokenData.expires_at ? Date.parse(tokenData.expires_at) : Number.NaN;
     const expires = Number.isFinite(parsedExpires)
       ? parsedExpires
-      : Date.now() + (tokenData.expires_in || 30 * 24 * 60 * 60) * 1000;
+      : Date.now() + (tokenData.expires_in || DEVICE_TOKEN_TTL_SECONDS) * 1000;
 
+    // encodeOAuthRefresh keeps the raw user_id (may be empty), matching the PAT
+    // exchange; only the credential's identity fields get defaults applied.
     return {
       refresh: encodeOAuthRefresh(
         tokenData.refresh_token || "",
@@ -552,10 +544,12 @@ async function pollDeviceFlow(
         machineID,
       ),
       access: tokenData.token,
-      expires: expires - 5 * 60 * 1000,
-      userID: tokenData.user_id || "qoder-user",
-      email: email || "user@qoder.com",
-      name: name || "Qoder User",
+      expires: expires - REFRESH_SKEW_MS,
+      ...withProfileDefaults({
+        userID: tokenData.user_id,
+        email: profile.email,
+        name: profile.name,
+      }),
       machineID,
     };
   }
@@ -571,25 +565,7 @@ function legacyHooks(options?: PluginOptions): Hooks {
       provider: id,
       loader: async (auth) => {
         const stored = (await auth()) as StoredCredential | undefined;
-        if (!stored) return {};
-        if (stored.type === "api") {
-          return {
-            apiKey: stored.key,
-            qoderUserID: metadataString(stored.metadata, "userID"),
-            qoderEmail: metadataString(stored.metadata, "email"),
-            qoderName: metadataString(stored.metadata, "name"),
-            qoderMachineID: metadataString(stored.metadata, "machineID"),
-          };
-        }
-        if (stored.type === "oauth") {
-          const decoded = decodeOAuthRefresh(stored.refresh || "");
-          return {
-            apiKey: stored.access,
-            qoderUserID: stored.accountId || decoded.userID,
-            qoderMachineID: decoded.machineID,
-          };
-        }
-        return {};
+        return stored ? credentialToOptions(stored) : {};
       },
       methods: [
         {
@@ -603,7 +579,7 @@ function legacyHooks(options?: PluginOptions): Hooks {
             const { codeVerifier, codeChallenge } = generatePKCE();
             const nonce = crypto.randomUUID();
             const machineID = getMachineId();
-            const url = `https://qoder.com/device/selectAccounts?challenge=${codeChallenge}&challenge_method=S256&machine_id=${machineID}&nonce=${nonce}`;
+            const url = `${QODER_MANAGE_URL}/device/selectAccounts?challenge=${codeChallenge}&challenge_method=S256&machine_id=${machineID}&nonce=${nonce}`;
             return {
               url,
               instructions: "Complete the Qoder browser login, then return to opencode.",

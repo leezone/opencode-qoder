@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { QODER_CLIENT_TYPE, QODER_VERSION } from "./constants.js";
 
 const qoderRSAPublicKey = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
@@ -10,8 +11,6 @@ MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
 XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----`;
 
-const QoderIDEVersion = "1.0.0";
-const QoderClientType = "5";
 const QoderDataPolicy = "disagree";
 const QoderLoginVersion = "v2";
 const QoderMachineOS = "x86_64_windows";
@@ -115,7 +114,7 @@ export function buildAuthHeaders(
     version: "v1",
     requestId,
     info: infoB64,
-    cosyVersion: QoderIDEVersion,
+    cosyVersion: QODER_VERSION,
     ideVersion: "",
   };
 
@@ -138,12 +137,12 @@ export function buildAuthHeaders(
     "Cosy-Key": cosyKey,
     "Cosy-User": creds.userID,
     "Cosy-Date": timestamp,
-    "Cosy-Version": QoderIDEVersion,
+    "Cosy-Version": QODER_VERSION,
     "Cosy-Machineid": machineID,
     "Cosy-Machinetoken": machineID,
     "Cosy-Machinetype": QoderMachineTypeMagic,
     "Cosy-Machineos": QoderMachineOS,
-    "Cosy-Clienttype": QoderClientType,
+    "Cosy-Clienttype": QODER_CLIENT_TYPE,
     "Cosy-Clientip": "127.0.0.1",
     "Cosy-Bodyhash": bodyHash,
     "Cosy-Bodylength": bodyLen,

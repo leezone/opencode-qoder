@@ -9,7 +9,6 @@ export const PROVIDER_NAME = "Qoder";
 
 export const QODER_BASE_URL = "https://api3.qoder.sh/";
 export const QODER_OPENAPI_URL = "https://openapi.qoder.sh";
-export const QODER_CENTER_URL = "https://center.qoder.sh";
 export const QODER_MANAGE_URL = "https://qoder.com";
 
 export const QODER_MODEL_LIST_URL = `${QODER_BASE_URL}algo/api/v2/model/list`;
@@ -17,12 +16,35 @@ export const QODER_QUOTA_URL = `${QODER_OPENAPI_URL}/api/v2/quota/usage`;
 export const QODER_CHAT_URL = `${QODER_BASE_URL}algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
 export const QODER_EXCHANGE_URL = `${QODER_OPENAPI_URL}/api/v1/jobToken/exchange`;
 export const QODER_USERINFO_URL = `${QODER_OPENAPI_URL}/api/v1/userinfo`;
-export const QODER_REFRESH_URL = `${QODER_CENTER_URL}/algo/api/v3/user/refresh_token`;
 
 export const QODER_PAT_ENV = ["QODER_PERSONAL_ACCESS_TOKEN", "QODER_PAT"] as const;
 export const USER_AGENT = "opencode-qoder";
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cache_read: 0, cache_write: 0 });
+
+// Defaults for an incomplete identity profile. credentialsFromPat(),
+// resolveQoderCredentials() and the device-flow login all synthesize a
+// QoderCredentials, and all three used to repeat the same triple inline.
+export const QODER_DEFAULT_USER_ID = "qoder-user";
+export const QODER_DEFAULT_EMAIL = "user@qoder.com";
+export const QODER_DEFAULT_NAME = "Qoder User";
+
+// Tokens are treated as expired this long before their actual deadline, so a
+// request never starts with a token that dies mid-flight.
+export const REFRESH_SKEW_MS = 5 * 60 * 1000;
+
+// Fallback lifetime for a device-flow token that reports no expiry at all.
+// Unlike the exchange endpoints this one is answered in SECONDS.
+export const DEVICE_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+// Client identity sent on every authenticated Qoder request. Two surfaces
+// consume it: auth.ts puts it on the openapi.qoder.sh JSON calls (PAT exchange,
+// userinfo) as Cosy-Version/Cosy-ClientType, and cosy.ts embeds the version in
+// the COSY payload and sends it on the api3.qoder.sh surface as
+// Cosy-Version/Cosy-Clienttype. They used to carry different version strings
+// (1.0.1 vs 1.0.0); unified to "1.0.1" by review decision B4.
+export const QODER_VERSION = "1.0.1";
+export const QODER_CLIENT_TYPE = "5";
 
 // Bundled fallback table, loaded from models.json at startup.
 //

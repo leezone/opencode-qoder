@@ -7,10 +7,10 @@ import {
   QODER_MODELS,
   QODER_QUOTA_URL,
   type QoderModelDefinition,
-  USER_AGENT,
 } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
-import { logPlugin } from "./log.js";
+import { fetchWithTimeout, jsonHeaders, readErrorBody } from "./http.js";
+import { errorMessage, logPlugin } from "./log.js";
 
 // Dynamic model discovery for Qoder.
 //
@@ -343,7 +343,17 @@ export function parseCatalog(payload: unknown): DiscoveredModel[] {
 
 let quotaExhausted = false;
 
-function bucketRemaining(usage: Record<string, unknown>, keys: string[]): number {
+// The buckets the account can draw on, labelled for the log. Single source for
+// isQuotaExhausted()'s sum AND quotaSnapshot()'s rendering: the camelCase /
+// snake_case key lists used to be retyped in both, and a rename upstream would
+// have had to land in two places.
+const QUOTA_BUCKETS: ReadonlyArray<readonly [label: string, keys: readonly string[]]> = [
+  ["userQuota", ["user_quota", "userQuota"]],
+  ["addOnQuota", ["add_on_quota", "addOnQuota"]],
+  ["orgPackage", ["org_resource_package", "orgResourcePackage", "shared_quota", "sharedQuota"]],
+];
+
+function bucketRemaining(usage: Record<string, unknown>, keys: readonly string[]): number {
   for (const key of keys) {
     const bucket = usage[key];
     if (bucket && typeof bucket === "object") {
@@ -352,6 +362,16 @@ function bucketRemaining(usage: Record<string, unknown>, keys: string[]): number
     }
   }
   return 0;
+}
+
+function totalRemaining(usage: Record<string, unknown>): number {
+  return QUOTA_BUCKETS.reduce((sum, [, keys]) => sum + bucketRemaining(usage, keys), 0);
+}
+
+// Explicit exceeded flag, or undefined when the payload carries neither spelling.
+function quotaFlag(usage: Record<string, unknown>): boolean | undefined {
+  const flag = usage.is_quota_exceeded ?? usage.isQuotaExceeded;
+  return typeof flag === "boolean" ? flag : undefined;
 }
 
 // qodercli: OsA(usage) -- the exceeded flag, or every bucket drained.
@@ -366,32 +386,17 @@ export function isQuotaExhausted(payload: unknown): boolean {
   if (typeof userID !== "string" || userID === "" || typeof userType !== "string" || !userType) {
     return false;
   }
-  const flag = usage.is_quota_exceeded ?? usage.isQuotaExceeded;
-  const remaining =
-    bucketRemaining(usage, ["user_quota", "userQuota"]) +
-    bucketRemaining(usage, ["add_on_quota", "addOnQuota"]) +
-    bucketRemaining(usage, [
-      "org_resource_package",
-      "orgResourcePackage",
-      "shared_quota",
-      "sharedQuota",
-    ]);
+  const flag = quotaFlag(usage);
+  const remaining = totalRemaining(usage);
   // total_usage_percentage is deliberately NOT consulted, though qodercli falls
   // back to it. The live endpoint returns it as a fraction (1 == 100%), and it
   // measures the plan quota alone: observed with userQuota at 3000/3000 while
   // orgResourcePackage still held 229 and isQuotaExceeded was false. Reading it
   // as ">= 100" would be wrong twice over -- wrong scale, and it would call an
   // account exhausted that still has an org package to draw on.
-  if (typeof flag === "boolean") return flag || remaining <= 0;
+  if (flag !== undefined) return flag || remaining <= 0;
   return remaining <= 0;
 }
-
-// The buckets isQuotaExhausted() sums, labelled for the log.
-const QUOTA_BUCKETS: ReadonlyArray<readonly [label: string, keys: readonly string[]]> = [
-  ["userQuota", ["user_quota", "userQuota"]],
-  ["addOnQuota", ["add_on_quota", "addOnQuota"]],
-  ["orgPackage", ["org_resource_package", "orgResourcePackage", "shared_quota", "sharedQuota"]],
-];
 
 // Renders why isQuotaExhausted() decided what it did. Without this, a log of
 // "exhausted=false" cannot be told apart from "the quota call failed open" --
@@ -413,8 +418,7 @@ function quotaSnapshot(usage: Record<string, unknown>): string {
     parts.push(Number.isFinite(cap) ? `${label}=${left}/${cap}` : `${label}=${left}`);
   }
   if (parts.length === 0) parts.push("buckets=<none>");
-  const flag = usage.is_quota_exceeded ?? usage.isQuotaExceeded;
-  parts.push(`flag=${typeof flag === "boolean" ? flag : "absent"}`);
+  parts.push(`flag=${quotaFlag(usage) ?? "absent"}`);
   const pct = Number(usage.total_usage_percentage ?? usage.totalUsagePercentage);
   // Shown as a percentage for readability. It is a fraction upstream and is
   // deliberately not part of the decision -- see isQuotaExhausted().
@@ -425,34 +429,28 @@ function quotaSnapshot(usage: Record<string, unknown>): string {
 // Fails open: an unreachable quota endpoint must not paint the whole catalog
 // unavailable. qodercli's vEu() returns false on error too.
 async function fetchQuotaExhausted(options: QoderProviderOptions): Promise<boolean> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
     const credentials = await resolveQoderCredentials(options);
-    const response = await fetch(QODER_QUOTA_URL, {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": USER_AGENT,
-        Authorization: `Bearer ${credentials.access}`,
+    return await fetchWithTimeout(
+      QODER_QUOTA_URL,
+      { headers: jsonHeaders({ Authorization: `Bearer ${credentials.access}` }) },
+      FETCH_TIMEOUT_MS,
+      async (response) => {
+        if (!response.ok) {
+          logPlugin(`quota: HTTP ${response.status} -- failing open, nothing marked Unavailable`);
+          return false;
+        }
+        const payload: unknown = await response.json();
+        const exhausted = isQuotaExhausted(payload);
+        const usage =
+          payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+        logPlugin(`quota: exhausted=${exhausted} ${quotaSnapshot(usage)}`);
+        return exhausted;
       },
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      logPlugin(`quota: HTTP ${response.status} -- failing open, nothing marked Unavailable`);
-      return false;
-    }
-    const payload: unknown = await response.json();
-    const exhausted = isQuotaExhausted(payload);
-    const usage =
-      payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
-    logPlugin(`quota: exhausted=${exhausted} ${quotaSnapshot(usage)}`);
-    return exhausted;
+    );
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    logPlugin(`quota: ${reason} -- failing open, nothing marked Unavailable`);
+    logPlugin(`quota: ${errorMessage(error)} -- failing open, nothing marked Unavailable`);
     return false;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -497,33 +495,26 @@ export function displayName(model: DiscoveredModel): string {
 async function fetchModels(options: QoderProviderOptions): Promise<DiscoveredModel[]> {
   const credentials = await resolveQoderCredentials(options);
   const url = modelListURL();
-  const headers = buildAuthHeaders(null, url, {
-    userID: credentials.userID,
-    authToken: credentials.access,
-    name: credentials.name,
-    email: credentials.email,
-    machineID: credentials.machineID,
+  // buildAuthHeaders supplies only Cosy-*/Authorization/X-Request-Id, so merging
+  // it under jsonHeaders cannot clobber Accept/User-Agent/Accept-Encoding.
+  const headers = jsonHeaders({
+    "Accept-Encoding": "identity",
+    ...buildAuthHeaders(null, url, {
+      userID: credentials.userID,
+      authToken: credentials.access,
+      name: credentials.name,
+      email: credentials.email,
+      machineID: credentials.machineID,
+    }),
   });
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, {
-      headers: {
-        Accept: "application/json",
-        "Accept-Encoding": "identity",
-        "User-Agent": USER_AGENT,
-        ...headers,
-      },
-      signal: controller.signal,
-    });
+  return fetchWithTimeout(url, { headers }, FETCH_TIMEOUT_MS, async (response) => {
     if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      throw new Error(`Qoder model list returned ${response.status}: ${text.slice(0, 200)}`);
+      throw new Error(
+        `Qoder model list returned ${response.status}: ${await readErrorBody(response)}`,
+      );
     }
     return parseCatalog(await response.json());
-  } finally {
-    clearTimeout(timer);
-  }
+  });
 }
 
 // Go: RefreshQoderModels(ctx, force)
@@ -560,7 +551,7 @@ export async function refreshModels(
     } catch (error) {
       // Keep serving whatever we had (live, then disk cache, then bundled);
       // retry sooner than the happy-path TTL.
-      lastError = error instanceof Error ? error.message : String(error);
+      lastError = errorMessage(error);
       expiresAt = Date.now() + ERROR_TTL_MS;
     } finally {
       inflight = undefined;

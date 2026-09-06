@@ -1,12 +1,17 @@
 import crypto from "node:crypto";
 import {
+  QODER_CLIENT_TYPE,
+  QODER_DEFAULT_EMAIL,
+  QODER_DEFAULT_NAME,
+  QODER_DEFAULT_USER_ID,
   QODER_EXCHANGE_URL,
   QODER_PAT_ENV,
-  QODER_REFRESH_URL,
   QODER_USERINFO_URL,
-  USER_AGENT,
+  QODER_VERSION,
+  REFRESH_SKEW_MS,
 } from "./constants.js";
 import { getMachineId } from "./cosy.js";
+import { jsonHeaders, readErrorBody } from "./http.js";
 
 export interface QoderCredentials {
   access: string;
@@ -27,6 +32,17 @@ export interface QoderProviderOptions {
   qoderMachineID?: string;
 }
 
+// Response shape shared by the token exchange, the device-token poll, and (if
+// it were ever wired up) a refresh call: all answer with a job token plus its
+// expiry. Declared once; it used to be retyped inline at each call site.
+export interface QoderTokenResponse {
+  token?: string;
+  user_id?: string;
+  refresh_token?: string;
+  expires_at?: string;
+  expires_in?: number;
+}
+
 export const PAT_REFRESH_PREFIX = "pat";
 
 const credentialsCache = new Map<string, Promise<QoderCredentials> | QoderCredentials>();
@@ -38,21 +54,6 @@ export function encodePatRefresh(
   machineID: string,
 ): string {
   return [PAT_REFRESH_PREFIX, pat, jobRefreshToken, userID, machineID].join("|");
-}
-
-export function decodePatRefresh(refresh: string): {
-  pat: string;
-  jobRefreshToken: string;
-  userID: string;
-  machineID: string;
-} {
-  const parts = refresh.split("|");
-  return {
-    pat: parts[1] || "",
-    jobRefreshToken: parts[2] || "",
-    userID: parts[3] || "",
-    machineID: parts[4] || "",
-  };
 }
 
 export function encodeOAuthRefresh(
@@ -92,25 +93,52 @@ function parseExpiresAt(expiresAt?: string, expiresIn?: number): number {
     if (Number.isFinite(numeric) && numeric > 0) return numeric;
   }
   if (expiresIn && expiresIn > 0) {
-    // PAT exchange returns milliseconds; browser device flow returns seconds.
+    // The exchange endpoint answers in milliseconds; a seconds-scaled value
+    // only ever shows up here if upstream changes units or a caller passes one
+    // in, hence the >7-days heuristic. The device-flow login does NOT use this
+    // helper: it always answers in seconds (30-day default), and 2.59e6 is
+    // above the 7-day threshold, so routing it through here would read it as
+    // milliseconds and expire the token in ~43 minutes. It keeps its own
+    // parser in index.ts for exactly that reason.
     return Date.now() + (expiresIn > 7 * 24 * 60 * 60 ? expiresIn : expiresIn * 1000);
   }
   return Date.now() + 24 * 60 * 60 * 1000;
 }
 
-async function fetchUserInfo(
+// Fallback identity for the profile fields, applied wherever a QoderCredentials
+// is synthesized from a possibly-partial upstream profile. credentialsFromPat(),
+// resolveQoderCredentials() and the device-flow login all needed the same triple;
+// it was the copy-paste point, so it is the place a rename used to drift.
+export function withProfileDefaults(profile: { userID?: string; email?: string; name?: string }): {
+  userID: string;
+  email: string;
+  name: string;
+} {
+  return {
+    userID: profile.userID || QODER_DEFAULT_USER_ID,
+    email: profile.email || QODER_DEFAULT_EMAIL,
+    name: profile.name || QODER_DEFAULT_NAME,
+  };
+}
+
+// The openapi.qoder.sh identity endpoints expect these two client tags on the
+// JSON calls that carry no COSY signature.
+function openApiHeaders(token?: string): Record<string, string> {
+  return jsonHeaders({
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    "Cosy-Version": QODER_VERSION,
+    "Cosy-ClientType": QODER_CLIENT_TYPE,
+  });
+}
+
+// Best-effort identity lookup. Both credential paths (PAT exchange and the
+// device-flow login) call it; a failure yields an empty profile rather than a
+// throw, since the token is already valid without it.
+export async function fetchQoderUserInfo(
   jobToken: string,
 ): Promise<{ userID: string; email: string; name: string }> {
   try {
-    const res = await fetch(QODER_USERINFO_URL, {
-      headers: {
-        Authorization: `Bearer ${jobToken}`,
-        Accept: "application/json",
-        "User-Agent": USER_AGENT,
-        "Cosy-Version": "1.0.1",
-        "Cosy-ClientType": "5",
-      },
-    });
+    const res = await fetch(QODER_USERINFO_URL, { headers: openApiHeaders(jobToken) });
     if (!res.ok) return { userID: "", email: "", name: "" };
     const info = (await res.json()) as {
       id?: string;
@@ -139,40 +167,30 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
   const pending = (async () => {
     const res = await fetch(QODER_EXCHANGE_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "User-Agent": USER_AGENT,
-        "Cosy-Version": "1.0.1",
-        "Cosy-ClientType": "5",
-      },
+      headers: { "Content-Type": "application/json", ...openApiHeaders() },
       body: JSON.stringify({ personal_token: pat }),
     });
 
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
       throw new Error(
-        `Qoder PAT exchange failed: ${res.status} ${res.statusText}. ${text.slice(0, 200)}`,
+        `Qoder PAT exchange failed: ${res.status} ${res.statusText}. ${await readErrorBody(res)}`,
       );
     }
 
-    const data = (await res.json()) as {
-      token?: string;
-      refresh_token?: string;
-      expires_at?: string;
-      expires_in?: number;
-    };
+    const data = (await res.json()) as QoderTokenResponse;
     if (!data.token) throw new Error("Qoder PAT exchange returned no job token");
 
-    const profile = await fetchUserInfo(data.token);
+    // encodePatRefresh stores the RAW upstream userID (empty when userinfo was
+    // unreachable), while the returned credential carries the defaulted one --
+    // so keep the raw profile separate from the applied-defaults one.
+    const rawProfile = await fetchQoderUserInfo(data.token);
+    const profile = withProfileDefaults(rawProfile);
     const machineID = getMachineId();
     return {
-      refresh: encodePatRefresh(pat, data.refresh_token || "", profile.userID, machineID),
+      refresh: encodePatRefresh(pat, data.refresh_token || "", rawProfile.userID, machineID),
       access: data.token,
-      expires: parseExpiresAt(data.expires_at, data.expires_in) - 5 * 60 * 1000,
-      userID: profile.userID || "qoder-user",
-      email: profile.email || "user@qoder.com",
-      name: profile.name || "Qoder User",
+      expires: parseExpiresAt(data.expires_at, data.expires_in) - REFRESH_SKEW_MS,
+      ...profile,
       machineID,
     } satisfies QoderCredentials;
   })();
@@ -186,46 +204,6 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
     credentialsCache.delete(pat);
     throw error;
   }
-}
-
-export async function refreshOAuthCredential(
-  credential: QoderCredentials,
-): Promise<QoderCredentials> {
-  const { refreshToken, userID, machineID } = decodeOAuthRefresh(credential.refresh);
-  if (!refreshToken) return credential;
-
-  const response = await fetch(QODER_REFRESH_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${credential.access}`,
-      Accept: "application/json",
-      "User-Agent": USER_AGENT,
-    },
-    body: JSON.stringify({ refreshToken }),
-  });
-
-  if (!response.ok) return credential;
-  const data = (await response.json()) as {
-    token?: string;
-    refresh_token?: string;
-    expires_at?: string;
-    expires_in?: number;
-  };
-  if (!data.token) return credential;
-
-  return {
-    ...credential,
-    access: data.token,
-    refresh: encodeOAuthRefresh(
-      data.refresh_token || refreshToken,
-      userID || credential.userID,
-      machineID || credential.machineID,
-    ),
-    expires: parseExpiresAt(data.expires_at, data.expires_in) - 5 * 60 * 1000,
-    userID: userID || credential.userID,
-    machineID: machineID || credential.machineID,
-  };
 }
 
 export async function resolveQoderCredentials(
@@ -244,9 +222,11 @@ export async function resolveQoderCredentials(
     access: token,
     refresh: "",
     expires: Date.now() + 60 * 60 * 1000,
-    userID: options.qoderUserID || "qoder-user",
-    email: options.qoderEmail || "user@qoder.com",
-    name: options.qoderName || "Qoder User",
+    ...withProfileDefaults({
+      userID: options.qoderUserID,
+      email: options.qoderEmail,
+      name: options.qoderName,
+    }),
     machineID: options.qoderMachineID || getMachineId(),
   };
 }

@@ -31,3 +31,11 @@ export function logPlugin(message: string): void {
     // for reporting this is the one that just failed.
   }
 }
+
+// A logged cause is the only record most failures leave, and the unknown is
+// typed as `unknown` everywhere a fetch or connection lookup can reject.
+// Extracting the message by hand (`error instanceof Error ? error.message :
+// String(error)`) was repeated at every catch site.
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
