@@ -37,13 +37,19 @@ export const REFRESH_SKEW_MS = 5 * 60 * 1000;
 // Unlike the exchange endpoints this one is answered in SECONDS.
 export const DEVICE_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 
-// Client identity sent on every authenticated Qoder request. Two surfaces
-// consume it: auth.ts puts it on the openapi.qoder.sh JSON calls (PAT exchange,
-// userinfo) as Cosy-Version/Cosy-ClientType, and cosy.ts embeds the version in
-// the COSY payload and sends it on the api3.qoder.sh surface as
-// Cosy-Version/Cosy-Clienttype. They used to carry different version strings
-// (1.0.1 vs 1.0.0); unified to "1.0.1" by review decision B4.
-export const QODER_VERSION = "1.0.1";
+// Client identity sent on authenticated Qoder requests. The api3.qoder.sh COSY
+// surface (cosy.ts: header + signed payload field) and the openapi.qoder.sh
+// JSON calls (auth.ts) both consume it.
+//
+// Value pinned to the reference client by reading qodercli's own bundle: it sets
+// `Cosy-Version = <its package version>` (ItA = BSA || "1.1.42") and uses that
+// single value everywhere it injects identity headers — there is no 1.0.x in the
+// real client. The token-exchange POSTs don't send Cosy-Version at all, so it is
+// advisory/telemetry: nothing here gates on it, but matching a current real
+// client is the safe default. Earlier values (1.0.0 on COSY, 1.0.1 on openapi)
+// were stale guesses. Bump this to track qodercli when convenient; it is not a
+// correctness dependency.
+export const QODER_VERSION = "1.1.42";
 export const QODER_CLIENT_TYPE = "5";
 
 // Bundled fallback table, loaded from models.json at startup.
