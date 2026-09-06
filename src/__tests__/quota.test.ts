@@ -11,8 +11,11 @@ function quota(overrides: Record<string, unknown> = {}): Record<string, unknown>
   return { user_id: "u1", user_type: "individual", ...overrides };
 }
 
-// The catalog holds module-level state (quotaExhausted, liveModels, TTLs), so
-// each case loads a fresh registry and stubs fetch to serve both endpoints.
+// The catalog and quota modules hold module-level state (quotaExhausted,
+// liveModels, TTLs), so each case loads a fresh registry and stubs fetch to
+// serve both endpoints. Both modules are imported together so they share the
+// same fresh instance graph (model-catalog itself imports quota). The binding
+// is named quotaModule so it never shadows the quota() payload helper above.
 async function loadCatalog(handlers: { models: unknown; quota?: unknown; quotaOk?: boolean }) {
   vi.resetModules();
   const urls: string[] = [];
@@ -37,7 +40,11 @@ async function loadCatalog(handlers: { models: unknown; quota?: unknown; quotaOk
       } as unknown as Response;
     }),
   );
-  return { catalog: await import("../model-catalog.js"), urls };
+  return {
+    catalog: await import("../model-catalog.js"),
+    quotaModule: await import("../quota.js"),
+    urls,
+  };
 }
 
 // parseCatalog needs recognisable limits, so every fixture carries one.
@@ -88,24 +95,26 @@ afterEach(() => {
 
 describe("isQuotaExhausted", () => {
   it("reads the exceeded flag", async () => {
-    const { catalog } = await loadCatalog({ models: modelsFixture });
-    expect(catalog.isQuotaExhausted(quota({ is_quota_exceeded: true }))).toBe(true);
+    const { quotaModule } = await loadCatalog({ models: modelsFixture });
+    expect(quotaModule.isQuotaExhausted(quota({ is_quota_exceeded: true }))).toBe(true);
     expect(
-      catalog.isQuotaExhausted(quota({ is_quota_exceeded: false, user_quota: { remaining: 5 } })),
+      quotaModule.isQuotaExhausted(
+        quota({ is_quota_exceeded: false, user_quota: { remaining: 5 } }),
+      ),
     ).toBe(false);
   });
 
   it("accepts the camelCase spelling", async () => {
-    const { catalog } = await loadCatalog({ models: modelsFixture });
+    const { quotaModule } = await loadCatalog({ models: modelsFixture });
     expect(
-      catalog.isQuotaExhausted({ userId: "u1", userType: "individual", isQuotaExceeded: true }),
+      quotaModule.isQuotaExhausted({ userId: "u1", userType: "individual", isQuotaExceeded: true }),
     ).toBe(true);
   });
 
   it("treats drained buckets as exhausted even when the flag says otherwise", async () => {
-    const { catalog } = await loadCatalog({ models: modelsFixture });
+    const { quotaModule } = await loadCatalog({ models: modelsFixture });
     expect(
-      catalog.isQuotaExhausted(
+      quotaModule.isQuotaExhausted(
         quota({
           is_quota_exceeded: false,
           user_quota: { remaining: 0 },
@@ -116,27 +125,27 @@ describe("isQuotaExhausted", () => {
   });
 
   it("sums the add-on and shared buckets before concluding drained", async () => {
-    const { catalog } = await loadCatalog({ models: modelsFixture });
+    const { quotaModule } = await loadCatalog({ models: modelsFixture });
     expect(
-      catalog.isQuotaExhausted(
+      quotaModule.isQuotaExhausted(
         quota({ user_quota: { remaining: 0 }, add_on_quota: { remaining: 3 } }),
       ),
     ).toBe(false);
     expect(
-      catalog.isQuotaExhausted(
+      quotaModule.isQuotaExhausted(
         quota({ user_quota: { remaining: 0 }, shared_quota: { remaining: 2 } }),
       ),
     ).toBe(false);
   });
 
   it("ignores the usage percentage, which is fractional and plan-only", async () => {
-    const { catalog } = await loadCatalog({ models: modelsFixture });
+    const { quotaModule } = await loadCatalog({ models: modelsFixture });
     // Observed live: totalUsagePercentage 1 (== 100%, not 1%) with userQuota
     // drained to 0, yet orgResourcePackage still held 229 and isQuotaExceeded
     // was false. Treating the percentage as exhaustion would mislabel an
     // account that can still draw on its org package.
     expect(
-      catalog.isQuotaExhausted(
+      quotaModule.isQuotaExhausted(
         quota({
           totalUsagePercentage: 1,
           isQuotaExceeded: false,
@@ -147,7 +156,7 @@ describe("isQuotaExhausted", () => {
     ).toBe(false);
     // And with the flag absent it still decides on remaining, not percentage.
     expect(
-      catalog.isQuotaExhausted(
+      quotaModule.isQuotaExhausted(
         quota({
           totalUsagePercentage: 1,
           userQuota: { remaining: 0 },
@@ -158,14 +167,14 @@ describe("isQuotaExhausted", () => {
   });
 
   it("refuses to judge a payload that is not a quota response", async () => {
-    const { catalog } = await loadCatalog({ models: modelsFixture });
+    const { quotaModule } = await loadCatalog({ models: modelsFixture });
     // Without this guard an empty or reshaped body reads as "0 remaining" and
     // every paid model gets marked unavailable.
-    expect(catalog.isQuotaExhausted({})).toBe(false);
-    expect(catalog.isQuotaExhausted(null)).toBe(false);
-    expect(catalog.isQuotaExhausted("exhausted")).toBe(false);
-    expect(catalog.isQuotaExhausted({ user_id: "u1" })).toBe(false);
-    expect(catalog.isQuotaExhausted({ user_type: "individual" })).toBe(false);
+    expect(quotaModule.isQuotaExhausted({})).toBe(false);
+    expect(quotaModule.isQuotaExhausted(null)).toBe(false);
+    expect(quotaModule.isQuotaExhausted("exhausted")).toBe(false);
+    expect(quotaModule.isQuotaExhausted({ user_id: "u1" })).toBe(false);
+    expect(quotaModule.isQuotaExhausted({ user_type: "individual" })).toBe(false);
   });
 });
 

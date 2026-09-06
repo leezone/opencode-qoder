@@ -2,16 +2,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
-import {
-  QODER_MODEL_LIST_URL,
-  QODER_MODELS,
-  QODER_QUOTA_URL,
-  type QoderModelDefinition,
-} from "./constants.js";
+import { FETCH_TIMEOUT_MS, QODER_MODEL_LIST_URL, type QoderModelDefinition } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
 import { readEnv } from "./env.js";
 import { fetchWithTimeout, jsonHeaders, readErrorBody } from "./http.js";
 import { errorMessage, logPlugin } from "./log.js";
+import { fetchQuotaExhausted, getQuotaExhausted, setQuotaExhausted } from "./quota.js";
+import { QODER_MODELS } from "./static-models.js";
 
 // Dynamic model discovery for Qoder.
 //
@@ -33,7 +30,6 @@ import { errorMessage, logPlugin } from "./log.js";
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000; // Go: defaultModelCatalogTTL = time.Hour
 const ERROR_TTL_MS = 60 * 1000; // Go: defaultModelCatalogErrorTTL = time.Minute
-const FETCH_TIMEOUT_MS = 15 * 1000; // Go: defaultModelCatalogTimeout = 15 * time.Second
 const DEFAULT_MAX_TOKENS = 32768; // Go: DefaultMaxTok
 const DEFAULT_CONTEXT_WINDOW = 131072; // Go: intField(entry, 131072, ...)
 const DEFAULT_MODEL = "auto"; // Go: DefaultModel
@@ -336,121 +332,10 @@ export function parseCatalog(payload: unknown): DiscoveredModel[] {
 
 // --- Credit quota -----------------------------------------------------------
 //
-// qodercli: getQuotaUsage() + OsA()/R7(). Plain Bearer auth -- unlike the model
-// list, this endpoint needs no COSY signing.
-
-let quotaExhausted = false;
-
-// The buckets the account can draw on, labelled for the log. Single source for
-// isQuotaExhausted()'s sum AND quotaSnapshot()'s rendering: the camelCase /
-// snake_case key lists used to be retyped in both, and a rename upstream would
-// have had to land in two places.
-const QUOTA_BUCKETS: ReadonlyArray<readonly [label: string, keys: readonly string[]]> = [
-  ["userQuota", ["user_quota", "userQuota"]],
-  ["addOnQuota", ["add_on_quota", "addOnQuota"]],
-  ["orgPackage", ["org_resource_package", "orgResourcePackage", "shared_quota", "sharedQuota"]],
-];
-
-function bucketRemaining(usage: Record<string, unknown>, keys: readonly string[]): number {
-  for (const key of keys) {
-    const bucket = usage[key];
-    if (bucket && typeof bucket === "object") {
-      const remaining = Number((bucket as Record<string, unknown>).remaining);
-      if (Number.isFinite(remaining)) return remaining;
-    }
-  }
-  return 0;
-}
-
-function totalRemaining(usage: Record<string, unknown>): number {
-  return QUOTA_BUCKETS.reduce((sum, [, keys]) => sum + bucketRemaining(usage, keys), 0);
-}
-
-// Explicit exceeded flag, or undefined when the payload carries neither spelling.
-function quotaFlag(usage: Record<string, unknown>): boolean | undefined {
-  const flag = usage.is_quota_exceeded ?? usage.isQuotaExceeded;
-  return typeof flag === "boolean" ? flag : undefined;
-}
-
-// qodercli: OsA(usage) -- the exceeded flag, or every bucket drained.
-export function isQuotaExhausted(payload: unknown): boolean {
-  if (!payload || typeof payload !== "object") return false;
-  const usage = payload as Record<string, unknown>;
-  // normalizeQuotaUsage() rejects a response without user_id AND user_type.
-  // Skipping this guard would read a malformed or empty payload as "0
-  // remaining" and mark every paid model unavailable.
-  const userID = usage.user_id ?? usage.userId;
-  const userType = usage.user_type ?? usage.userType;
-  if (typeof userID !== "string" || userID === "" || typeof userType !== "string" || !userType) {
-    return false;
-  }
-  const flag = quotaFlag(usage);
-  const remaining = totalRemaining(usage);
-  // total_usage_percentage is deliberately NOT consulted, though qodercli falls
-  // back to it. The live endpoint returns it as a fraction (1 == 100%), and it
-  // measures the plan quota alone: observed with userQuota at 3000/3000 while
-  // orgResourcePackage still held 229 and isQuotaExceeded was false. Reading it
-  // as ">= 100" would be wrong twice over -- wrong scale, and it would call an
-  // account exhausted that still has an org package to draw on.
-  if (flag !== undefined) return flag || remaining <= 0;
-  return remaining <= 0;
-}
-
-// Renders why isQuotaExhausted() decided what it did. Without this, a log of
-// "exhausted=false" cannot be told apart from "the quota call failed open" --
-// and both leave every paid model looking usable.
-function quotaSnapshot(usage: Record<string, unknown>): string {
-  const parts: string[] = [];
-  for (const [label, keys] of QUOTA_BUCKETS) {
-    const bucket = keys
-      .map((key) => usage[key])
-      .find((value): value is Record<string, unknown> => !!value && typeof value === "object");
-    if (!bucket) continue;
-    const left = Number(bucket.remaining);
-    if (!Number.isFinite(left)) {
-      parts.push(`${label}=?`);
-      continue;
-    }
-    // The live payload spells the org package's ceiling `cap`, not `total`.
-    const cap = Number(bucket.total ?? bucket.cap);
-    parts.push(Number.isFinite(cap) ? `${label}=${left}/${cap}` : `${label}=${left}`);
-  }
-  if (parts.length === 0) parts.push("buckets=<none>");
-  parts.push(`flag=${quotaFlag(usage) ?? "absent"}`);
-  const pct = Number(usage.total_usage_percentage ?? usage.totalUsagePercentage);
-  // Shown as a percentage for readability. It is a fraction upstream and is
-  // deliberately not part of the decision -- see isQuotaExhausted().
-  if (Number.isFinite(pct)) parts.push(`planUsage=${(pct * 100).toFixed(1)}%`);
-  return parts.join(" ");
-}
-
-// Fails open: an unreachable quota endpoint must not paint the whole catalog
-// unavailable. qodercli's vEu() returns false on error too.
-async function fetchQuotaExhausted(options: QoderProviderOptions): Promise<boolean> {
-  try {
-    const credentials = await resolveQoderCredentials(options);
-    return await fetchWithTimeout(
-      QODER_QUOTA_URL,
-      { headers: jsonHeaders({ Authorization: `Bearer ${credentials.access}` }) },
-      FETCH_TIMEOUT_MS,
-      async (response) => {
-        if (!response.ok) {
-          logPlugin(`quota: HTTP ${response.status} -- failing open, nothing marked Unavailable`);
-          return false;
-        }
-        const payload: unknown = await response.json();
-        const exhausted = isQuotaExhausted(payload);
-        const usage =
-          payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
-        logPlugin(`quota: exhausted=${exhausted} ${quotaSnapshot(usage)}`);
-        return exhausted;
-      },
-    );
-  } catch (error) {
-    logPlugin(`quota: ${errorMessage(error)} -- failing open, nothing marked Unavailable`);
-    return false;
-  }
-}
+// Moved to quota.ts: its own endpoint, protocol (plain Bearer, no COSY), and
+// module state. This module reads the verdict via getQuotaExhausted() for name
+// rendering and the catalog signature, and refreshModels() stamps it via
+// setQuotaExhausted() on the shared refresh cadence.
 
 // --- Display name -----------------------------------------------------------
 
@@ -485,7 +370,7 @@ function formatFactor(factor: number): string {
 export function displayName(model: DiscoveredModel): string {
   const parts: string[] = [];
   if (typeof model.priceFactor === "number") parts.push(formatFactor(model.priceFactor));
-  if (quotaExhausted && !isZeroCost(model)) parts.push("Unavailable");
+  if (getQuotaExhausted() && !isZeroCost(model)) parts.push("Unavailable");
   return parts.length > 0 ? `${model.name} (${parts.join(", ")})` : model.name;
 }
 
@@ -554,14 +439,14 @@ export async function refreshModels(
     } finally {
       inflight = undefined;
     }
-    quotaExhausted = await quota;
+    setQuotaExhausted(await quota);
     // One line per refresh (every REFRESH_INTERVAL_MS, plus on demand). Reports
     // the model-list half; fetchQuotaExhausted() logs the quota half in detail.
     // `source` is what tells a missing multiplier apart from a zero one: names
     // carry no annotation while the bundled fallback is in use.
     logPlugin(
       `refresh: source=${source} live=${liveModels.length} total=${catalogModels().length} ` +
-        `exhausted=${quotaExhausted}${lastError ? ` error=${lastError}` : ""}`,
+        `exhausted=${getQuotaExhausted()}${lastError ? ` error=${lastError}` : ""}`,
     );
     return catalogStatus();
   })();
@@ -595,7 +480,13 @@ export function catalogModels(): DiscoveredModel[] {
 // preserved as the last resort.
 export function getModelDefinition(modelID: string): DiscoveredModel {
   const id = String(modelID ?? "").trim();
-  return catalogModels().find((model) => model.id === id) ?? normalizeStatic(QODER_MODELS[0]);
+  const found = catalogModels().find((model) => model.id === id);
+  if (found) return found;
+  // A pinned model that upstream retired lands here. Say so -- silently
+  // re-keying the request onto the default model's limits is indistinguishable
+  // from a correct lookup from the outside.
+  logPlugin(`catalog: unknown model id "${id}" -- using "${QODER_MODELS[0].id}" as last resort`);
+  return normalizeStatic(QODER_MODELS[0]);
 }
 
 // Cheap equality check so index.ts only reloads opencode's catalog when the
@@ -615,7 +506,7 @@ export function catalogSignature(): string {
         // The inputs behind displayName()'s annotation -- name is already signed
         // above, so signing the rendered string too would just repeat it.
         model.priceFactor ?? "",
-        quotaExhausted,
+        getQuotaExhausted(),
       ].join(":"),
     )
     .join("|");

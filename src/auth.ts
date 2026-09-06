@@ -1,10 +1,12 @@
 import crypto from "node:crypto";
 import {
+  DEVICE_TOKEN_TTL_SECONDS,
   QODER_CLIENT_TYPE,
   QODER_DEFAULT_EMAIL,
   QODER_DEFAULT_NAME,
   QODER_DEFAULT_USER_ID,
   QODER_EXCHANGE_URL,
+  QODER_OPENAPI_URL,
   QODER_PAT_ENV,
   QODER_USERINFO_URL,
   QODER_VERSION,
@@ -206,6 +208,28 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
   }
 }
 
+// The credential funnel: every code path that talks to Qoder ends here, which
+// makes this the right place to write down the token precedence it applies.
+// Layers 1-3 are assembled by the callers (index.ts builds the options bag;
+// see discoveryOptions() there); layers 4-5 are applied below.
+//
+// Token precedence, highest first:
+//   1. personalAccessToken option -- explicit, rarely set, but wins over
+//      everything when present (checked first below);
+//   2. connection credential -- what `/connect qoder` stored (a PAT or an
+//      oauth access token), resolved by authOptionsFromV2Connection() or the
+//      legacy auth loader;
+//   3. plugin options apiKey -- ctx.options / the provider options in
+//      opencode.json, already substituted from `{file:...}` by the time the
+//      legacy config hook runs;
+//   4. shared apiKey -- the token the legacy config hook published over
+//      globalThis for the v2 instance, which cannot see (2)/(3) itself;
+//   5. environment -- QODER_PERSONAL_ACCESS_TOKEN, then QODER_PAT (getEnvPat).
+//
+// Once a token is in hand the shape decides the path: a `pt-` prefix routes to
+// credentialsFromPat() (exchange endpoint, memoized per PAT), and anything
+// else is treated as an already-exchanged short-lived job token and passed
+// through as-is -- which is also how the device-flow oauth credential arrives.
 export async function resolveQoderCredentials(
   options: QoderProviderOptions = {},
 ): Promise<QoderCredentials> {
@@ -235,4 +259,72 @@ export function generatePKCE(): { codeVerifier: string; codeChallenge: string } 
   const codeVerifier = crypto.randomBytes(32).toString("base64url");
   const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
   return { codeVerifier, codeChallenge };
+}
+
+// Plain sleep. It was called abortableDelay but never accepted a signal or
+// abort reason -- the device poll loop just awaits it between attempts. Named
+// for what it does.
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Device-flow login, second half: poll for the token the browser session
+// authorizes. The first half (PKCE + authorize URL) lives with the caller --
+// opencode's auth hook opens the browser and invokes pollDeviceFlow afterwards.
+// Lives in auth.ts rather than index.ts because every other credential
+// acquisition path does, and it shares this module's primitives: the token
+// response shape, userinfo lookup, refresh encoding, and profile defaults.
+export async function pollDeviceFlow(
+  codeVerifier: string,
+  nonce: string,
+  machineID: string,
+): Promise<QoderCredentials> {
+  const pollURL = `${QODER_OPENAPI_URL}/api/v1/deviceToken/poll?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(codeVerifier)}&challenge_method=S256`;
+
+  for (let attempt = 0; attempt < 90; attempt++) {
+    await delay(2000);
+    const response = await fetch(pollURL, { method: "GET", headers: jsonHeaders() });
+    if (response.status === 202 || response.status === 404) continue;
+    if (!response.ok) {
+      throw new Error(
+        `Device token poll failed: ${response.status} ${response.statusText}. Response: ${await readErrorBody(response)}`,
+      );
+    }
+
+    const tokenData = (await response.json()) as QoderTokenResponse;
+    if (!tokenData.token) throw new Error("Device token poll returned empty access token");
+
+    // Shared with the PAT exchange path. Adds two Cosy-* headers the old
+    // inline call omitted; userinfo is a plain Bearer GET that ignores them.
+    const profile = await fetchQoderUserInfo(tokenData.token);
+
+    // The device flow answers expires_in in SECONDS (see DEVICE_TOKEN_TTL_SECONDS
+    // in constants.ts). It cannot reuse parseExpiresAt above, whose >7-days
+    // heuristic would read 30 days as milliseconds and expire the token in ~43
+    // minutes.
+    const parsedExpires = tokenData.expires_at ? Date.parse(tokenData.expires_at) : Number.NaN;
+    const expires = Number.isFinite(parsedExpires)
+      ? parsedExpires
+      : Date.now() + (tokenData.expires_in || DEVICE_TOKEN_TTL_SECONDS) * 1000;
+
+    // encodeOAuthRefresh keeps the raw user_id (may be empty), matching the PAT
+    // exchange; only the credential's identity fields get defaults applied.
+    return {
+      refresh: encodeOAuthRefresh(
+        tokenData.refresh_token || "",
+        tokenData.user_id || "",
+        machineID,
+      ),
+      access: tokenData.token,
+      expires: expires - REFRESH_SKEW_MS,
+      ...withProfileDefaults({
+        userID: tokenData.user_id,
+        email: profile.email,
+        name: profile.name,
+      }),
+      machineID,
+    };
+  }
+
+  throw new Error("Authorization timed out");
 }

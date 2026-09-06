@@ -15,6 +15,7 @@ import { QODER_CHAT_URL, USER_AGENT } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { readEnv } from "./env.js";
+import { logPlugin } from "./log.js";
 import { getModelDefinition } from "./model-catalog.js";
 import { type QoderMessage, type QoderTool, transformPrompt, transformTools } from "./transform.js";
 
@@ -436,12 +437,34 @@ function parseSSELine(line: string): QoderChunk | undefined {
   const dataStr = line.substring(5).trim();
   if (!dataStr || dataStr === "[DONE]") return undefined;
 
-  const envelope = JSON.parse(dataStr) as { statusCodeValue?: number; body?: string };
-  if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-    throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
+  // A malformed line is dropped, not fatal: a proxy can inject or truncate one
+  // mid-body, and a stream that is otherwise fine should keep rendering rather
+  // than fail as a whole. Protocol-level failures (statusCodeValue) still throw
+  // -- those are the upstream answering, not noise.
+  let envelope: { statusCodeValue?: number; body?: string };
+  try {
+    envelope = JSON.parse(dataStr) as { statusCodeValue?: number; body?: string };
+  } catch {
+    logPlugin(`sse: dropped malformed data line (${dataStr.slice(0, 80)})`);
+    return undefined;
+  }
+  // The envelope's status: 200 -- or absent -- proceeds; any other number is
+  // an upstream failure. Written as a typeof check rather than a truthiness
+  // guard so the semantics are deliberate: 0 has never been observed upstream
+  // and is tolerated as "no status" instead of inventing a new failure mode,
+  // while a string like "500" is treated as absent (the body parse below will
+  // judge the envelope on its merits).
+  const status = envelope.statusCodeValue;
+  if (typeof status === "number" && status !== 0 && status !== 200) {
+    throw new Error(`Upstream status ${status}: ${envelope.body}`);
   }
   if (!envelope.body || envelope.body === "[DONE]") return undefined;
-  return JSON.parse(envelope.body) as QoderChunk;
+  try {
+    return JSON.parse(envelope.body) as QoderChunk;
+  } catch {
+    logPlugin(`sse: dropped chunk with malformed body (${envelope.body.slice(0, 80)})`);
+    return undefined;
+  }
 }
 
 export class QoderLanguageModel implements LanguageModelV3 {
@@ -524,34 +547,48 @@ export class QoderLanguageModel implements LanguageModelV3 {
     });
 
     const abortController = new AbortController();
-    const abort = () => abortController.abort(options.abortSignal?.reason);
-    if (options.abortSignal?.aborted) abort();
-    else options.abortSignal?.addEventListener("abort", abort, { once: true });
+    // detachAbort exists because the listener outlives doStream(): the external
+    // signal may be opencode's long-lived request signal, reused across many
+    // model calls, and a listener added per call would accumulate on it. It is
+    // removed however this exchange ends -- fetch failure, HTTP error, or a
+    // fully consumed stream (see responseToStream's finally).
+    const signal = options.abortSignal;
+    const abort = () => abortController.abort(signal?.reason);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    const detachAbort = () => signal?.removeEventListener("abort", abort);
 
-    const response = await fetch(QODER_CHAT_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Accept-Encoding": "identity",
-        "User-Agent": USER_AGENT,
-        "X-Model-Key": this.modelId,
-        "X-Model-Source": "system",
-        ...headers,
-      },
-      body: encodedBytes,
-      signal: abortController.signal,
-    });
+    let response: Response;
+    try {
+      response = await fetch(QODER_CHAT_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Accept-Encoding": "identity",
+          "User-Agent": USER_AGENT,
+          "X-Model-Key": this.modelId,
+          "X-Model-Source": "system",
+          ...headers,
+        },
+        body: encodedBytes,
+        signal: abortController.signal,
+      });
+    } catch (error) {
+      detachAbort();
+      throw error;
+    }
 
     if (!response.ok) {
+      detachAbort();
       const errText = await response.text().catch(() => "");
       throw new Error(
         `Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`,
       );
     }
 
-    const stream = this.responseToStream(response, warnings);
+    const stream = this.responseToStream(response, warnings, detachAbort);
     return {
       stream,
       request: { body },
@@ -562,6 +599,7 @@ export class QoderLanguageModel implements LanguageModelV3 {
   private responseToStream(
     response: Response,
     warnings: SharedV3Warning[],
+    detachAbort: () => void,
   ): ReadableStream<LanguageModelV3StreamPart> {
     const modelID = this.modelId;
     return new ReadableStream<LanguageModelV3StreamPart>({
@@ -714,6 +752,10 @@ export class QoderLanguageModel implements LanguageModelV3 {
           });
           controller.close();
         } finally {
+          // The exchange is over either way; drop the external signal's
+          // listener before anything else so an abort racing the stream close
+          // cannot re-arm the controller.
+          detachAbort();
           await reader.cancel().catch(() => {});
         }
       },

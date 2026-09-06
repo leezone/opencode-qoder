@@ -4,9 +4,9 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Only the pure parser helpers are imported statically: they read no environment
 // and touch no disk. Anything derived from QODER_MODELS must be re-imported
-// under a pinned environment (see reload()), because constants.ts resolves the
-// table once at import time.
-import { isSaneStaticModel, parseStaticModels } from "../constants.js";
+// under a pinned environment (see reload()), because static-models.ts resolves
+// the table once at import time.
+import { isSaneStaticModel, parseStaticModels } from "../static-models.js";
 
 const valid = {
   id: "auto",
@@ -54,11 +54,12 @@ describe("static models parsing", () => {
   });
 });
 
-// constants.ts is resolved once per import, so exercising either the shipped
-// table or the search order needs a fresh module under a controlled environment.
+// static-models.ts is resolved once per import, so exercising either the
+// shipped table or the search order needs a fresh module under a controlled
+// environment.
 async function reload() {
   vi.resetModules();
-  return (await import("../constants.js")) as typeof import("../constants.js");
+  return (await import("../static-models.js")) as typeof import("../static-models.js");
 }
 
 describe("static models", () => {

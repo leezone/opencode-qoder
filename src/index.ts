@@ -2,27 +2,19 @@ import type { Hooks, PluginInput, PluginOptions } from "@opencode-ai/plugin";
 import type { PluginContext } from "@opencode-ai/plugin/v2/promise";
 import {
   decodeOAuthRefresh,
-  encodeOAuthRefresh,
-  fetchQoderUserInfo,
   generatePKCE,
-  type QoderCredentials,
+  pollDeviceFlow,
   type QoderProviderOptions,
-  type QoderTokenResponse,
-  withProfileDefaults,
 } from "./auth.js";
 import {
-  DEVICE_TOKEN_TTL_SECONDS,
   PROVIDER_ID,
   PROVIDER_NAME,
   QODER_BASE_URL,
   QODER_MANAGE_URL,
-  QODER_OPENAPI_URL,
   QODER_PAT_ENV,
-  REFRESH_SKEW_MS,
   ZERO_COST,
 } from "./constants.js";
 import { getMachineId } from "./cosy.js";
-import { jsonHeaders, readErrorBody } from "./http.js";
 import { createQoder, QoderLanguageModel } from "./language-model.js";
 import { errorMessage, logPlugin } from "./log.js";
 import {
@@ -461,7 +453,8 @@ async function setupV2(ctx: PluginContext): Promise<void> {
       // Order matters: an explicit connection (from `/connect qoder`) beats the
       // plugin's own options, which beat the credential published by the legacy
       // config hook. resolveQoderCredentials() still falls back to the
-      // QODER_PERSONAL_ACCESS_TOKEN env var after all of these.
+      // QODER_PERSONAL_ACCESS_TOKEN env var after all of these -- the full
+      // precedence table lives above resolveQoderCredentials() in auth.ts.
       apiKey: connection.apiKey || optionString(ctx.options, "apiKey") || readSharedApiKey(),
     };
     // Shapes and key names only -- the values here can be a PAT. This is what
@@ -507,67 +500,9 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   timer.unref?.();
 }
 
-// Plain sleep. It was called abortableDelay but never accepted a signal or
-// abort reason -- the device poll loop just awaits it between attempts. Named
-// for what it does.
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function pollDeviceFlow(
-  codeVerifier: string,
-  nonce: string,
-  machineID: string,
-): Promise<QoderCredentials> {
-  const pollURL = `${QODER_OPENAPI_URL}/api/v1/deviceToken/poll?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(codeVerifier)}&challenge_method=S256`;
-
-  for (let attempt = 0; attempt < 90; attempt++) {
-    await delay(2000);
-    const response = await fetch(pollURL, { method: "GET", headers: jsonHeaders() });
-    if (response.status === 202 || response.status === 404) continue;
-    if (!response.ok) {
-      throw new Error(
-        `Device token poll failed: ${response.status} ${response.statusText}. Response: ${await readErrorBody(response)}`,
-      );
-    }
-
-    const tokenData = (await response.json()) as QoderTokenResponse;
-    if (!tokenData.token) throw new Error("Device token poll returned empty access token");
-
-    // Shared with the PAT exchange path. Adds two Cosy-* headers the old
-    // inline call omitted; userinfo is a plain Bearer GET that ignores them.
-    const profile = await fetchQoderUserInfo(tokenData.token);
-
-    // The device flow answers expires_in in SECONDS (see constants.ts). It
-    // cannot reuse parseExpiresAt in auth.ts, whose >7-days heuristic would
-    // read 30 days as milliseconds and expire the token in ~43 minutes.
-    const parsedExpires = tokenData.expires_at ? Date.parse(tokenData.expires_at) : Number.NaN;
-    const expires = Number.isFinite(parsedExpires)
-      ? parsedExpires
-      : Date.now() + (tokenData.expires_in || DEVICE_TOKEN_TTL_SECONDS) * 1000;
-
-    // encodeOAuthRefresh keeps the raw user_id (may be empty), matching the PAT
-    // exchange; only the credential's identity fields get defaults applied.
-    return {
-      refresh: encodeOAuthRefresh(
-        tokenData.refresh_token || "",
-        tokenData.user_id || "",
-        machineID,
-      ),
-      access: tokenData.token,
-      expires: expires - REFRESH_SKEW_MS,
-      ...withProfileDefaults({
-        userID: tokenData.user_id,
-        email: profile.email,
-        name: profile.name,
-      }),
-      machineID,
-    };
-  }
-
-  throw new Error("Authorization timed out");
-}
-
+// pollDeviceFlow() and its delay() helper live in auth.ts alongside every
+// other credential-acquisition path; legacyHooks below only wires it into
+// opencode's browser-login hook.
 function legacyHooks(options?: PluginOptions): Hooks {
   const id = providerID(options);
   return {
@@ -606,7 +541,11 @@ function legacyHooks(options?: PluginOptions): Hooks {
                     expires: credential.expires,
                     accountId: credential.userID,
                   };
-                } catch {
+                } catch (error) {
+                  // opencode only surfaces the failed verdict, not the cause --
+                  // without this line a timeout, a network error, and a poll
+                  // rejection are indistinguishable to the user.
+                  logPlugin(`auth: device flow failed: ${errorMessage(error)}`);
                   return { type: "failed" as const };
                 }
               },
