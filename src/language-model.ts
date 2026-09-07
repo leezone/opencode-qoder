@@ -1,23 +1,80 @@
 import crypto from "node:crypto";
-import type {
-  LanguageModelV3,
-  LanguageModelV3CallOptions,
-  LanguageModelV3Content,
-  LanguageModelV3FinishReason,
-  LanguageModelV3GenerateResult,
-  LanguageModelV3StreamPart,
-  LanguageModelV3StreamResult,
-  LanguageModelV3Usage,
-  SharedV3Warning,
+import {
+  APICallError,
+  type LanguageModelV3,
+  type LanguageModelV3CallOptions,
+  type LanguageModelV3Content,
+  type LanguageModelV3FinishReason,
+  type LanguageModelV3GenerateResult,
+  type LanguageModelV3StreamPart,
+  type LanguageModelV3StreamResult,
+  type LanguageModelV3Usage,
+  type SharedV3Warning,
 } from "@ai-sdk/provider";
 import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
-import { QODER_CHAT_URL, USER_AGENT } from "./constants.js";
+import { QODER_CHAT_URL, QODER_ERROR_CODE_QUOTA_EXHAUSTED, USER_AGENT } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { readEnv } from "./env.js";
 import { logPlugin } from "./log.js";
 import { getModelDefinition } from "./model-catalog.js";
 import { type QoderMessage, type QoderTool, transformPrompt, transformTools } from "./transform.js";
+
+// ---------------------------------------------------------------------------
+// Upstream error → user-friendly APICallError
+// ---------------------------------------------------------------------------
+// The chat endpoint wraps errors in JSON like:
+//   {"code":"112","message":"{\"pricingUrl\":\"...\"}"}
+// parseQoderHttpError tries to extract the code and rewrites the message so
+// opencode can display it nicely (APICallError is the AI SDK standard).
+// ---------------------------------------------------------------------------
+
+type QoderUpstreamBody = { code?: string; message?: string };
+
+function parseQoderUpstreamBody(text: string): QoderUpstreamBody | undefined {
+  try {
+    const outer = JSON.parse(text) as Record<string, unknown>;
+    if (typeof outer.code === "string") return outer as QoderUpstreamBody;
+    if (typeof outer.message === "string") {
+      try {
+        const inner = JSON.parse(outer.message) as Record<string, unknown>;
+        if (typeof inner.code === "string") return inner as QoderUpstreamBody;
+      } catch {
+        /* message is plain text, not nested JSON */
+      }
+    }
+  } catch {
+    /* not JSON at all */
+  }
+  return undefined;
+}
+
+function buildQoderErrorMessage(status: number, body: string): string {
+  const parsed = parseQoderUpstreamBody(body);
+  if (parsed?.code === QODER_ERROR_CODE_QUOTA_EXHAUSTED) {
+    return "Qoder credits exhausted — free quota used up. Upgrade at https://qoder.com/pricing";
+  }
+  if (parsed?.code && parsed?.message) {
+    return `Qoder API error (code ${parsed.code}): ${parsed.message}`;
+  }
+  return `Qoder API error ${status}`;
+}
+
+function throwQoderApiError(status: number, url: string, body: string): never {
+  const message = buildQoderErrorMessage(status, body);
+  const error = new APICallError({
+    message,
+    url,
+    requestBodyValues: undefined,
+    statusCode: status,
+    responseBody: body,
+    isRetryable: false,
+    data: parseQoderUpstreamBody(body),
+  });
+  // Ensure opencode sees a clear message even if it wraps the error.
+  Object.defineProperty(error, "name", { value: "QoderAPIError", configurable: true });
+  throw error;
+}
 
 type ToolCallState = {
   // Undefined until the upstream id arrives (or startToolCall fabricates one).
@@ -583,9 +640,7 @@ export class QoderLanguageModel implements LanguageModelV3 {
     if (!response.ok) {
       detachAbort();
       const errText = await response.text().catch(() => "");
-      throw new Error(
-        `Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`,
-      );
+      throwQoderApiError(response.status, QODER_CHAT_URL, errText);
     }
 
     const stream = this.responseToStream(response, warnings, detachAbort);

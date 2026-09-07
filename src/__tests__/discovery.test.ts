@@ -138,4 +138,23 @@ describe("parseCatalog", () => {
     // A guessed 1 would display a multiplier Qoder never advertised.
     expect(models.find((entry) => entry.id === "kmodel_latest")!.priceFactor).toBeUndefined();
   });
+
+  it("merges models from the frontier group", () => {
+    const models = parseCatalog({
+      chat: [{ key: "auto", max_input_tokens: 180000 }],
+      frontier: [{ key: "cmodel", display_name: "Cantus", max_input_tokens: 1000000 }],
+    });
+    const ids = models.map((model) => model.id);
+    expect(ids).toContain("auto");
+    expect(ids).toContain("cmodel");
+  });
+
+  it("deduplicates models that appear in both chat and frontier", () => {
+    const models = parseCatalog({
+      chat: [{ key: "auto", max_input_tokens: 180000 }],
+      frontier: [{ key: "auto", max_input_tokens: 180000 }],
+    });
+    const autoModels = models.filter((model) => model.id === "auto");
+    expect(autoModels).toHaveLength(1);
+  });
 });

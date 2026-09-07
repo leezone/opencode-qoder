@@ -295,11 +295,18 @@ function normalizeStatic(model: QoderModelDefinition): DiscoveredModel {
   };
 }
 
-// Go: parseQoderModelCatalog() -- only the `chat` group feeds agent_chat_generation.
+// Go: parseQoderModelCatalog() -- the `chat` group feeds agent_chat_generation,
+// while the `frontier` group carries newer models (e.g. Cantus) that may
+// not yet be in the tiered pool. Both groups are merged so the picker
+// can offer everything the vendor advertises.
 export function parseCatalog(payload: unknown): DiscoveredModel[] {
   const chat =
     payload && typeof payload === "object" ? (payload as Record<string, unknown>).chat : undefined;
-  const entries = Array.isArray(chat) ? (chat as CatalogEntry[]) : [];
+  const frontier =
+    payload && typeof payload === "object" ? (payload as Record<string, unknown>).frontier : undefined;
+  const chatEntries = Array.isArray(chat) ? (chat as CatalogEntry[]) : [];
+  const frontierEntries = Array.isArray(frontier) ? (frontier as CatalogEntry[]) : [];
+  const entries = [...chatEntries, ...frontierEntries];
   if (entries.length === 0) throw new Error("Qoder model list response is missing the chat array");
   const models: DiscoveredModel[] = [];
   const seen = new Set<string>();

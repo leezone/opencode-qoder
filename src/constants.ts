@@ -88,3 +88,8 @@ export type QoderModelDefinition = {
 // already (a retired preview id genuinely ran at 313,972 tokens, so copying its
 // successor's 200,000 would have broken it). A dead id keeps whatever number
 // was last observed live, or is dropped entirely.
+
+// Upstream error codes returned in the `code` field of a failed response body.
+// The chat endpoint wraps these in its own JSON envelope; the plugin detects
+// them and rewrites the raw HTTP error into a user-facing message.
+export const QODER_ERROR_CODE_QUOTA_EXHAUSTED = "112";

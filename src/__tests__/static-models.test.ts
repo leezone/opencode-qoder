@@ -86,16 +86,18 @@ describe("static models", () => {
     vi.resetModules();
   });
 
-  it("ships 16 entries and excludes the retired preview ids", async () => {
+  it("ships 17 entries and excludes the retired preview ids", async () => {
     // The prefab mirrors the live list. qmodel_preview and gm51model are no
     // longer advertised upstream, so they must not reappear through the fallback
     // path either -- the picker should never offer an unpriced model.
+    // Cantus is a frontier model that was added to the bundled prefab.
     const mod = await reload();
     const ids = mod.QODER_MODELS.map((model) => model.id);
-    expect(mod.QODER_MODELS).toHaveLength(16);
+    expect(mod.QODER_MODELS).toHaveLength(17);
     expect(ids).not.toContain("qmodel_preview");
     expect(ids).not.toContain("gm51model");
     expect(ids).toContain("auto");
+    expect(ids).toContain("cmodel");
   });
 
   it("ships entries that each pass the same validator a hand-edit must pass", async () => {
@@ -121,7 +123,7 @@ describe("static models", () => {
     writeFileSync(file, "{ this is not json");
     process.env.QODER_STATIC_MODELS = file;
     const mod = await reload();
-    expect(mod.QODER_MODELS).toHaveLength(16);
+    expect(mod.QODER_MODELS).toHaveLength(17);
     expect(mod.STATIC_MODELS_ORIGIN).toBe("shipped");
   });
 

@@ -167,5 +167,15 @@
     "contextWindow": 200000,
     "inputWindow": 200000,
     "maxTokens": 32768
+  },
+  {
+    "id": "cmodel",
+    "name": "Cantus",
+    "reasoning": true,
+    "supportsEffort": true,
+    "input": ["text", "image"],
+    "contextWindow": 1000000,
+    "inputWindow": 1000000,
+    "maxTokens": 32768
   }
 ]
