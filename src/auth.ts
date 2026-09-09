@@ -139,23 +139,45 @@ function openApiHeaders(token?: string): Record<string, string> {
 export async function fetchQoderUserInfo(
   jobToken: string,
 ): Promise<{ userID: string; email: string; name: string }> {
+  const info = await fetchQoderAccount(jobToken);
+  return {
+    userID: text(info.id),
+    email: text(info.email),
+    name: text(info.name) || text(info.username),
+  };
+}
+
+// The whole account record, undifferentiated. fetchQoderUserInfo() projects the
+// three fields the plugin itself needs; the tool surface wants organisation,
+// plan source and avatar too, and re-listing every field upstream adds would
+// only recreate the camelCase drift this module already fights. Best-effort:
+// an unreachable endpoint answers {} rather than throwing.
+export async function fetchQoderAccount(jobToken: string): Promise<Record<string, unknown>> {
   try {
     const res = await fetch(QODER_USERINFO_URL, { headers: openApiHeaders(jobToken) });
-    if (!res.ok) return { userID: "", email: "", name: "" };
-    const info = (await res.json()) as {
-      id?: string;
-      email?: string;
-      name?: string;
-      username?: string;
-    };
-    return {
-      userID: info.id || "",
-      email: info.email || "",
-      name: info.name || info.username || "",
-    };
+    if (!res.ok) return {};
+    const body: unknown = await res.json();
+    return body && typeof body === "object" ? (body as Record<string, unknown>) : {};
   } catch {
-    return { userID: "", email: "", name: "" };
+    return {};
   }
+}
+
+// Describes a credential without ever printing it. A log file is no place for a
+// PAT, but the shape is exactly what tells an unresolved `{file:...}` reference
+// apart from a real token, or from the option not reaching the plugin at all.
+// Shared with capabilities.ts, which reports the credential *layer* to a model
+// under the same rule: shape only, never the value.
+export function describeTokenShape(value: unknown): string {
+  if (typeof value !== "string" || value === "") return "absent";
+  if (value.startsWith("{file:")) return "file-ref";
+  if (value.startsWith("{env:")) return "env-ref";
+  if (value.startsWith("pt-")) return "pat";
+  return `opaque(${value.length})`;
+}
+
+function text(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }
 
 export async function credentialsFromPat(pat: string): Promise<QoderCredentials> {

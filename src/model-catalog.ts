@@ -103,6 +103,13 @@ function diskCachePath(): string {
   return join(homedir(), ".cache", "opencode", "opencode-qoder-models.json");
 }
 
+// The path this module reads at import time and writes on every successful
+// refresh. Exported for the capability layer's diagnostics: "why is model X
+// missing" is usually answered by whether this file exists and how stale it is.
+export function catalogCachePath(): string {
+  return diskCachePath();
+}
+
 function isSaneModel(model: DiscoveredModel): boolean {
   return (
     Boolean(model) &&
@@ -303,7 +310,9 @@ export function parseCatalog(payload: unknown): DiscoveredModel[] {
   const chat =
     payload && typeof payload === "object" ? (payload as Record<string, unknown>).chat : undefined;
   const frontier =
-    payload && typeof payload === "object" ? (payload as Record<string, unknown>).frontier : undefined;
+    payload && typeof payload === "object"
+      ? (payload as Record<string, unknown>).frontier
+      : undefined;
   const chatEntries = Array.isArray(chat) ? (chat as CatalogEntry[]) : [];
   const frontierEntries = Array.isArray(frontier) ? (frontier as CatalogEntry[]) : [];
   const entries = [...chatEntries, ...frontierEntries];

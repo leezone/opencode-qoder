@@ -1,11 +1,24 @@
-import type { Hooks, PluginInput, PluginOptions } from "@opencode-ai/plugin";
+import { type Hooks, type PluginInput, type PluginOptions, tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "@opencode-ai/plugin/v2/promise";
 import {
   decodeOAuthRefresh,
   generatePKCE,
   pollDeviceFlow,
   type QoderProviderOptions,
+  // Describes a credential without ever printing it -- auth.ts owns the rule, so
+  // the tool surface reports exactly what the log lines report.
+  describeTokenShape as tokenShape,
 } from "./auth.js";
+import {
+  type CapabilityReport,
+  capabilityError,
+  reportAccount,
+  reportAuth,
+  reportCatalog,
+  reportModel,
+  reportModels,
+  reportQuota,
+} from "./capabilities.js";
 import {
   PROVIDER_ID,
   PROVIDER_NAME,
@@ -49,17 +62,6 @@ function logCatalogRegistration(path: "legacy" | "v2"): void {
     `catalog[${path}]: pid=${process.pid} registered ${status.total} models ` +
       `(source=${status.source}, live=${status.live})`,
   );
-}
-
-// Describes a credential without ever printing it. A log file is no place for a
-// PAT, but the shape is exactly what tells an unresolved `{file:...}` reference
-// apart from a real token, or from the option not reaching the plugin at all.
-function tokenShape(value: unknown): string {
-  if (typeof value !== "string" || value === "") return "absent";
-  if (value.startsWith("{file:")) return "file-ref";
-  if (value.startsWith("{env:")) return "env-ref";
-  if (value.startsWith("pt-")) return "pat";
-  return `opaque(${value.length})`;
 }
 
 // The "usable string" guard shared by option and globalThis reads: absent,
@@ -503,10 +505,114 @@ async function setupV2(ctx: PluginContext): Promise<void> {
 // pollDeviceFlow() and its delay() helper live in auth.ts alongside every
 // other credential-acquisition path; legacyHooks below only wires it into
 // opencode's browser-login hook.
+
+// Options for the capability layer. The legacy instance sees the plugin's own
+// options (rarely populated) plus the token the config hook published over
+// globalThis; env and opencode's auth.json are consulted inside capabilities.ts.
+function capabilityOptions(options?: PluginOptions): QoderProviderOptions {
+  const apiKey = optionString(options, "apiKey") || readSharedApiKey();
+  return apiKey ? { apiKey } : {};
+}
+
+// Wraps a capability so a throw becomes a readable answer instead of a tool
+// error with no cause. The structured half of the report rides along as the
+// result metadata, so anything downstream of the tool call can compute on it
+// without re-parsing the text.
+function capabilityTool(
+  name: string,
+  run: () => Promise<CapabilityReport> | CapabilityReport,
+  context: { metadata: (input: { title?: string }) => void },
+) {
+  context.metadata({ title: `Qoder: ${name}` });
+  return Promise.resolve(run())
+    .then((report) => ({ output: report.output, metadata: report.data as Record<string, unknown> }))
+    .catch((error) => {
+      const failed = capabilityError(name, error);
+      return { output: failed.output, metadata: failed.data as Record<string, unknown> };
+    });
+}
+
+// Read-only views of plugin state, registered as native tools so a model can
+// ask about quota, models and credentials without shelling out. v2 exposes no
+// tool registration surface (verified: PluginContext offers agent/aisdk/catalog/
+// command/integration/reference/skill), so this legacy map is the only place
+// they can live -- which also means they read the legacy instance's copy of the
+// catalog. That copy seeds from the same on-disk cache the v2 instance writes at
+// import time, so it is a snapshot rather than a dead fallback; anything that
+// needs a live number (quota, availability) fetches it itself.
+function capabilityTools(options?: PluginOptions): Hooks["tool"] {
+  return {
+    // Live credit balance. The one tool that answers "还剩多少额度".
+    qoder_quota: tool({
+      description:
+        "Read the Qoder account's remaining credits: per-bucket balance (plan, add-on, " +
+        "org package), total left, whether credits are exhausted, plan usage and renewal " +
+        "date. Use when the user asks about 额度/配额/余额/credits or whether they can " +
+        "still afford a paid model.",
+      args: {},
+      execute: (_args, ctx) =>
+        capabilityTool("quota", () => reportQuota(capabilityOptions(options)), ctx),
+    }),
+    // Identity behind the credential.
+    qoder_account: tool({
+      description:
+        "Read the Qoder account profile the current credential belongs to: name, email, " +
+        "user and organisation IDs, registration source. Use when the user asks which " +
+        "Qoder account is in use or whose quota is being spent.",
+      args: {},
+      execute: (_args, ctx) =>
+        capabilityTool("account", () => reportAccount(capabilityOptions(options)), ctx),
+    }),
+    // The full picker table.
+    qoder_models: tool({
+      description:
+        "List every Qoder model opencode is currently offering: id, credit multiplier, " +
+        "context/input/output limits, thinking-effort levels, reasoning flag, and an " +
+        "Unavailable marker on paid models when credits are drained. Use when the user " +
+        "asks which models exist, which are cheapest, or which support reasoning.",
+      args: {},
+      execute: (_args, ctx) =>
+        capabilityTool("models", () => reportModels(capabilityOptions(options)), ctx),
+    }),
+    // One model's limits, resolved exactly like a request resolves it.
+    qoder_model: tool({
+      description:
+        "Show one Qoder model's details by id: limits, thinking efforts, credit " +
+        "multiplier, and where its definition came from (live, cache or bundled). An " +
+        "unknown id resolves to the fallback model and says so. Use when the user asks " +
+        "about a specific model's limits or price.",
+      args: { id: tool.schema.string().describe("Model id, e.g. cmodel or qmodel_38max") },
+      execute: (args, ctx) => capabilityTool("model", () => reportModel(args.id), ctx),
+    }),
+    // Where the model list came from, and why.
+    qoder_catalog: tool({
+      description:
+        "Show Qoder model-catalog diagnostics: whether the table came from the live API, " +
+        "the disk cache or the bundled fallback; when it was fetched; the cache file " +
+        "path; whether discovery is disabled by env. Use when a model is missing, stale, " +
+        "or wrong -- this is the answer to 'why do I not see model X'.",
+      args: {},
+      execute: (_args, ctx) => capabilityTool("catalog", () => reportCatalog(), ctx),
+    }),
+    // Credential plumbing, shape-only.
+    qoder_auth: tool({
+      description:
+        "Show which Qoder credential layer is in effect (option, config hook, auth.json, " +
+        "env) and what it resolves to -- identity and expiry only, never the token " +
+        "itself. Use when requests fail with auth errors or the user asks how login is " +
+        "configured.",
+      args: {},
+      execute: (_args, ctx) =>
+        capabilityTool("auth", () => reportAuth(capabilityOptions(options)), ctx),
+    }),
+  };
+}
+
 function legacyHooks(options?: PluginOptions): Hooks {
   const id = providerID(options);
   return {
     config: async (cfg) => applyLegacyConfig(cfg as unknown as LegacyConfig, options),
+    tool: capabilityTools(options),
     auth: {
       provider: id,
       loader: async (auth) => {
