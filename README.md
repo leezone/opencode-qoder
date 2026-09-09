@@ -25,7 +25,33 @@ Add the plugin to `opencode.json`, or adjust the path for your config location:
 }
 ```
 
-The plugin registers provider `qoder` and bundles these models: `auto`, `ultimate`, `performance`, `efficient`, `lite`, `qmodel_38max`, `qfmodel`, `qmodel_latest`, `qmodel`, `kmodel_latest`, `kmodel`, `gmodel`, `gfmodel`, `dmodel`, `dfmodel`, `mmodel`, `qmodel_preview`, and `gm51model`.
+The plugin registers provider `qoder` and bundles 17 models -- see [Models](#models).
+
+## Models
+
+The bundled table ships these ids. The first five are Qoder's own tier aliases rather than upstream brands; the rest map to their upstream model names:
+
+| id | Upstream model |
+| --- | --- |
+| `auto` | Auto (gateway picks) |
+| `ultimate` | Ultimate |
+| `performance` | Performance |
+| `efficient` | Efficient |
+| `lite` | Lite |
+| `qmodel_38max` | Qwen3.8-Max |
+| `qfmodel` | Qwen3.8-Flash |
+| `qmodel_latest` | Qwen3.7-Max |
+| `qmodel` | Qwen3.7-Plus |
+| `kmodel_latest` | Kimi-K3 |
+| `kmodel` | Kimi-K2.7-Code |
+| `gmodel` | GLM-5.3 |
+| `gfmodel` | GLM-5.3-Flash |
+| `dmodel` | DeepSeek-V4-Pro |
+| `dfmodel` | DeepSeek-V4-Flash |
+| `mmodel` | MiniMax-M3 |
+| `cmodel` | Cantus |
+
+Credit multipliers, context tiers and thinking efforts come from live discovery (next section) and move with Qoder's pricing; the bundled table carries none of them. The previously listed `qmodel_preview` and `gm51model` are retired upstream and no longer bundled.
 
 ## Model discovery
 
@@ -45,6 +71,31 @@ Model names carry Qoder's credit multiplier, e.g. `(0.5x)`. Once credits run out
 | `QODER_MODEL_DISK_CACHE` | Override the disk cache path |
 | `QODER_STATIC_MODELS` | Path to a custom static fallback table (JSON) |
 | `OPENCODE_QODER_LOG_FILE` | Append diagnostics (credit quota, catalog refreshes) to this path. Unset by default, which logs nothing |
+
+## Tools and skill
+
+Once loaded, the plugin registers read-only tools that answer account questions directly in the conversation:
+
+| Tool | Answers |
+| --- | --- |
+| `qoder_quota` | Remaining credits per bucket (plan / add-on / org package), total, exhaustion flag, renewal date |
+| `qoder_account` | The profile the current credential belongs to (name, email, organisation) |
+| `qoder_models` | Every model offered: multiplier, limits, thinking efforts, `Unavailable` marks |
+| `qoder_model` | One model's details by `id`; an unknown id resolves to the fallback model and says so |
+| `qoder_catalog` | Where the model table came from (live / cache / fallback), freshness, cache path |
+| `qoder_auth` | Which credential layer is in effect and what it resolves to -- shape only, never the token value |
+
+Reading quota is unmetered: ten consecutive reads leave the usage counters unchanged (verified 2026-09-08). If the numbers move between reads, that is model usage, not these tools.
+
+The repo also ships the `qoder-quota` skill (`skills/qoder-quota/`) with a standalone script for contexts without a running opencode session (cron, a bare shell):
+
+```bash
+node skills/qoder-quota/scripts/qoder-quota.mjs            # human-readable
+node skills/qoder-quota/scripts/qoder-quota.mjs --json     # structured
+node skills/qoder-quota/scripts/qoder-quota.mjs --refresh  # skip the cached job token
+```
+
+The script resolves credentials in the same order the plugin does: `--pat`/`--token`, then `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`, then `provider.qoder.options.apiKey` in `opencode.jsonc` (expanding `{file:...}`), then `~/.qoderkey_pat`, then opencode's own `auth.json`.
 
 ## Authenticate
 

@@ -25,7 +25,33 @@ pnpm build
 }
 ```
 
-插件注册 `qoder` 提供商，内置以下模型：`auto`、`ultimate`、`performance`、`efficient`、`lite`、`qmodel_38max`、`qfmodel`、`qmodel_latest`、`qmodel`、`kmodel_latest`、`kmodel`、`gmodel`、`gfmodel`、`dmodel`、`dfmodel`、`mmodel`、`qmodel_preview`、`gm51model`。
+插件注册 `qoder` 提供商，内置 17 个模型——见[模型](#模型)。
+
+## 模型
+
+内置表使用以下 id。前五个是 Qoder 自己的档位别名，并非上游品牌；其余对应其上游模型名称：
+
+| id | 上游模型 |
+| --- | --- |
+| `auto` | Auto（网关自动选择） |
+| `ultimate` | Ultimate |
+| `performance` | Performance |
+| `efficient` | Efficient |
+| `lite` | Lite |
+| `qmodel_38max` | Qwen3.8-Max |
+| `qfmodel` | Qwen3.8-Flash |
+| `qmodel_latest` | Qwen3.7-Max |
+| `qmodel` | Qwen3.7-Plus |
+| `kmodel_latest` | Kimi-K3 |
+| `kmodel` | Kimi-K2.7-Code |
+| `gmodel` | GLM-5.3 |
+| `gfmodel` | GLM-5.3-Flash |
+| `dmodel` | DeepSeek-V4-Pro |
+| `dfmodel` | DeepSeek-V4-Flash |
+| `mmodel` | MiniMax-M3 |
+| `cmodel` | Cantus |
+
+credit 倍率、上下文档位与思考档位来自线上发现（下一节），随 Qoder 定价浮动；内置表不携带这些信息。此前列出的 `qmodel_preview` 与 `gm51model` 已在上游下线，不再内置。
 
 ## 模型发现
 
@@ -45,6 +71,31 @@ pnpm build
 | `QODER_MODEL_DISK_CACHE` | 覆盖磁盘缓存路径 |
 | `QODER_STATIC_MODELS` | 指向自定义静态兜底表（JSON）的路径 |
 | `OPENCODE_QODER_LOG_FILE` | 将诊断信息（credit 配额、目录刷新）追加到该路径。默认未设置，即不记录任何日志 |
+
+## 工具与技能
+
+插件加载后注册一组只读工具，可在对话中直接查询账户信息：
+
+| 工具 | 回答什么 |
+| --- | --- |
+| `qoder_quota` | 剩余额度：plan / add-on / org package 各桶、合计、是否耗尽、续期日期 |
+| `qoder_account` | 当前凭证所属的账户信息（姓名、邮箱、组织） |
+| `qoder_models` | 全部可用模型：倍率、上下文限制、思考档位、`Unavailable` 标记 |
+| `qoder_model` | 按 `id` 查单个模型详情；未知 id 会明确说明已回退到兜底模型 |
+| `qoder_catalog` | 模型表来源（线上 / 缓存 / 内置兜底）、刷新时间、缓存路径 |
+| `qoder_auth` | 当前生效的凭证层与解析结果——只报形态，绝不回显 token 值 |
+
+查询配额本身不计费：连续十次读取，用量计数器纹丝不动（2026-09-08 实测）。两次读取之间数字若发生变化，那是模型消耗，与这些工具无关。
+
+仓库同时附带 `qoder-quota` 技能（`skills/qoder-quota/`），内含独立脚本，用于没有 opencode 会话在跑的场景（cron、裸 shell）：
+
+```bash
+node skills/qoder-quota/scripts/qoder-quota.mjs            # 人类可读
+node skills/qoder-quota/scripts/qoder-quota.mjs --json     # 结构化输出
+node skills/qoder-quota/scripts/qoder-quota.mjs --refresh  # 跳过缓存的 job token
+```
+
+脚本的凭证解析顺序与插件一致：`--pat`/`--token`，其次 `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`，再次 `opencode.jsonc` 中的 `provider.qoder.options.apiKey`（自动展开 `{file:...}`），然后 `~/.qoderkey_pat`，最后 opencode 自身的 `auth.json`。
 
 ## 认证
 
