@@ -1,5 +1,8 @@
 import type { LanguageModelV3Prompt } from "@ai-sdk/provider";
-import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseCatalog } from "../model-catalog.js";
 import { transformPrompt } from "../transform.js";
 
@@ -75,6 +78,48 @@ describe("parseCatalog", () => {
     expect(model.inputWindow).toBe(180000);
     expect(model.efforts).toEqual(["high", "low", "max"]);
     expect(model.supportsEffort).toBe(true);
+    // The full tier table is retained for the tier picker, ascending.
+    expect(model.contextTiers).toEqual([200000, 1000000]);
+  });
+
+  it("omits contextTiers when upstream lists fewer than two usable windows", () => {
+    const models = parseCatalog({
+      chat: [
+        { key: "single", max_input_tokens: 180000, context_config: { "200K": { token_count: 200000, is_default: true } } },
+        { key: "garbage", max_input_tokens: 180000, context_config: { a: { token_count: -5 }, b: { token_count: "x" } } },
+        { key: "none", max_input_tokens: 180000 },
+      ],
+    });
+    expect(models.find((entry) => entry.id === "single")!.contextTiers).toBeUndefined();
+    expect(models.find((entry) => entry.id === "garbage")!.contextTiers).toBeUndefined();
+    expect(models.find((entry) => entry.id === "none")!.contextTiers).toBeUndefined();
+  });
+
+  it("validates request tiers against the advertised table", async () => {
+    const { isValidContextTier } = await import("../model-catalog.js");
+    const models = parseCatalog({
+      chat: [
+        {
+          key: "tiered",
+          max_input_tokens: 180000,
+          context_config: {
+            "1M": { token_count: 1000000 },
+            "200K": { token_count: 200000, is_default: true },
+          },
+        },
+        { key: "plain", max_input_tokens: 180000 },
+      ],
+    });
+    const tiered = models.find((entry) => entry.id === "tiered")!;
+    const plain = models.find((entry) => entry.id === "plain")!;
+    // With a tier table: exact members only, mirroring qodercli's qq().
+    expect(isValidContextTier(tiered, 200000)).toBe(true);
+    expect(isValidContextTier(tiered, 1000000)).toBe(true);
+    expect(isValidContextTier(tiered, 500000)).toBe(false);
+    expect(isValidContextTier(tiered, 0)).toBe(false);
+    // Without a table: bounded by the input budget.
+    expect(isValidContextTier(plain, 180000)).toBe(true);
+    expect(isValidContextTier(plain, 180001)).toBe(false);
   });
 
   it("rejects a schema-drifted batch with no recognisable limits", () => {
@@ -156,5 +201,72 @@ describe("parseCatalog", () => {
     });
     const autoModels = models.filter((model) => model.id === "auto");
     expect(autoModels).toHaveLength(1);
+  });
+});
+
+// opencode loads the plugin twice per process (legacy + v2 realms) and only
+// the v2 realm refreshes; the realms share state exclusively through the disk
+// cache. The serving realm must therefore adopt a peer-written cache, or a
+// model's context tiers -- parsed only on a live refresh -- stay invisible to
+// the request path and parameters.context_length never rides the wire.
+describe("cross-realm disk-cache adoption", () => {
+  const CACHE_VERSION = 1;
+
+  function cachedModel(withTiers: boolean) {
+    return {
+      id: "cmodel",
+      name: "Cantus",
+      reasoning: true,
+      supportsEffort: false,
+      efforts: [],
+      input: ["text"],
+      contextWindow: 200000,
+      inputWindow: 200000,
+      maxTokens: 32768,
+      origin: "qoder",
+      ...(withTiers ? { contextTiers: [200000, 400000, 1000000] } : {}),
+    };
+  }
+
+  function writeCache(file: string, withTiers: boolean, fetchedAt: number, mtimeSec: number): void {
+    writeFileSync(file, JSON.stringify({ version: CACHE_VERSION, fetchedAt, models: [cachedModel(withTiers)] }));
+    // Explicit mtimes keep the stat comparison deterministic regardless of how
+    // fast the two writes land on the real clock.
+    utimesSync(file, mtimeSec, mtimeSec);
+  }
+
+  it("adopts a peer refresh that arrived after this realm seeded", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "qoder-adopt-"));
+    const cache = join(dir, "models.json");
+    const t0 = 1_700_000_000_000;
+    writeCache(cache, false, t0, t0 / 1000);
+    vi.stubEnv("QODER_MODEL_DISK_CACHE", cache);
+    vi.useFakeTimers();
+    vi.setSystemTime(t0);
+    try {
+      vi.resetModules();
+      const mod = await import("../model-catalog.js");
+      // The serving realm seeds the tier-less snapshot and reports it.
+      expect(mod.getModelDefinition("cmodel").contextTiers).toBeUndefined();
+
+      // Peer realm refreshes ~1s later and persists the parsed table.
+      writeCache(cache, true, t0 + 1000, t0 / 1000 + 5);
+      vi.setSystemTime(t0 + 1000);
+      expect(mod.getModelDefinition("cmodel").contextTiers).toBeUndefined(); // still throttled
+
+      // Past the poll interval the newer file is adopted...
+      vi.setSystemTime(t0 + 6000);
+      expect(mod.getModelDefinition("cmodel").contextTiers).toEqual([200000, 400000, 1000000]);
+      expect(mod.catalogStatus().fetchedAt).toBe(t0 + 1000);
+
+      // ...and the adoption is sticky-cheap: an unchanged file is not reparsed.
+      writeCache(cache, false, t0 + 2000, t0 / 1000 + 5);
+      vi.setSystemTime(t0 + 12000);
+      expect(mod.getModelDefinition("cmodel").contextTiers).toEqual([200000, 400000, 1000000]);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

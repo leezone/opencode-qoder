@@ -16,8 +16,11 @@ import { QODER_CHAT_URL, QODER_ERROR_CODE_QUOTA_EXHAUSTED, USER_AGENT } from "./
 import { buildAuthHeaders } from "./cosy.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { readEnv } from "./env.js";
-import { logPlugin } from "./log.js";
-import { getModelDefinition } from "./model-catalog.js";
+import { errorMessage, logPlugin } from "./log.js";
+import { getModelDefinition, isValidContextTier } from "./model-catalog.js";
+import { getRoutingPolicy, resolveRouting } from "./routing-policy.js";
+import { resolveRootSession } from "./session-roots.js";
+import { getSelectedTier, getSessionTier } from "./tier-store.js";
 import { type QoderMessage, type QoderTool, transformPrompt, transformTools } from "./transform.js";
 
 // ---------------------------------------------------------------------------
@@ -394,11 +397,53 @@ function resolveReasoningEffort(
   return supported.includes(picked) ? picked : undefined;
 }
 
+// Session-aware route for one request.
+//
+// opencode hands us the conversation identity for free: its per-request
+// headers carry X-Session-Id (verified live). The agent name is NOT in those
+// headers, so the plugin's own chat.headers hook stamps X-Qoder-Agent before
+// the call reaches this class (see index.ts). Both are read here.
+//
+// A child session (task subagent) carries its own id, so the tier lookup
+// resolves upward through the parent map recorded from session.created events;
+// an unresolvable id simply means "no session tier" and the request keeps the
+// selected model with its default behavior. Everything degrades to the
+// pre-tier wire shape when either header is missing.
+function resolveRequestRoute(
+  modelID: string,
+  options: LanguageModelV3CallOptions,
+): { modelID: string; tier: number | undefined; root: string; agent: string } {
+  let agent = "";
+  let sessionID = "";
+  for (const [key, value] of Object.entries(options.headers ?? {})) {
+    const lowered = key.toLowerCase();
+    if (lowered === "x-qoder-agent" && typeof value === "string") agent = value;
+    else if (lowered === "x-session-id" && typeof value === "string") sessionID = value;
+  }
+  const root = sessionID === "" ? "" : resolveRootSession(sessionID);
+  const tier = root === "" ? undefined : getSessionTier(root);
+  const decision = resolveRouting({
+    policy: getRoutingPolicy(),
+    modelID,
+    agent,
+    sessionTier: tier,
+    targetSupports: (id, tokens) => isValidContextTier(getModelDefinition(id), tokens),
+  });
+  if (decision.escalated) {
+    logPlugin(
+      `routing: ${agent === "" ? "?" : agent} ${modelID} -> ${decision.modelID} @${tier} (session ${root})`,
+    );
+  }
+  return { modelID: decision.modelID, tier, root, agent };
+}
+
 function buildRequestBody(
   modelID: string,
   options: LanguageModelV3CallOptions,
   userID: string,
 ): { body: Record<string, unknown>; warnings: SharedV3Warning[] } {
+  const route = resolveRequestRoute(modelID, options);
+  modelID = route.modelID;
   const model = getModelDefinition(modelID);
   const transformed = transformPrompt(options.prompt);
   const { tools, ignoredTools } = transformTools(options.tools);
@@ -431,6 +476,37 @@ function buildRequestBody(
   // thinking_config (e.g. lite) keep their payload byte-identical to before.
   const effort = resolveReasoningEffort(options, model);
   if (effort) parameters.reasoning_effort = effort;
+
+  // Context tier selection.
+  //
+  // When a tier other than the default is selected for this model (tier-store),
+  // the request carries parameters.context_length = <token count> -- the same
+  // field qodercli sends after its window picker:
+  //   s?.contextWindow!==void 0 && qq(E,s.contextWindow) && (m.context_length=s.contextWindow)
+  // Its qq() validator accepts the value only when it is EXACTLY one of the
+  // model's advertised context_config windows (or <= max_input_tokens when
+  // upstream lists no windows), so the same rule is applied here -- anything
+  // else risks a gateway 400. Absent a selection, no context_length is sent
+  // and the gateway applies the default tier, keeping the payload
+  // byte-identical to before the feature existed.
+  //
+  // The session tier wins because it is conversation-bound and shared with the
+  // subagents (one switch lifts the whole exchange). The per-model display
+  // selection remains as the fallback for a request whose session carries no
+  // tier: a manually edited store file, or a call with no resolvable session.
+  // Both are re-validated against the model that ACTUALLY serves the request
+  // (post-escalation), so a tier the target does not advertise is never sent.
+  const selectedTier = route.tier ?? getSelectedTier(modelID);
+  if (selectedTier !== undefined && isValidContextTier(model, selectedTier)) {
+    parameters.context_length = selectedTier;
+    logPlugin(
+      `tier: ${modelID} (agent ${route.agent === "" ? "?" : route.agent}) @${selectedTier} via session ${route.root === "" ? "store-file" : route.root}`,
+    );
+  } else if (selectedTier !== undefined) {
+    // Asked for a tier this model does not advertise: a stale store value or a
+    // manual-file mistake. Silently falling back beats a gateway 400.
+    logPlugin(`tier: ${modelID} wanted ${selectedTier} but it is not advertised -> gateway default`);
+  }
 
   return {
     warnings,
@@ -590,6 +666,10 @@ export class QoderLanguageModel implements LanguageModelV3 {
   }
 
   async doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
+    // TEMP PROBE: which per-request channels actually reach this class?
+    logPlugin(
+      `probe: keys=${JSON.stringify(Object.keys(options))} providerOptions=${JSON.stringify(options.providerOptions)} headers=${JSON.stringify(options.headers)}`,
+    );
     const credentials = await resolveQoderCredentials(this.providerOptions);
     const { body, warnings } = buildRequestBody(this.modelId, options, credentials.userID);
     const bodyBytes = Buffer.from(JSON.stringify(body));

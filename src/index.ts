@@ -37,8 +37,17 @@ import {
   type DiscoveredModel,
   discoveryDisabled,
   displayName,
+  isValidContextTier,
   refreshModels,
 } from "./model-catalog.js";
+import {
+  addPAT,
+  getActivePAT,
+  listPATs,
+  removePAT,
+  switchPAT,
+} from "./pat-store.js";
+import { clearTier, getSelectedTier, listSelectedTiers, setTier } from "./tier-store.js";
 
 export { createQoder, QoderLanguageModel };
 
@@ -116,6 +125,24 @@ function writeSharedApiKey(apiKey: string): boolean {
   return true;
 }
 
+// Cross-instance refresh trigger. The tier/pat tools live on the legacy
+// instance, but only the v2 instance owns refreshCatalog() and
+// ctx.catalog.reload(). setupV2 publishes its force-refresh closure here; the
+// tools call it when present so a switch takes effect without waiting out the
+// 15-minute refresh timer (whose non-forced path is also TTL-throttled).
+const REFRESH_TRIGGER_KEY = "__opencode_qoder_refresh_trigger";
+
+function triggerCatalogRefresh(): boolean {
+  const trigger = sharedState()[REFRESH_TRIGGER_KEY];
+  if (typeof trigger !== "function") return false;
+  try {
+    (trigger as () => void)();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Wired by setupV2 once refreshCatalog() exists, and invoked when a credential
 // first becomes available -- so discovery starts immediately rather than waiting
 // out the next 15-minute tick. Deferred rather than called directly because the
@@ -137,6 +164,17 @@ function shouldSetDefault(options?: PluginOptions): boolean {
 // The `limit` triple is identical on both config surfaces; only the v1 legacy
 // path carried the explanation, so the comment now lives with the shape.
 function modelLimit(model: DiscoveredModel): { context: number; input: number; output: number } {
+  // A selected context tier overrides the default-tier limits, so opencode's
+  // auto-compaction threshold defers past the default tier instead of
+  // compacting at ~180k while the gateway would still accept input at the
+  // selected tier. The selection was validated against the model's advertised
+  // tiers at switch time; re-checked here because the live table may have
+  // changed since (a tier the gateway stopped advertising must not keep
+  // driving the registered limits).
+  const tier = getSelectedTier(model.id);
+  if (tier !== undefined && isValidContextTier(model, tier)) {
+    return { context: tier, input: tier, output: model.maxTokens };
+  }
   return {
     context: model.contextWindow,
     // opencode's auto-compaction threshold derives from limit.input, so it
@@ -202,9 +240,27 @@ interface LegacyProviderConfig {
   options?: Record<string, unknown>;
   models?: Record<string, LegacyModelConfig>;
 }
+interface LegacyAgentConfig {
+  model?: string;
+  // Verified against opencode 1.18.29's agent Info schema: {model, variant,
+  // temperature, top_p, prompt, description, mode, hidden, options, ...}.
+  // There is no reasoningEffort field; per-request reasoning is delivered via
+  // model `variant` instead, and lite publishes no variants at all.
+  variant?: string;
+}
 interface LegacyConfig {
   provider?: Record<string, LegacyProviderConfig>;
   model?: string;
+  // SINGULAR key -- this is the documented agent-definition section
+  // (opencode config schema: agent.{plan,build,general,explore,title,summary,
+  // compaction,...}). The plural `agents` key is NOT the same section: writing
+  // agents.task there CREATES a ghost custom agent (mode "all") instead of
+  // configuring a builtin, because "task"/"summarizer" ceased to exist as
+  // builtins around the 1.x JS rewrite.
+  agent?: Record<string, LegacyAgentConfig>;
+  // Legacy/compat alias opencode still merges by name; respected below so a
+  // user override under either spelling wins over our defaults.
+  agents?: Record<string, LegacyAgentConfig>;
 }
 
 function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
@@ -252,6 +308,53 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
 
   if (shouldSetDefault(options) && !cfg.model) cfg.model = `${id}/auto`;
   logCatalogRegistration("legacy");
+
+  // Configure subagents to use free/cheap models. This saves quota by using
+  // lite (free, 200k) for mechanical tasks -- title generation, compaction,
+  // plan research, parallel subtasks -- while the main agent keeps the user's
+  // selected model.
+  //
+  // Resolution order in opencode 1.18.x (verified in the bundle):
+  //   message.model ?? agent.config.model ?? session's current model
+  // So an agent WITH a configured model is pinned to it (our goal); an agent
+  // without one inherits whatever model the user picked. Only the main agent
+  // follows the user's model picker; that is by design and is what keeps the
+  // picker meaningful.
+  //
+  // Precedence for our defaults: an entry under cfg.agent.X or the legacy
+  // cfg.agents.X alias means the user configured it -- not touched.
+  //
+  // Compaction caveat: the compaction agent receives the WHOLE conversation.
+  // lite caps at 200k, so a session run above 200k (performance/kmodel, or a
+  // raised context tier) cannot be compacted by it -- qoder_tier_switch warns
+  // about this. Users living above 200k should override agent.compaction in
+  // opencode.json (or leave it unset to inherit the session model, which
+  // always fits by definition).
+  if (!cfg.agent) cfg.agent = {};
+  const agents = cfg.agent;
+  const ensureAgent = (name: string, value: LegacyAgentConfig): void => {
+    if (agents[name] || cfg.agents?.[name]) return;
+    agents[name] = value;
+  };
+
+  // plan: explores code and writes plans, doesn't execute.
+  ensureAgent("plan", { model: `${id}/lite` });
+  // general/explore: Task-tool subagents (multi-step work / read-only search).
+  // Subagent sessions start fresh, so 200k is plenty.
+  ensureAgent("general", { model: `${id}/lite` });
+  ensureAgent("explore", { model: `${id}/lite` });
+  // title: generates session titles from the user prompts -- always small.
+  ensureAgent("title", { model: `${id}/lite` });
+  // compaction: compresses full conversations. Pinned to lite for quota; see
+  // the caveat above for sessions exceeding 200k tokens.
+  ensureAgent("compaction", { model: `${id}/lite` });
+  // Deliberately untouched: build (main agent, user's model choice), summary
+  // (hidden internal agent, safe to inherit the session model).
+
+  logPlugin(
+    `legacy: configured subagents (plan/general/explore/title/compaction -> ${id}/lite). ` +
+      `Set agent.* in opencode.json to override.`,
+  );
 }
 
 function v2ModelConfig(model: DiscoveredModel) {
@@ -263,7 +366,14 @@ function v2ModelConfig(model: DiscoveredModel) {
     api: {
       id: model.id,
       type: "aisdk" as const,
-      package: "@ai-sdk/openai-compatible",
+      // This MODEL-level api.package is what Provider.getLanguage actually
+      // resolves. With "@ai-sdk/openai-compatible" there, opencode served
+      // chat with its GENERIC client (verified 1.18.29: real request, zero
+      // QoderLanguageModel wire-probe lines) and every payload rule in
+      // language-model.ts was dead -- including context-tier injection.
+      // A file:// package falls through the built-in map to
+      // import(package) -> first `create*` export -> createQoder below.
+      package: import.meta.url,
       url: QODER_BASE_URL,
       settings: {},
     },
@@ -380,9 +490,22 @@ async function setupV2(ctx: PluginContext): Promise<void> {
     catalog.provider.update(id, (provider) => {
       provider.name = PROVIDER_NAME;
       provider.integrationID = id;
+      // package MUST be this plugin's own module URL, NOT "@ai-sdk/openai-compatible".
+      //
+      // On 1.18.29 the v2 catalog is the serving path: opencode resolves the
+      // SDK by package -- built-ins are a fixed map, anything else is imported
+      // and its first `create*` export is called with the provider options.
+      // With the openai-compatible package there, requests were served by the
+      // GENERIC client (verified: a real chat request produced zero
+      // wire-probe lines from QoderLanguageModel), silently discarding every
+      // payload rule in language-model.ts -- including the context-tier
+      // parameters.context_length injection. The legacy path already points
+      // npm at this module (applyLegacyConfig), whose createQoder export is
+      // exactly the factory opencode's fallback expects, so aligning the v2
+      // package puts QoderLanguageModel back on the wire on both paths.
       provider.api = {
         type: "aisdk",
-        package: "@ai-sdk/openai-compatible",
+        package: import.meta.url,
         url: QODER_BASE_URL,
         settings: {},
       };
@@ -490,6 +613,10 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   // Armed only now: the aisdk handler above is registered before refreshCatalog
   // exists, so it fires this trigger rather than calling refreshCatalog directly.
   onCredentialsCaptured = () => {
+    refreshCatalog(true).catch(logRefreshFailure);
+  };
+  // Published for the legacy instance's tools (see triggerCatalogRefresh).
+  sharedState()[REFRESH_TRIGGER_KEY] = () => {
     refreshCatalog(true).catch(logRefreshFailure);
   };
   const warm = setTimeout(() => {
@@ -605,6 +732,177 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
       execute: (_args, ctx) =>
         capabilityTool("auth", () => reportAuth(capabilityOptions(options)), ctx),
     }),
+    // Multi-PAT management: list stored accounts.
+    qoder_pat_list: tool({
+      description:
+        "List all stored Qoder PATs (Personal Access Tokens). Shows id, label, email, " +
+        "and which one is currently active. Use when the user asks 'which accounts do I have' " +
+        "or 'which PAT is active'.",
+      args: {},
+      execute: () => {
+        const pats = listPATs();
+        const active = getActivePAT();
+        const output = pats.length === 0
+          ? "No PATs stored yet. Use qoder_pat_add to add one."
+          : pats
+              .map((p) => {
+                const marker = p.active ? " [ACTIVE]" : "";
+                const email = p.email ? ` (${p.email})` : "";
+                return `${p.id}: ${p.label}${email}${marker}`;
+              })
+              .join("\n");
+        return Promise.resolve({ output, data: { pats, activeId: active?.id } });
+      },
+    }),
+    // Multi-PAT management: switch active account.
+    qoder_pat_switch: tool({
+      description:
+        "Switch the active Qoder PAT to a different stored account. The id must match " +
+        "one shown by qoder_pat_list. Use when the user says 'switch to account X' or " +
+        "'use my other PAT'.",
+      args: { id: tool.schema.string().describe("PAT id from qoder_pat_list") },
+      execute: (args) => {
+        const success = switchPAT(args.id);
+        const output = success
+          ? `Switched to ${args.id}. This PAT will be used for all subsequent requests.`
+          : `PAT ${args.id} not found. Run qoder_pat_list to see available accounts.`;
+        return Promise.resolve({ output, data: { success, id: args.id } });
+      },
+    }),
+    // Multi-PAT management: add a new PAT.
+    qoder_pat_add: tool({
+      description:
+        "Add a new Qoder PAT (Personal Access Token) to the store. The label is a " +
+        "human-readable name like 'Work Account' or 'Personal'. If this is the first " +
+        "PAT, it becomes active automatically. Use when the user says 'add my other account' " +
+        "or provides a new PAT.",
+      args: {
+        pat: tool.schema.string().describe("The Personal Access Token (pt-...)"),
+        label: tool.schema.string().describe("Human-readable label, e.g. 'Work Account'"),
+        email: tool.schema.string().optional().describe("Account email (optional, for display)"),
+      },
+      execute: (args) => {
+        const entry = addPAT(args.pat, args.label, args.email);
+        const output = entry
+          ? `Added ${entry.id} (${entry.label}). ${entry.active ? "This is now the active PAT." : "Use qoder_pat_switch to activate it."}`
+          : `PAT already exists (duplicate detected).`;
+        return Promise.resolve({ output, data: { entry } });
+      },
+    }),
+    // Multi-PAT management: remove a PAT.
+    qoder_pat_remove: tool({
+      description:
+        "Remove a stored Qoder PAT. The id must match one shown by qoder_pat_list. " +
+        "If the removed PAT was active, no other PAT becomes active automatically. " +
+        "Use when the user says 'remove account X' or 'delete my old PAT'.",
+      args: { id: tool.schema.string().describe("PAT id from qoder_pat_list") },
+      execute: (args) => {
+        const success = removePAT(args.id);
+        const output = success
+          ? `Removed ${args.id}.`
+          : `PAT ${args.id} not found.`;
+        return Promise.resolve({ output, data: { success, id: args.id } });
+      },
+    }),
+    // Context tiers: what each model offers and what is currently selected.
+    qoder_tier_list: tool({
+      description:
+        "Show each Qoder model's selectable context tiers (from the live context_config) " +
+        "and any currently selected tier. The DEFAULT tier is what requests run at when " +
+        "nothing is selected. Use when the user asks about 上下文档位/1M/long context or " +
+        "before switching a model's context window.",
+      args: {},
+      execute: () => {
+        const selections = listSelectedTiers();
+        const tiers = catalogModels()
+          .filter((model) => (model.contextTiers?.length ?? 0) > 0 || model.id in selections)
+          .map((model) => ({
+            model: model.id,
+            defaultTier: model.contextWindow,
+            availableTiers: model.contextTiers ?? [model.contextWindow],
+            selected: selections[model.id] ?? null,
+          }));
+        const output =
+          tiers.length === 0
+            ? "No model advertises multiple context tiers. All run at their default tier."
+            : tiers
+                .map((entry) => {
+                  const selected = entry.selected
+                    ? ` [SELECTED: ${entry.selected}]`
+                    : " [default]";
+                  return `${entry.model}: ${entry.availableTiers.join(" / ")}${selected}`;
+                })
+                .join("\n") +
+              "\n\nSwitch with qoder_tier_switch(model, tier). After switching, re-select " +
+              "the model so the new limits take effect (restart opencode if needed).";
+        return Promise.resolve({ output, data: { tiers } });
+      },
+    }),
+    // Context tiers: select a tier (or clear back to default).
+    qoder_tier_switch: tool({
+      description:
+        "Select a context tier for a Qoder model, e.g. 1000000 for the 1M window. The " +
+        "tier must be one of the model's advertised tiers (see qoder_tier_list); omit " +
+        "the tier argument to return the model to its default. The chat request will " +
+        "carry context_length and the registered limits follow the selection. Use when " +
+        "the user says 'switch to 1M context' or 'reset the context tier'.",
+      args: {
+        model: tool.schema.string().describe("Model id, e.g. cmodel or ultimate"),
+        tier: tool.schema
+          .number()
+          .optional()
+          .describe("Tier in tokens (e.g. 1000000). Omit to restore the default tier."),
+      },
+      execute: (args) => {
+        const def = catalogModels().find((model) => model.id === args.model);
+        if (!def) {
+          return Promise.resolve({
+            output: `Model "${args.model}" not found. Run qoder_models to list available models.`,
+            data: { success: false },
+          });
+        }
+        if (args.tier === undefined) {
+          const cleared = clearTier(args.model);
+          triggerCatalogRefresh();
+          return Promise.resolve({
+            output: cleared
+              ? `Cleared tier selection for ${args.model}; it runs at its default tier (${def.contextWindow} tokens) again.`
+              : `${args.model} has no tier selection; it already runs at the default tier.`,
+            data: { success: true, cleared },
+          });
+        }
+        if (!isValidContextTier(def, args.tier)) {
+          const offered = def.contextTiers?.join(" / ") ?? `<= ${def.inputWindow ?? def.contextWindow}`;
+          return Promise.resolve({
+            output:
+              `Tier ${args.tier} is not valid for ${args.model}. ` +
+              `Accepted values: ${offered}. Run qoder_tier_list for the full table.`,
+            data: { success: false },
+          });
+        }
+        setTier(args.model, args.tier);
+        const refreshed = triggerCatalogRefresh();
+        // The subagent defaults pin the compaction agent to lite (200k). A
+        // session that grows past the compaction model's window can no longer
+        // be compacted by it, so say so when raising a model above 200k.
+        const compactionNote =
+          args.tier > 200_000
+            ? "\n\nNote: the compaction agent is pinned to a 200k model by this plugin's " +
+              "subagent defaults. Sessions exceeding 200k tokens cannot be compacted by it. " +
+              "Override agent.compaction in opencode.json (or remove that pin) if you work " +
+              "above 200k."
+            : "";
+        return Promise.resolve({
+          output:
+            `${args.model} now runs at the ${args.tier}-token tier (was ${def.contextWindow}). ` +
+            (refreshed
+              ? "Model list refresh triggered -- re-select the model so its session picks up the new limits; restart opencode if the compaction threshold did not move."
+              : "Restart opencode to apply the new limits.") +
+            compactionNote,
+          data: { success: true, model: args.model, tier: args.tier },
+        });
+      },
+    }),
   };
 }
 
@@ -612,6 +910,20 @@ function legacyHooks(options?: PluginOptions): Hooks {
   const id = providerID(options);
   return {
     config: async (cfg) => applyLegacyConfig(cfg as unknown as LegacyConfig, options),
+    // TEMP PROBES: does opencode fire chat hooks for our custom model, and
+    // what identity does it hand us? Removed once the answer is known.
+    "chat.params": async (input, output) => {
+      if (input.model.providerID !== id) return;
+      logPlugin(
+        `probe chat.params: session=${input.sessionID} agent=${input.agent} model=${input.model.id} optionsKeys=${JSON.stringify(Object.keys(output.options))} options=${JSON.stringify(output.options).slice(0, 200)}`,
+      );
+    },
+    "chat.headers": async (input, output) => {
+      if (input.model.providerID !== id) return;
+      logPlugin(
+        `probe chat.headers: session=${input.sessionID} agent=${input.agent} model=${input.model.id}`,
+      );
+    },
     tool: capabilityTools(options),
     auth: {
       provider: id,

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
@@ -9,6 +9,7 @@ import { fetchWithTimeout, jsonHeaders, readErrorBody } from "./http.js";
 import { errorMessage, logPlugin } from "./log.js";
 import { fetchQuotaExhausted, getQuotaExhausted, setQuotaExhausted } from "./quota.js";
 import { QODER_MODELS } from "./static-models.js";
+import { getSelectedTier } from "./tier-store.js";
 
 // Dynamic model discovery for Qoder.
 //
@@ -35,6 +36,14 @@ const DEFAULT_CONTEXT_WINDOW = 131072; // Go: intField(entry, 131072, ...)
 const DEFAULT_MODEL = "auto"; // Go: DefaultModel
 const DISK_CACHE_VERSION = 1;
 const DISK_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+
+// How often a realm probes the shared disk cache for a refresh performed by its
+// peer realm in the same process (see adoptNewerDiskCache()).
+const ADOPT_POLL_MS = 5 * 1000;
+
+// How long a tier table survives being absent from a fresh upstream batch
+// (see saveDiskCache()'s downgrade guard).
+const TIER_PRESERVE_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Guards against a renamed/repurposed upstream field silently feeding us garbage.
 // A token budget above this is not a token budget (it is a byte count, a
@@ -131,13 +140,59 @@ function isSaneModel(model: DiscoveredModel): boolean {
 
 // Persist the PARSED table rather than the raw response: a future upstream shape
 // change then cannot invalidate what we already understood.
+//
+// Downgrade guard: the live list occasionally comes back WITHOUT a model's
+// context_config (observed: a long-running peer process rewrote the shared
+// disk cache with a tier-less batch minutes after a full one). Tiers are
+// additive capability data, so losing them silently disables the tier feature
+// -- a missing field is treated as transport noise, not revocation, and the
+// last known tier table is carried over for up to TIER_PRESERVE_MS.
 function saveDiskCache(models: DiscoveredModel[]): void {
   try {
     const file = diskCachePath();
     mkdirSync(dirname(file), { recursive: true });
+    const now = Date.now();
+    const persisted = models.map((model) => ({ ...model }));
+    let preservedTiers: Record<string, number> = {};
+    try {
+      const raw = JSON.parse(readFileSync(file, "utf8")) as {
+        version?: unknown;
+        fetchedAt?: unknown;
+        models?: unknown;
+        preservedTiers?: unknown;
+      };
+      if (raw?.version === DISK_CACHE_VERSION && Array.isArray(raw.models)) {
+        const prior = new Map(
+          (raw.models as DiscoveredModel[])
+            .filter((model) => typeof model?.id === "string")
+            .map((model) => [model.id, model]),
+        );
+        const priorPreserved =
+          raw.preservedTiers && typeof raw.preservedTiers === "object"
+            ? (raw.preservedTiers as Record<string, unknown>)
+            : {};
+        const since = Number(raw.fetchedAt) || 0;
+        for (const model of persisted) {
+          if (model.contextTiers?.length) continue;
+          const old = prior.get(model.id);
+          if (!old?.contextTiers?.length) continue;
+          const firstSeen = Number(priorPreserved[model.id]) || since || now;
+          if (now - firstSeen > TIER_PRESERVE_MS) continue;
+          model.contextTiers = old.contextTiers;
+          preservedTiers[model.id] = firstSeen;
+        }
+      }
+    } catch {
+      // No readable previous cache: nothing to preserve.
+    }
+    if (Object.keys(preservedTiers).length > 0) {
+      logPlugin(
+        `catalog: preserved tier tables for ${Object.keys(preservedTiers).join(", ")} (upstream batch omitted them)`,
+      );
+    }
     writeFileSync(
       file,
-      JSON.stringify({ version: DISK_CACHE_VERSION, fetchedAt: Date.now(), models }),
+      JSON.stringify({ version: DISK_CACHE_VERSION, fetchedAt: now, models: persisted, preservedTiers }),
       "utf8",
     );
   } catch {
@@ -173,6 +228,46 @@ if (seeded) {
   liveModels = seeded.models.map((model) => ({ ...model, origin: "cache" as const }));
   fetchedAt = seeded.fetchedAt;
   source = "cache";
+}
+
+// opencode loads this module twice in one process: the legacy plugin realm and
+// the v2 realm each get their own copy of the state above. Only the v2 realm
+// runs the periodic refresh, and only the legacy realm's language model serves
+// chat requests. Without a bridge the serving realm stays frozen on whatever it
+// seeded at import time, so a peer refresh that added (or changed) a model's
+// context tiers is never seen and the tier silently stops riding the wire.
+//
+// The disk cache file is the shared medium: whichever realm refreshed writes
+// it, and the other adopts it here before answering a catalog read. statSync
+// is cheap and the file is small, but this runs on every request, so it is
+// throttled to one probe per interval and skipped entirely once this realm has
+// live data of its own that is still within TTL.
+let lastAdoptProbeAt = 0;
+let lastAdoptProbeMtimeMs = -1;
+
+function adoptNewerDiskCache(): void {
+  const now = Date.now();
+  // Own live data, still fresh: nothing on disk could be newer.
+  if (source === "qoder" && now < expiresAt) return;
+  // Throttle the stat probe; -1 forces the very first call to run.
+  if (now - lastAdoptProbeAt < ADOPT_POLL_MS && lastAdoptProbeMtimeMs !== -1) return;
+  lastAdoptProbeAt = now;
+  let mtimeMs: number;
+  try {
+    mtimeMs = statSync(diskCachePath()).mtimeMs;
+  } catch {
+    return; // no cache file yet
+  }
+  if (mtimeMs === lastAdoptProbeMtimeMs) return; // unchanged since last probe
+  lastAdoptProbeMtimeMs = mtimeMs;
+  const disk = loadDiskCache();
+  if (!disk || disk.fetchedAt <= fetchedAt) return; // not newer than what we hold
+  liveModels = disk.models.map((model) => ({ ...model, origin: "cache" as const }));
+  fetchedAt = disk.fetchedAt;
+  source = "cache";
+  logPlugin(
+    `catalog: adopted peer refresh (live=${disk.models.length} fetchedAt=${disk.fetchedAt})`,
+  );
 }
 
 // Go: stringField()
@@ -240,6 +335,39 @@ function defaultTierTokens(entry: CatalogEntry): number {
   return first;
 }
 
+// Every advertised context tier, ascending. qodercli treats a selected request
+// window as valid when it is EXACTLY one of these (see its qq() validator), so
+// the picker must offer the advertised numbers, not arbitrary values. Returns
+// undefined unless upstream lists at least two usable windows -- a single tier
+// carries no choice, and undefined keeps the wire type absent rather than a
+// one-element array.
+function contextTiers(entry: CatalogEntry): number[] | undefined {
+  const tiers = entry.context_config;
+  if (!tiers || typeof tiers !== "object") return undefined;
+  const tokens = new Set<number>();
+  for (const tier of Object.values(tiers as Record<string, ContextTier>)) {
+    const count = Number(tier?.token_count);
+    if (!Number.isFinite(count) || count <= 0 || count > MAX_PLAUSIBLE_TOKENS) continue;
+    tokens.add(Math.floor(count));
+  }
+  if (tokens.size < 2) return undefined;
+  return [...tokens].sort((a, b) => a - b);
+}
+
+// Mirrors qodercli's qq() window validator: a request context_length is legal
+// when it is EXACTLY one of the model's advertised context_config tiers, or --
+// when upstream lists no tier table -- no larger than the model's input budget.
+// Keeping the rule identical to the reference client means a tier the picker
+// offered can never be rejected as malformed by the gateway. Shared by the
+// chat-request builder (language-model.ts) and the tier tools (index.ts).
+export function isValidContextTier(model: DiscoveredModel, tokens: number): boolean {
+  if (!Number.isInteger(tokens) || tokens <= 0) return false;
+  if (model.contextTiers && model.contextTiers.length > 0) {
+    return model.contextTiers.includes(tokens);
+  }
+  return tokens <= (model.inputWindow ?? model.contextWindow);
+}
+
 // Qoder exposes reasoning effort levels through thinking_config, e.g.
 // kmodel_latest -> { enabled: { efforts: { high:{}, low:{}, max:{} } } }.
 function thinkingEfforts(entry: CatalogEntry): string[] {
@@ -258,6 +386,7 @@ function modelFromEntry(entry: CatalogEntry): DiscoveredModel | undefined {
   const isVL = pickBool(entry, ["is_vl", "isVL"]) ?? false;
   const declaredInput = pickInt(entry, 0, ["max_input_tokens", "context_window", "contextWindow"]);
   const tierTokens = defaultTierTokens(entry);
+  const tiers = contextTiers(entry);
   const contextWindow = tierTokens || declaredInput || DEFAULT_CONTEXT_WINDOW;
   // `max_input_tokens` is NOT semantically consistent across Qoder models:
   //   kmodel_latest -> 180000, i.e. the input budget OF the default 200K tier
@@ -276,6 +405,7 @@ function modelFromEntry(entry: CatalogEntry): DiscoveredModel | undefined {
     reasoning: pickBool(entry, ["is_reasoning", "isReasoning"]) ?? false,
     supportsEffort: efforts.length > 0,
     efforts,
+    ...(tiers ? { contextTiers: tiers } : {}),
     input: isVL ? ["text", "image"] : ["text"],
     contextWindow,
     inputWindow: inputWindow || contextWindow,
@@ -383,10 +513,24 @@ function formatFactor(factor: number): string {
 // exist on the v1 model schema and `status: "deprecated"` filters the model out
 // of the list entirely; a suffix keeps it selectable so an in-flight session
 // holds its model and the gateway returns the real billing error.
+//
+// A selected display tier (tier-store) rides in the same parentheses, e.g.
+// "Qwen3.8-Max (0.5x, 1M)", only when it differs from the default window. The
+// label matches qoder's own picker wording ("1M context window").
+function tierLabel(tokens: number): string {
+  return tokens % 1_000_000 === 0
+    ? `${tokens / 1_000_000}M`
+    : `${Math.round(tokens / 1000)}K`;
+}
+
 export function displayName(model: DiscoveredModel): string {
   const parts: string[] = [];
   if (typeof model.priceFactor === "number") parts.push(formatFactor(model.priceFactor));
   if (getQuotaExhausted() && !isZeroCost(model)) parts.push("Unavailable");
+  const tier = getSelectedTier(model.id);
+  if (tier !== undefined && tier !== model.contextWindow && model.contextTiers?.includes(tier)) {
+    parts.push(tierLabel(tier));
+  }
   return parts.length > 0 ? `${model.name} (${parts.join(", ")})` : model.name;
 }
 
@@ -482,6 +626,7 @@ export async function refreshModels(
 // "fallback"), which is its job: something usable when there is no live data at
 // all.
 export function catalogModels(): DiscoveredModel[] {
+  adoptNewerDiskCache();
   // "cache" (seeded from disk) must be honoured exactly like "qoder"; checking
   // only for "qoder" here would make the persisted snapshot dead weight and drop
   // every restart straight back to the bundled table.

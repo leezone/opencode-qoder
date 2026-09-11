@@ -68,6 +68,12 @@ export type QoderModelDefinition = {
   // Thinking-strength levels the gateway accepts for this model, from
   // thinking_config.enabled.efforts. Empty for models without a thinking_config.
   efforts?: string[];
+  // Every context tier the gateway advertises for this model (token counts,
+  // ascending), from context_config.*.token_count. Undefined when upstream
+  // carries no context_config or fewer than two usable windows. The DEFAULT
+  // tier is what contextWindow/inputWindow report; a selected tier rides
+  // parameters.context_length on the chat request (see tier-store.ts).
+  contextTiers?: number[];
   input: Array<"text" | "image">;
   contextWindow: number;
   // Input budget within the default tier. Defaults to contextWindow for the
