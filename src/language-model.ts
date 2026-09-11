@@ -399,27 +399,31 @@ function resolveReasoningEffort(
 
 // Session-aware route for one request.
 //
-// opencode hands us the conversation identity for free: its per-request
-// headers carry X-Session-Id (verified live). The agent name is NOT in those
-// headers, so the plugin's own chat.headers hook stamps X-Qoder-Agent before
-// the call reaches this class (see index.ts). Both are read here.
+// The plugin's chat.headers hook stamps two headers on every call: X-Qoder-Agent
+// (opencode's agent name, which it otherwise never forwards) and X-Qoder-Session
+// (the session id, so we do not depend on opencode's native X-Session-Id name
+// surviving a rename -- that one is still read as a fallback). Both are read here.
 //
-// A child session (task subagent) carries its own id, so the tier lookup
-// resolves upward through the parent map recorded from session.created events;
-// an unresolvable id simply means "no session tier" and the request keeps the
-// selected model with its default behavior. Everything degrades to the
-// pre-tier wire shape when either header is missing.
+// A child session (task subagent, compaction) carries its own id, so the tier
+// lookup resolves upward through the parent map recorded from session.created
+// events; an unresolvable id simply means "no session tier" and the request
+// keeps the selected model at its default. Everything degrades to the
+// pre-tier wire shape when neither header is present.
 function resolveRequestRoute(
   modelID: string,
   options: LanguageModelV3CallOptions,
 ): { modelID: string; tier: number | undefined; root: string; agent: string } {
   let agent = "";
-  let sessionID = "";
+  let qoderSession = "";
+  let nativeSession = "";
   for (const [key, value] of Object.entries(options.headers ?? {})) {
+    if (typeof value !== "string") continue;
     const lowered = key.toLowerCase();
-    if (lowered === "x-qoder-agent" && typeof value === "string") agent = value;
-    else if (lowered === "x-session-id" && typeof value === "string") sessionID = value;
+    if (lowered === "x-qoder-agent") agent = value;
+    else if (lowered === "x-qoder-session") qoderSession = value;
+    else if (lowered === "x-session-id") nativeSession = value;
   }
+  const sessionID = qoderSession !== "" ? qoderSession : nativeSession;
   const root = sessionID === "" ? "" : resolveRootSession(sessionID);
   const tier = root === "" ? undefined : getSessionTier(root);
   const decision = resolveRouting({
@@ -434,8 +438,19 @@ function resolveRequestRoute(
       `routing: ${agent === "" ? "?" : agent} ${modelID} -> ${decision.modelID} @${tier} (session ${root})`,
     );
   }
+  // One-shot plumbing report: confirms the chat.headers identity stamps actually
+  // reach doStream (opencode loads this in a separate realm from the hook, so
+  // "did it arrive?" is a real question this answers once instead of per call).
+  if (!routeProbeLogged) {
+    routeProbeLogged = true;
+    logPlugin(
+      `route-probe: headers=${JSON.stringify(Object.keys(options.headers ?? {}))} agent=${agent === "" ? "?" : agent} session=${sessionID === "" ? "?" : sessionID} root=${root === "" ? "?" : root}`,
+    );
+  }
   return { modelID: decision.modelID, tier, root, agent };
 }
+
+let routeProbeLogged = false;
 
 function buildRequestBody(
   modelID: string,
@@ -666,10 +681,6 @@ export class QoderLanguageModel implements LanguageModelV3 {
   }
 
   async doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
-    // TEMP PROBE: which per-request channels actually reach this class?
-    logPlugin(
-      `probe: keys=${JSON.stringify(Object.keys(options))} providerOptions=${JSON.stringify(options.providerOptions)} headers=${JSON.stringify(options.headers)}`,
-    );
     const credentials = await resolveQoderCredentials(this.providerOptions);
     const { body, warnings } = buildRequestBody(this.modelId, options, credentials.userID);
     const bodyBytes = Buffer.from(JSON.stringify(body));

@@ -11,7 +11,8 @@ import { logPlugin } from "./log.js";
 // (plan/general/explore/title/compaction) run there at zero cost. A 400K/1M
 // conversation does NOT fit in lite -- compaction has to read the whole
 // conversation -- so those agents escalate to a cheap model that advertises
-// the session's tier (default target: qfmodel / Qwen3.8-Flash at x0.1).
+// the session's tier (default target: qfmodel, the cheapest model
+// that advertises it -- its multiplier rides the live catalog).
 //
 // Customizable via ~/.config/opencode/qoder-routing.json; missing fields keep
 // their defaults, unknown fields are ignored, and a broken file never blocks
@@ -34,12 +35,27 @@ export interface RoutingPolicy {
   exemptAgents: string[];
 }
 
+// Which agents are exempt, and why:
+//   - title is the ONLY one kept on the base model by default. It is driven
+//     from a short prompt (the first user turn) regardless of how long the
+//     conversation grows, it is free (lite), and it fires often -- escalating
+//     it to a billed model would cost real money for nothing. A 1M conversation
+//     that switches tiers still title-generates on lite at the default window,
+//     which always fits; buildRequestBody drops the session tier from the wire
+//     when the serving model does not advertise it.
+//   - compaction receives the WHOLE conversation and MUST follow the tier:
+//     exempting it is exactly what strands a >200k chat.
+//   - task children (plan/general/explore) resolve to the conversation's tier
+//     too. Their prompts start small, so they usually stay under the threshold
+//     and ride lite free; a long-running child that grows past it escalates
+//     like compaction. The user explicitly chose this ("subagent uses
+//     flash@1M"); the cost only materialises for a genuinely large child.
 export const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
   enabled: true,
   subagentModel: "lite",
   target: "qfmodel",
   threshold: 200_000,
-  exemptAgents: ["title", "summary"],
+  exemptAgents: ["title"],
 };
 
 interface Cache {

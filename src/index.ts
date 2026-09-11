@@ -47,7 +47,18 @@ import {
   removePAT,
   switchPAT,
 } from "./pat-store.js";
-import { clearTier, getSelectedTier, listSelectedTiers, setTier } from "./tier-store.js";
+import { getRoutingPolicy, updateRoutingPolicy, type RoutingPolicy } from "./routing-policy.js";
+import { forgetSession, recordSessionParent, resolveRootSession } from "./session-roots.js";
+import {
+  clearAllTiers,
+  clearSessionTier,
+  clearTier,
+  getSelectedTier,
+  getSessionTier,
+  listSelectedTiers,
+  setSessionTier,
+  setTier,
+} from "./tier-store.js";
 
 export { createQoder, QoderLanguageModel };
 
@@ -324,12 +335,13 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   // Precedence for our defaults: an entry under cfg.agent.X or the legacy
   // cfg.agents.X alias means the user configured it -- not touched.
   //
-  // Compaction caveat: the compaction agent receives the WHOLE conversation.
-  // lite caps at 200k, so a session run above 200k (performance/kmodel, or a
-  // raised context tier) cannot be compacted by it -- qoder_tier_switch warns
-  // about this. Users living above 200k should override agent.compaction in
-  // opencode.json (or leave it unset to inherit the session model, which
-  // always fits by definition).
+  // Compaction caveat: the compaction agent receives the WHOLE conversation,
+  // and lite caps at 200k. A conversation switched to a higher tier does NOT
+  // strand it -- the routing policy (see routing-policy.ts) escalates that
+  // request, like any non-exempt pinned-agent call, to a model advertising
+  // the session tier (default target: the cheap qfmodel). Only with the policy
+  // disabled would such a session fail to compact; the pin stays so the
+  // common case remains free.
   if (!cfg.agent) cfg.agent = {};
   const agents = cfg.agent;
   const ensureAgent = (name: string, value: LegacyAgentConfig): void => {
@@ -812,8 +824,10 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "nothing is selected. Use when the user asks about 上下文档位/1M/long context or " +
         "before switching a model's context window.",
       args: {},
-      execute: () => {
+      execute: (_args, ctx) => {
         const selections = listSelectedTiers();
+        const root = ctx.sessionID ? resolveRootSession(ctx.sessionID) : "";
+        const sessionTier = root ? getSessionTier(root) : undefined;
         const tiers = catalogModels()
           .filter((model) => (model.contextTiers?.length ?? 0) > 0 || model.id in selections)
           .map((model) => ({
@@ -822,30 +836,36 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
             availableTiers: model.contextTiers ?? [model.contextWindow],
             selected: selections[model.id] ?? null,
           }));
+        const header =
+          sessionTier !== undefined
+            ? `This conversation runs at the ${sessionTier}-token tier (session ${root}).\n\n`
+            : "This conversation runs at each model's default tier (no switch yet).\n\n";
         const output =
-          tiers.length === 0
+          header +
+          (tiers.length === 0
             ? "No model advertises multiple context tiers. All run at their default tier."
             : tiers
                 .map((entry) => {
                   const selected = entry.selected
-                    ? ` [SELECTED: ${entry.selected}]`
+                    ? ` [displayed: ${entry.selected}]`
                     : " [default]";
                   return `${entry.model}: ${entry.availableTiers.join(" / ")}${selected}`;
                 })
                 .join("\n") +
-              "\n\nSwitch with qoder_tier_switch(model, tier). After switching, re-select " +
-              "the model so the new limits take effect (restart opencode if needed).";
-        return Promise.resolve({ output, data: { tiers } });
+              "\n\nSwitch for THIS conversation with qoder_tier_switch(model, tier); subagent " +
+              "requests (compaction, task children) follow the same tier automatically.");
+        return Promise.resolve({ output, data: { tiers, sessionTier: sessionTier ?? null } });
       },
     }),
-    // Context tiers: select a tier (or clear back to default).
+    // Context tiers: select a tier for THIS conversation (or clear it).
     qoder_tier_switch: tool({
       description:
-        "Select a context tier for a Qoder model, e.g. 1000000 for the 1M window. The " +
-        "tier must be one of the model's advertised tiers (see qoder_tier_list); omit " +
-        "the tier argument to return the model to its default. The chat request will " +
-        "carry context_length and the registered limits follow the selection. Use when " +
-        "the user says 'switch to 1M context' or 'reset the context tier'.",
+        "Select a context tier for THIS conversation's Qoder model, e.g. 1000000 for the " +
+        "1M window. The tier must be one of the model's advertised tiers (see " +
+        "qoder_tier_list); omit it to return the conversation to its default. The binding " +
+        "is per-conversation: this chat and its subagents (compaction, task children) all " +
+        "run at the chosen tier, while a brand-new chat still defaults. Use when the user " +
+        "says 'switch to 1M context' or 'reset the context tier'.",
       args: {
         model: tool.schema.string().describe("Model id, e.g. cmodel or ultimate"),
         tier: tool.schema
@@ -853,7 +873,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
           .optional()
           .describe("Tier in tokens (e.g. 1000000). Omit to restore the default tier."),
       },
-      execute: (args) => {
+      execute: (args, ctx) => {
         const def = catalogModels().find((model) => model.id === args.model);
         if (!def) {
           return Promise.resolve({
@@ -861,14 +881,17 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
             data: { success: false },
           });
         }
+        const root = ctx.sessionID ? resolveRootSession(ctx.sessionID) : "";
         if (args.tier === undefined) {
-          const cleared = clearTier(args.model);
+          const clearedSession = root ? clearSessionTier(root) : false;
+          const clearedMode = clearTier(args.model);
           triggerCatalogRefresh();
           return Promise.resolve({
-            output: cleared
-              ? `Cleared tier selection for ${args.model}; it runs at its default tier (${def.contextWindow} tokens) again.`
-              : `${args.model} has no tier selection; it already runs at the default tier.`,
-            data: { success: true, cleared },
+            output:
+              clearedSession || clearedMode
+                ? `This conversation returns to ${args.model}'s default tier (${def.contextWindow} tokens).`
+                : `This conversation had no tier switch for ${args.model}; it already runs at the default.`,
+            data: { success: true, cleared: clearedSession || clearedMode },
           });
         }
         if (!isValidContextTier(def, args.tier)) {
@@ -880,49 +903,119 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
             data: { success: false },
           });
         }
+        // The session binding drives the wire; the mode drives the picker label
+        // and the registered (compaction-threshold) limits. A missing root id
+        // (no session yet) degrades to the global mode alone.
+        if (root) setSessionTier(root, args.tier);
         setTier(args.model, args.tier);
         const refreshed = triggerCatalogRefresh();
-        // The subagent defaults pin the compaction agent to lite (200k). A
-        // session that grows past the compaction model's window can no longer
-        // be compacted by it, so say so when raising a model above 200k.
-        const compactionNote =
-          args.tier > 200_000
-            ? "\n\nNote: the compaction agent is pinned to a 200k model by this plugin's " +
-              "subagent defaults. Sessions exceeding 200k tokens cannot be compacted by it. " +
-              "Override agent.compaction in opencode.json (or remove that pin) if you work " +
-              "above 200k."
+        // Subagent handling: above the pinned helper model's window the routing
+        // policy escalates compaction/task requests to a model that advertises
+        // this tier, so the whole exchange -- not just the main thread -- fits.
+        const policy = getRoutingPolicy();
+        const routingNote =
+          args.tier > policy.threshold
+            ? policy.enabled
+              ? `\n\nPinned subagents (compaction, task children) auto-escalate to ${policy.target} at this tier (policy: qoder_routing_policy).`
+              : `\n\nWarning: routing is disabled, so the compaction agent stays on a ${policy.threshold}-token model and cannot compact this conversation above that. Re-enable with qoder_routing_policy, or override agent.compaction in opencode.json.`
             : "";
         return Promise.resolve({
           output:
-            `${args.model} now runs at the ${args.tier}-token tier (was ${def.contextWindow}). ` +
+            `This conversation now runs at the ${args.tier}-token tier on ${args.model} (was ${def.contextWindow}). ` +
             (refreshed
-              ? "Model list refresh triggered -- re-select the model so its session picks up the new limits; restart opencode if the compaction threshold did not move."
-              : "Restart opencode to apply the new limits.") +
-            compactionNote,
-          data: { success: true, model: args.model, tier: args.tier },
+              ? "The picker label and compaction limits update on the next model re-select; restart opencode if they lag."
+              : "Restart opencode to update the picker label and limits.") +
+            routingNote,
+          data: { success: true, model: args.model, tier: args.tier, session: root || null },
+        });
+      },
+    }),
+    // Subagent routing: which model serves pinned helpers above the default tier.
+    qoder_routing_policy: tool({
+      description:
+        "Show or set the subagent routing policy -- how pinned helper agents (compaction, " +
+        "task children, plan) are served when a conversation runs above the default " +
+        "context tier. With no arguments it reports the current policy. Set target to " +
+        "change the escalated model, threshold to change the token count that triggers it, " +
+        "subagentModel to change the pinned base model, exemptAgents to list agents that " +
+        "keep the base model, or enabled=false to disable escalation entirely. Use when the " +
+        "user asks which model handles long-context subagents or how compaction fits a 1M tier.",
+      args: {
+        enabled: tool.schema.boolean().optional().describe("Master switch; false pins every request to its selected model."),
+        subagentModel: tool.schema.string().optional().describe("The pinned helper model this policy escalates (default lite)."),
+        target: tool.schema.string().optional().describe("Where escalated requests go (default qfmodel)."),
+        threshold: tool.schema.number().optional().describe("Escalate when the conversation tier exceeds this many tokens."),
+        exemptAgents: tool.schema.array(tool.schema.string()).optional().describe("Agents that keep the base model even above the threshold."),
+      },
+      execute: (args) => {
+        const patch: Partial<RoutingPolicy> = {};
+        if (typeof args.enabled === "boolean") patch.enabled = args.enabled;
+        if (args.subagentModel) patch.subagentModel = args.subagentModel;
+        if (args.target) patch.target = args.target;
+        if (args.threshold !== undefined) patch.threshold = args.threshold;
+        if (args.exemptAgents) patch.exemptAgents = args.exemptAgents;
+        const changed = Object.keys(patch).length > 0;
+        const policy = changed ? updateRoutingPolicy(patch) : getRoutingPolicy();
+        if (changed && args.target && !catalogModels().some((m) => m.id === args.target)) {
+          return Promise.resolve({
+            output: `Target "${args.target}" is not a known model. Policy left as: ${describePolicy(policy)}.`,
+            data: { success: false, policy },
+          });
+        }
+        return Promise.resolve({
+          output: `${changed ? "Updated " : ""}routing policy: ${describePolicy(policy)}.`,
+          data: { success: true, policy },
         });
       },
     }),
   };
 }
 
+// One-line rendering of the routing policy for the tool surface.
+function describePolicy(policy: RoutingPolicy): string {
+  if (!policy.enabled) return "disabled (subagents stay on their selected model)";
+  return (
+    `${policy.subagentModel} -> ${policy.target} above ${policy.threshold} tokens` +
+    ` (exempt: ${policy.exemptAgents.join(", ") || "none"})`
+  );
+}
+
 function legacyHooks(options?: PluginOptions): Hooks {
   const id = providerID(options);
   return {
     config: async (cfg) => applyLegacyConfig(cfg as unknown as LegacyConfig, options),
-    // TEMP PROBES: does opencode fire chat hooks for our custom model, and
-    // what identity does it hand us? Removed once the answer is known.
-    "chat.params": async (input, output) => {
-      if (input.model.providerID !== id) return;
-      logPlugin(
-        `probe chat.params: session=${input.sessionID} agent=${input.agent} model=${input.model.id} optionsKeys=${JSON.stringify(Object.keys(output.options))} options=${JSON.stringify(output.options).slice(0, 200)}`,
-      );
-    },
+    // Identity stamp for the request layer.
+    //
+    // opencode hands the agent name to this hook but never forwards it to the
+    // language model; resolveRequestRoute() in language-model.ts needs it to
+    // apply the routing policy's exempt-agent list (title/summary stay on the
+    // cheap base model, compaction escalates). X-Qoder-Session is stamped from
+    // the same input rather than leaning on opencode's native X-Session-Id
+    // header name, which the request path still reads as a fallback.
     "chat.headers": async (input, output) => {
       if (input.model.providerID !== id) return;
-      logPlugin(
-        `probe chat.headers: session=${input.sessionID} agent=${input.agent} model=${input.model.id}`,
-      );
+      if (input.agent !== "") output.headers["x-qoder-agent"] = input.agent;
+      output.headers["x-qoder-session"] = input.sessionID;
+    },
+    // Session tree: subagent spawns (task tool, compaction) arrive here with
+    // a parentID, which is how session-roots learns child -> root. The only
+    // mutation for a ROOT creation is the display-mode reset, so a fresh
+    // conversation shows (and defaults to) the model's stock tier -- the
+    // conversation-scoped session entries are deliberately NOT cleared; some
+    // other window's 1M chat must keep its wire tier.
+    event: async ({ event }) => {
+      if (event.type === "session.created") {
+        const info = event.properties.info;
+        if (info.id === undefined || info.id === "") return;
+        recordSessionParent(info.id, info.parentID);
+        if (info.parentID === undefined && clearAllTiers()) {
+          triggerCatalogRefresh();
+        }
+        return;
+      }
+      if (event.type === "session.deleted") {
+        forgetSession(event.properties.info.id);
+      }
     },
     tool: capabilityTools(options),
     auth: {

@@ -31,8 +31,9 @@ a token.
 | `qoder_pat_switch`| 切换到指定 PAT（参数 `id`）                                    |
 | `qoder_pat_add` | 添加新 PAT（参数 `pat`, `label`, `email`）                       |
 | `qoder_pat_remove`| 删除指定 PAT（参数 `id`）                                      |
-| `qoder_tier_list`| 各模型的可选上下文档位 + 当前选中档                              |
-| `qoder_tier_switch`| 切换模型上下文档位（参数 `model`, `tier`；省略 `tier` 恢复默认）|
+| `qoder_tier_list`| 各模型的可选上下文档位 + 本会话当前档位 + 路由策略                 |
+| `qoder_tier_switch`| 为**当前会话**切换上下文档位（参数 `model`, `tier`；省略 `tier` 恢复默认）|
+| `qoder_routing_policy`| 查看/设置子代理超档自动升级策略（无参数=查看）                   |
 
 Call them directly with no arguments unless noted. Results arrive as text with
 the structured payload in metadata.
@@ -79,12 +80,18 @@ Model resolution per message: `message.model ?? agent.config.model ?? session's
 current model`. An agent with a configured model is pinned to it; agents without
 one (e.g. the main agent) follow the user's model picker.
 
-**Compaction caveat:** the compaction agent receives the WHOLE conversation.
-`lite` caps at 200k, so sessions run above 200k (`performance` 272k, `kmodel`
-256k, or a raised context tier like cmodel @ 1M) cannot be compacted by it.
-`qoder_tier_switch` warns when raising a model above 200k. If you live above
-200k, override `agent.compaction` in `opencode.json` or remove the pin (unset
-agents inherit the session model, which always fits by definition).
+**Compaction & the routing policy:** the compaction agent receives the WHOLE
+conversation. `lite` caps at 200k (advertises no higher tier), so a conversation
+switched above 200k cannot be served by it. Rather than leaving those sessions
+uncompactable, the plugin's **routing policy auto-escalates** a pinned-subagent
+request when its conversation runs above the threshold: `lite → qfmodel` (a
+cheap model that advertises the higher tier — read its multiplier from
+`qoder_models`), but only when `qfmodel` actually advertises the
+session's tier. `title` is exempt (its prompt is always short) and stays on the
+free `lite`. Inspect or change this with `qoder_routing_policy` — e.g. raise the
+`threshold`, point `target` at a different cheap long-context model, or set
+`enabled=false` to pin every request to its selected model (then you must raise
+`agent.compaction` yourself for >200k sessions). See the tier section below.
 
 **Override:** Set `agent.*` (singular) in `opencode.json` to use different
 models. The plugin only fills gaps — an entry under `agent.X` (or the legacy
@@ -160,21 +167,43 @@ get.
 ## Context Tier Switching
 
 Qoder's gateway serves most models at several selectable context tiers
-(`context_config`, e.g. Cantus 200K default / 1M). Requests pick a tier via
-`parameters.context_length` (a token count) — the same field qodercli sends
-from its window picker. Without it, the gateway applies the DEFAULT tier,
-which is what the model's advertised context window reflects.
+(`context_config`, e.g. `cmodel` 200K default / 400K / 1M). Requests pick a tier
+via `parameters.context_length` (a token count) — the same field qodercli sends
+from its window picker. Without it, the gateway applies the DEFAULT tier, which
+is what the model's advertised context window reflects.
+
+**The switch is conversation-bound.** `qoder_tier_switch` records the tier
+against the current conversation's ROOT session, so:
+
+- this chat — main agent, compaction, and task subagents alike — runs at it;
+- a brand-new chat starts back at the default tier, no reset needed;
+- switching the main model mid-conversation keeps the chosen tier when the new
+  model advertises it, and silently drops to that model's default when it does
+  not (an unadvertised tier is never sent);
+- entries live in `~/.config/opencode/qoder-tiers.json` (honours
+  `XDG_CONFIG_HOME`) for 30 days; after a restart, freshly spawned subagents
+  re-learn their parent link from live session events.
 
 **Workflow:**
-1. `qoder_tier_list()` — see each model's advertised tiers and the current selection
-2. `qoder_tier_switch(model="cmodel", tier=1000000)` — select a tier
-3. `qoder_tier_switch(model="cmodel")` — omit `tier` to restore the default
-4. After switching, **re-select the model** in the picker so the session picks
-   up the new limits; if the compaction threshold did not move, restart opencode
+1. `qoder_tier_list()` — see each model's advertised tiers, this conversation's
+   tier, and the active routing policy
+2. `qoder_tier_switch(model="cmodel", tier=1000000)` — switch THIS conversation
+3. `qoder_tier_switch(model="cmodel")` — omit `tier` to return it to the default
+4. The model list annotates the selection (name + the live multiplier + the tier
+   label, e.g. `Cantus (3.2x, 1M)` — read the multiplier from `qoder_models`, it
+   moves with pricing) and opencode's auto-compaction threshold moves with it;
+   the label clears when you start a new chat (the running conversation keeps
+   its tier)
+
+Subagent escalation rides the same switch: above the policy threshold the
+pinned helpers move from `lite` to the policy target at the session tier (see
+`qoder_routing_policy`). A 1M conversation therefore stays compactable — you
+do not need to touch `agent.*` yourself.
 
 **Validation:** the tier must be EXACTLY one of the model's advertised tiers
 (mirrors qodercli's `qq()` validator). The tool rejects anything else and
-lists the accepted values.
+lists the accepted values. The wire re-validates the same rule against the
+model that actually serves each request.
 
 **Why limits must move with the tier:** opencode's auto-compaction threshold
 derives from the model's registered `limit.input`. Selecting the 1M tier
@@ -183,5 +212,11 @@ gateway accepts ~980k — the 1M would never be used. The plugin re-registers
 the model's limits at the selected tier automatically (same model id, same
 name; only the numbers behind the picker change).
 
+**Customizing:** persisted to `~/.config/opencode/qoder-routing.json`
+(`qoder_routing_policy`), tiers to `~/.config/opencode/qoder-tiers.json`. A
+broken or missing file falls back to defaults and never blocks a request.
+
 **Billing caveat:** higher tiers may bill differently — check `qoder_quota`
-after a long session on a non-default tier.
+after a long session on a non-default tier. Escalated subagents pay their
+target's multiplier (the `qfmodel` entry in `qoder_models`) instead of `lite`'s
+zero.
