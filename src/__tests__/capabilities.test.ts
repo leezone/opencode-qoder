@@ -200,4 +200,31 @@ describe("renderAuth", () => {
     // A shape, never a value.
     expect(text).not.toContain("pt-");
   });
+
+  // The 105 diagnosis lives on this line: a placeholder uid gets chat rejected
+  // however fresh the token is, so printing it like a healthy id sends the user
+  // looking for an expiry that is not the problem.
+  it("flags a placeholder uid instead of printing it as a resolved identity", () => {
+    const placeholder = renderAuth(
+      layers,
+      {
+        userID: "qoder-user",
+        email: "qoder@local",
+        name: "Qoder",
+        machineID: "m1",
+        expires: 1791336225000,
+      },
+      "",
+    );
+    expect(placeholder).toContain("PLACEHOLDER");
+    expect(placeholder).toContain("Login expired");
+    expect(placeholder).not.toContain("User ID       qoder-user\n");
+
+    const blank = renderAuth(
+      layers,
+      { userID: "", email: "", name: "", machineID: "m1", expires: 1791336225000 },
+      "",
+    );
+    expect(blank).toContain("(unresolved)");
+  });
 });

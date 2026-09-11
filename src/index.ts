@@ -443,6 +443,14 @@ function credentialToOptions(credential: StoredCredential): QoderProviderOptions
     const decoded = decodeOAuthRefresh(credential.refresh || "");
     return {
       apiKey: credential.access,
+      // Forwarded so a rejected job token can be renewed: opencode's plugin API
+      // has no refresh hook, so refreshQoderCredentials() (auth.ts) is the only
+      // caller, and it reads the token off the resolved credential. Without
+      // this the stored refresh value never reaches it and a device-flow login
+      // has no recovery from a "Login expired" other than a plain throw.
+      // The composite (`refreshToken|uid|machineID`) is passed whole, not
+      // decoded.refreshToken, so the uid and machine id survive the rotation.
+      refreshToken: credential.refresh,
       qoderUserID: metadataString(metadata, "userID") || credential.accountId || decoded.userID,
       qoderEmail: metadataString(metadata, "email"),
       qoderName: metadataString(metadata, "name"),

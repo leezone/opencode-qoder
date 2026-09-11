@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   describeTokenShape,
   fetchQoderAccount,
+  identityUnresolved,
   type QoderProviderOptions,
   resolveQoderCredentials,
 } from "./auth.js";
@@ -379,7 +380,17 @@ export function renderAuth(
   }
   if (credentials) {
     lines.push(`Resolves to   ${credentials.name || "?"} <${credentials.email || "?"}>`);
-    lines.push(`User ID       ${credentials.userID}`);
+    // The uid is the field the chat gateway authenticates: a COSY payload signed
+    // with the placeholder is rejected as "Login expired" (105) no matter how
+    // fresh the token is. So an unresolved one is reported as such rather than
+    // printed like a healthy id -- this line is what tells a user running the
+    // tool after a 105 whether they need a new token or a working userinfo.
+    lines.push(
+      identityUnresolved(credentials.userID)
+        ? `User ID       ${credentials.userID || "(unresolved)"} -- PLACEHOLDER: chat requests ` +
+            `will be rejected as "Login expired"; the identity endpoint returned no id`
+        : `User ID       ${credentials.userID}`,
+    );
     lines.push(`Machine ID    ${credentials.machineID}`);
     // The plugin treats a token as dead this long before its real deadline, so
     // the number printed here is the one that governs behaviour, not the expiry.
