@@ -7,8 +7,10 @@ import {
   identityUnresolved,
   type QoderProviderOptions,
   resolveQoderCredentials,
+  type StoredCredential,
 } from "./auth.js";
-import { QODER_VERSION, REFRESH_SKEW_MS } from "./constants.js";
+import { text } from "./coerce.js";
+import { QODER_PAT_ENV, QODER_VERSION, REFRESH_SKEW_MS } from "./constants.js";
 import { readEnv } from "./env.js";
 import { errorMessage, logPlugin } from "./log.js";
 import {
@@ -21,6 +23,7 @@ import {
   getModelDefinition,
 } from "./model-catalog.js";
 import { fetchQuotaUsage, type QuotaUsage, setQuotaExhausted } from "./quota.js";
+import { readSharedApiKey } from "./shared-state.js";
 import { QODER_MODELS, STATIC_MODELS_ORIGIN } from "./static-models.js";
 
 // Read-only capability layer.
@@ -45,10 +48,6 @@ import { QODER_MODELS, STATIC_MODELS_ORIGIN } from "./static-models.js";
 export type CapabilityReport = { output: string; data: unknown };
 
 // --- shared formatting ------------------------------------------------------
-
-function text(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
 
 // UTC, minute precision, no locale dependence -- renderers are asserted in tests
 // and a machine's TZ must not change what they print.
@@ -83,18 +82,6 @@ function toolOptions(explicit?: QoderProviderOptions): QoderProviderOptions {
     ...(apiKey ? { apiKey } : {}),
   };
 }
-
-function readSharedApiKey(): string {
-  const value = (globalThis as Record<string, unknown>).__opencode_qoder_api_key;
-  return typeof value === "string" && value.length > 0 ? value : "";
-}
-
-type StoredCredential = {
-  type?: string;
-  key?: string;
-  access?: string;
-  refresh?: string;
-};
 
 // opencode's own credential store. Best-effort and read-only: a missing file, a
 // different install layout, or a corrupt JSON all collapse to "" and the report
@@ -415,11 +402,10 @@ export async function reportAuth(explicit?: QoderProviderOptions): Promise<Capab
     { layer: "apiKey option", shape: describeTokenShape(options.apiKey) },
     { layer: "shared channel (config hook)", shape: describeTokenShape(readSharedApiKey()) },
     { layer: "opencode auth.json", shape: describeTokenShape(readStoredQoderToken()) },
-    {
-      layer: "env QODER_PERSONAL_ACCESS_TOKEN",
-      shape: describeTokenShape(readEnv("QODER_PERSONAL_ACCESS_TOKEN")),
-    },
-    { layer: "env QODER_PAT", shape: describeTokenShape(readEnv("QODER_PAT")) },
+    ...QODER_PAT_ENV.map((key) => ({
+      layer: `env ${key}`,
+      shape: describeTokenShape(readEnv(key)),
+    })),
   ];
   try {
     const credentials = await resolveQoderCredentials(options);

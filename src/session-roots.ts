@@ -1,4 +1,6 @@
+import { normalizeId } from "./coerce.js";
 import { logPlugin } from "./log.js";
+import { readShared, writeShared } from "./shared-state.js";
 
 // Session parent chain.
 //
@@ -23,11 +25,10 @@ const ROOTS_KEY = "__opencode_qoder_session_parents";
 const MAX_CHAIN_DEPTH = 16;
 
 function parentMap(): Record<string, string> {
-  const shared = globalThis as Record<string, unknown>;
-  let map = shared[ROOTS_KEY] as Record<string, string> | undefined;
+  let map = readShared<Record<string, string>>(ROOTS_KEY);
   if (!map) {
     map = {};
-    shared[ROOTS_KEY] = map;
+    writeShared(ROOTS_KEY, map);
   }
   return map;
 }
@@ -35,10 +36,10 @@ function parentMap(): Record<string, string> {
 // Record a session's parent. Called from the event hook for every
 // session.created. Re-recording the same pair is free.
 export function recordSessionParent(sessionID: string, parentID: string | undefined): void {
-  const id = String(sessionID ?? "").trim();
+  const id = normalizeId(sessionID);
   if (id === "") return;
   const map = parentMap();
-  const parent = String(parentID ?? "").trim();
+  const parent = normalizeId(parentID);
   if (parent === "") {
     if (map[id]) {
       delete map[id];
@@ -55,7 +56,7 @@ export function recordSessionParent(sessionID: string, parentID: string | undefi
 
 // The session that owns the conversation: walk parent links until a root.
 export function resolveRootSession(sessionID: string): string {
-  const start = String(sessionID ?? "").trim();
+  const start = normalizeId(sessionID);
   if (start === "") return start;
   const map = parentMap();
   let current = start;
@@ -71,7 +72,7 @@ export function resolveRootSession(sessionID: string): string {
 // Forget links to a gone session (event: session.deleted). Descendants re-
 // resolve on their own; a stale link only costs one hop.
 export function forgetSession(sessionID: string): void {
-  const id = String(sessionID ?? "").trim();
+  const id = normalizeId(sessionID);
   if (id === "") return;
   const map = parentMap();
   if (map[id]) delete map[id];

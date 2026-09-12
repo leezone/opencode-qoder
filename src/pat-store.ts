@@ -1,7 +1,6 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
 import { logPlugin } from "./log.js";
+import { readShared, writeShared } from "./shared-state.js";
 
 // Multi-PAT storage: lets users store several Qoder accounts and switch between
 // them at runtime. The active PAT is used by resolveQoderCredentials() before
@@ -33,31 +32,21 @@ interface PATStoreData {
 
 const STORE_FILENAME = "qoder-pats.json";
 
-// Cache lives on globalThis, not module state. opencode loads this plugin twice
-// in one process (legacy config hooks + v2 catalog hooks -- see the CREDENTIAL_KEY
-// comment in index.ts), and module-level state is invisible across instances: a
-// PAT switched by a tool in one instance would stay unread in the other until
-// restart. The two instances share a realm, so globalThis is the established
-// cross-instance channel. The PATs already live in this realm inside opencode's
-// own auth store, so this does not widen exposure; the fixed key is a collision
-// risk, not a leak.
+// Cache lives on globalThis, not module state: a PAT switched by a tool in one
+// plugin instance must be visible to credential resolution in the other. The
+// realm-boundary explanation lives once, in shared-state.ts.
 const CACHE_KEY = "__opencode_qoder_pat_store";
 
-interface PATStoreData {
-  entries: StoredPAT[];
-}
-
 function cachedStore(): PATStoreData | undefined {
-  return (globalThis as Record<string, unknown>)[CACHE_KEY] as PATStoreData | undefined;
+  return readShared<PATStoreData>(CACHE_KEY);
 }
 
 function setCachedStore(data: PATStoreData | undefined): void {
-  (globalThis as Record<string, unknown>)[CACHE_KEY] = data;
+  writeShared(CACHE_KEY, data);
 }
 
 function storePath(): string {
-  const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(configDir, "opencode", STORE_FILENAME);
+  return opencodeConfigFile(STORE_FILENAME);
 }
 
 // Loaded once per process (shared by both plugin instances via globalThis).
@@ -67,28 +56,13 @@ function loadStore(): PATStoreData {
   const cached = cachedStore();
   if (cached) return cached;
   const path = storePath();
-  if (!existsSync(path)) {
-    const fresh = { entries: [] };
-    setCachedStore(fresh);
-    return fresh;
+  let data: PATStoreData = { entries: [] };
+  const parsed = readJsonFile("pat-store", path);
+  if (parsed && typeof parsed === "object" && Array.isArray((parsed as PATStoreData).entries)) {
+    data = { entries: (parsed as PATStoreData).entries.filter(isValidEntry) };
   }
-  try {
-    const raw = readFileSync(path, "utf8");
-    const parsed = JSON.parse(raw);
-    let data: PATStoreData;
-    if (parsed && typeof parsed === "object" && Array.isArray(parsed.entries)) {
-      data = { entries: parsed.entries.filter(isValidEntry) };
-    } else {
-      data = { entries: [] };
-    }
-    setCachedStore(data);
-    return data;
-  } catch (error) {
-    logPlugin(`pat-store: failed to read ${path}: ${error}`);
-    const fresh = { entries: [] };
-    setCachedStore(fresh);
-    return fresh;
-  }
+  setCachedStore(data);
+  return data;
 }
 
 // Drop the in-memory copy so the next loadStore() re-reads the file. Exported
@@ -112,15 +86,8 @@ function saveStore(): void {
   const data = cachedStore();
   if (!data) return;
   const path = storePath();
-  const dir = join(path, "..");
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
-  }
-  try {
-    writeFileSync(path, JSON.stringify(data, null, 2), "utf8");
+  if (writeJsonFile("pat-store", path, data)) {
     logPlugin(`pat-store: saved ${data.entries.length} entries to ${path}`);
-  } catch (error) {
-    logPlugin(`pat-store: failed to write ${path}: ${error}`);
   }
 }
 
@@ -150,11 +117,7 @@ export function getActivePatString(): string | undefined {
 // Add a new PAT to the store. If it is the first entry, it becomes active
 // automatically. Returns the stored entry, or undefined if the PAT already
 // exists (duplicate detection by ID).
-export function addPAT(
-  pat: string,
-  label: string,
-  email?: string,
-): StoredPAT | undefined {
+export function addPAT(pat: string, label: string, email?: string): StoredPAT | undefined {
   const store = loadStore();
   const id = patID(pat);
 
@@ -207,10 +170,7 @@ export function switchPAT(id: string): boolean {
 }
 
 // Update the label or email of an existing entry. Returns true if found.
-export function updatePAT(
-  id: string,
-  updates: { label?: string; email?: string },
-): boolean {
+export function updatePAT(id: string, updates: { label?: string; email?: string }): boolean {
   const store = loadStore();
   const target = store.entries.find((e) => e.id === id);
   if (!target) return false;

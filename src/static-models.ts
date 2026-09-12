@@ -1,9 +1,8 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { QoderModelDefinition } from "./constants.js";
 import { readEnv } from "./env.js";
+import { opencodeConfigFile } from "./json-store.js";
 import { logPlugin } from "./log.js";
 
 // Bundled fallback model table, loaded at import time.
@@ -109,9 +108,8 @@ function loadStaticModels(): { models: QoderModelDefinition[]; origin: string } 
   const candidates: Array<{ path: string; origin: string }> = [];
   const envPath = readEnv("QODER_STATIC_MODELS");
   if (envPath) candidates.push({ path: envPath, origin: `env ${envPath}` });
-  const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
   candidates.push({
-    path: join(configDir, "opencode", "qoder-models.json"),
+    path: opencodeConfigFile("qoder-models.json"),
     origin: "user override",
   });
   candidates.push({

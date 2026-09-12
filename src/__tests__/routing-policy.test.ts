@@ -88,8 +88,12 @@ describe("routing-policy", () => {
     const supports1M = (id: string, tokens: number) =>
       id === "qfmodel" ? tokens <= 1_000_000 : tokens <= 200_000;
 
-    const call = (modelID: string, agent: string, tier: number | undefined, supports = supports1M) =>
-      resolveRouting({ policy, modelID, agent, sessionTier: tier, targetSupports: supports });
+    const call = (
+      modelID: string,
+      agent: string,
+      tier: number | undefined,
+      supports = supports1M,
+    ) => resolveRouting({ policy, modelID, agent, sessionTier: tier, targetSupports: supports });
 
     it("keeps the model at or below the threshold and without a tier", () => {
       expect(call("lite", "build", undefined)).toEqual({ modelID: "lite", escalated: false });

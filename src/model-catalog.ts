@@ -1,7 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { type QoderProviderOptions, resolveQoderCredentials, signingUserID } from "./auth.js";
+import {
+  cosyCredentialsForSigning,
+  type QoderProviderOptions,
+  resolveQoderCredentials,
+} from "./auth.js";
+import { normalizeId } from "./coerce.js";
 import { FETCH_TIMEOUT_MS, QODER_MODEL_LIST_URL, type QoderModelDefinition } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
 import { readEnv } from "./env.js";
@@ -545,16 +550,7 @@ async function fetchModels(options: QoderProviderOptions): Promise<DiscoveredMod
   // it under jsonHeaders cannot clobber Accept/User-Agent/Accept-Encoding.
   const headers = jsonHeaders({
     "Accept-Encoding": "identity",
-    ...buildAuthHeaders(null, url, {
-      // Lenient endpoint: the model list accepts a placeholder uid, so a
-      // userinfo outage must not take discovery down with it -- see
-      // signingUserID() in auth.ts.
-      userID: signingUserID(credentials),
-      authToken: credentials.access,
-      name: credentials.name,
-      email: credentials.email,
-      machineID: credentials.machineID,
-    }),
+    ...buildAuthHeaders(null, url, cosyCredentialsForSigning(credentials)),
   });
   return fetchWithTimeout(url, { headers }, FETCH_TIMEOUT_MS, async (response) => {
     if (!response.ok) {
@@ -646,7 +642,7 @@ export function catalogModels(): DiscoveredModel[] {
 // constants.ts used to return QODER_MODELS[0] for unknown ids; that behaviour is
 // preserved as the last resort.
 export function getModelDefinition(modelID: string): DiscoveredModel {
-  const id = String(modelID ?? "").trim();
+  const id = normalizeId(modelID);
   const found = catalogModels().find((model) => model.id === id);
   if (found) return found;
   // A pinned model that upstream retired lands here. Say so -- silently

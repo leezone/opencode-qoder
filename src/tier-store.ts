@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { normalizeId } from "./coerce.js";
+import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
 import { logPlugin } from "./log.js";
+import { readShared, writeShared } from "./shared-state.js";
 
 // Context-tier state, in two scopes:
 //
@@ -25,10 +25,10 @@ import { logPlugin } from "./log.js";
 //
 // State persists to ~/.config/opencode/qoder-tiers.json (honours
 // XDG_CONFIG_HOME). Like pat-store, the in-memory copy lives on globalThis:
-// opencode loads this plugin twice per process (legacy config hooks + v2
-// catalog hooks) and module state is invisible across instances -- a tier
-// switched by a tool in one instance must be visible to request building in
-// the other. Same realm, so globalThis is the established channel.
+// opencode loads this plugin twice per process and module state is invisible
+// across instances -- a tier switched by a tool in one instance must be
+// visible to request building in the other. See shared-state.ts for the
+// boundary itself.
 
 const STORE_FILENAME = "qoder-tiers.json";
 const CACHE_KEY = "__opencode_qoder_tier_store";
@@ -50,16 +50,15 @@ function emptyStore(): TierStoreData {
 }
 
 function cachedStore(): TierStoreData | undefined {
-  return (globalThis as Record<string, unknown>)[CACHE_KEY] as TierStoreData | undefined;
+  return readShared<TierStoreData>(CACHE_KEY);
 }
 
 function setCachedStore(data: TierStoreData): void {
-  (globalThis as Record<string, unknown>)[CACHE_KEY] = data;
+  writeShared(CACHE_KEY, data);
 }
 
 function storePath(): string {
-  const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(configDir, "opencode", STORE_FILENAME);
+  return opencodeConfigFile(STORE_FILENAME);
 }
 
 function readTokens(value: unknown): number | undefined {
@@ -71,55 +70,49 @@ function loadStore(): TierStoreData {
   const cached = cachedStore();
   if (cached) return cached;
   const path = storePath();
-  let data = emptyStore();
-  if (existsSync(path)) {
-    try {
-      const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-      // `selections` is the v1 name for what is now `mode`; honour it so a
-      // hand-edited or pre-v2 file keeps working as a global default.
-      const mode = parsed.mode ?? parsed.selections;
-      if (mode && typeof mode === "object" && !Array.isArray(mode)) {
-        for (const [model, tokens] of Object.entries(mode)) {
-          const count = readTokens(tokens);
-          if (model !== "" && count) data.mode[model] = count;
-        }
+  const data = emptyStore();
+  const parsed = readJsonFile("tier-store", path) as Record<string, unknown> | undefined;
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    // `selections` is the v1 name for what is now `mode`; honour it so a
+    // hand-edited or pre-v2 file keeps working as a global default.
+    const mode = parsed.mode ?? parsed.selections;
+    if (mode && typeof mode === "object" && !Array.isArray(mode)) {
+      for (const [model, tokens] of Object.entries(mode)) {
+        const count = readTokens(tokens);
+        if (model !== "" && count) data.mode[model] = count;
       }
-      const sessions = parsed.sessions;
-      if (sessions && typeof sessions === "object" && !Array.isArray(sessions)) {
-        const now = Date.now();
-        let dropped = 0;
-        for (const [session, entry] of Object.entries(sessions)) {
-          const tokens = readTokens(
-            entry && typeof entry === "object"
-              ? (entry as Record<string, unknown>).tokens
-              : entry,
-          );
-          const at =
-            entry && typeof entry === "object"
-              ? Number((entry as Record<string, unknown>).at)
-              : // A bare-number entry is a hand-edited one; treat it as fresh
-                // rather than dating it to the epoch (which would expire it).
-                now;
-          if (!session || !tokens || !Number.isFinite(at)) {
-            dropped += 1;
-            continue;
-          }
-          if (now - at >= SESSION_TTL_MS) {
-            dropped += 1;
-            continue;
-          }
-          data.sessions[session] = { tokens, at };
+    }
+    const sessions = parsed.sessions;
+    if (sessions && typeof sessions === "object" && !Array.isArray(sessions)) {
+      const now = Date.now();
+      let dropped = 0;
+      for (const [session, entry] of Object.entries(sessions)) {
+        const tokens = readTokens(
+          entry && typeof entry === "object" ? (entry as Record<string, unknown>).tokens : entry,
+        );
+        const at =
+          entry && typeof entry === "object"
+            ? Number((entry as Record<string, unknown>).at)
+            : // A bare-number entry is a hand-edited one; treat it as fresh
+              // rather than dating it to the epoch (which would expire it).
+              now;
+        if (!session || !tokens || !Number.isFinite(at)) {
+          dropped += 1;
+          continue;
         }
-        // Expired/invalid entries are dropped from memory by every realm alike;
-        // without this rewrite each realm keeps re-loading (and re-dropping)
-        // them forever, and the file never converges to what is actually live.
-        if (dropped > 0) {
-          setCachedStore(data);
-          saveStore(data);
+        if (now - at >= SESSION_TTL_MS) {
+          dropped += 1;
+          continue;
         }
+        data.sessions[session] = { tokens, at };
       }
-    } catch (error) {
-      logPlugin(`tier-store: failed to read ${path}: ${error}`);
+      // Expired/invalid entries are dropped from memory by every realm alike;
+      // without this rewrite each realm keeps re-loading (and re-dropping)
+      // them forever, and the file never converges to what is actually live.
+      if (dropped > 0) {
+        setCachedStore(data);
+        saveStore(data);
+      }
     }
   }
   setCachedStore(data);
@@ -128,15 +121,10 @@ function loadStore(): TierStoreData {
 
 function saveStore(data: TierStoreData): void {
   const path = storePath();
-  const dir = join(path, "..");
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  try {
-    writeFileSync(path, JSON.stringify(data, null, 2), "utf8");
+  if (writeJsonFile("tier-store", path, data)) {
     logPlugin(
       `tier-store: saved ${Object.keys(data.mode).length} mode + ${Object.keys(data.sessions).length} session entr(y/ies) to ${path}`,
     );
-  } catch (error) {
-    logPlugin(`tier-store: failed to write ${path}: ${error}`);
   }
 }
 
@@ -146,7 +134,7 @@ function saveStore(data: TierStoreData): void {
 // this is deliberately NOT the request-path source any more -- requests ask
 // getSessionTier() for the session's own choice first.
 export function getSelectedTier(modelID: string): number | undefined {
-  const id = String(modelID ?? "").trim();
+  const id = normalizeId(modelID);
   if (id === "") return undefined;
   return loadStore().mode[id];
 }
@@ -156,7 +144,7 @@ export function listSelectedTiers(): Record<string, number> {
 }
 
 export function setTier(modelID: string, tokens: number): boolean {
-  const id = String(modelID ?? "").trim();
+  const id = normalizeId(modelID);
   if (id === "" || !Number.isInteger(tokens) || tokens <= 0) return false;
   const data = loadStore();
   data.mode[id] = tokens;
@@ -167,7 +155,7 @@ export function setTier(modelID: string, tokens: number): boolean {
 }
 
 export function clearTier(modelID: string): boolean {
-  const id = String(modelID ?? "").trim();
+  const id = normalizeId(modelID);
   if (id === "") return false;
   const data = loadStore();
   if (!(id in data.mode)) return false;
@@ -197,7 +185,7 @@ export function clearAllTiers(): boolean {
 // session never switched and rides the model's default tier. Touching an entry
 // refreshes its TTL timestamp (and persists when it changed in memory).
 export function getSessionTier(sessionID: string): number | undefined {
-  const id = String(sessionID ?? "").trim();
+  const id = normalizeId(sessionID);
   if (id === "") return undefined;
   const data = loadStore();
   const entry = data.sessions[id];
@@ -212,7 +200,7 @@ export function getSessionTier(sessionID: string): number | undefined {
 }
 
 export function setSessionTier(sessionID: string, tokens: number): boolean {
-  const id = String(sessionID ?? "").trim();
+  const id = normalizeId(sessionID);
   if (id === "" || !Number.isInteger(tokens) || tokens <= 0) return false;
   const data = loadStore();
   data.sessions[id] = { tokens, at: Date.now() };
@@ -223,7 +211,7 @@ export function setSessionTier(sessionID: string, tokens: number): boolean {
 }
 
 export function clearSessionTier(sessionID: string): boolean {
-  const id = String(sessionID ?? "").trim();
+  const id = normalizeId(sessionID);
   if (id === "") return false;
   const data = loadStore();
   if (!(id in data.sessions)) return false;

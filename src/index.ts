@@ -5,6 +5,7 @@ import {
   generatePKCE,
   pollDeviceFlow,
   type QoderProviderOptions,
+  type StoredCredential,
   // Describes a credential without ever printing it -- auth.ts owns the rule, so
   // the tool surface reports exactly what the log lines report.
   describeTokenShape as tokenShape,
@@ -19,6 +20,7 @@ import {
   reportModels,
   reportQuota,
 } from "./capabilities.js";
+import { nonEmptyString } from "./coerce.js";
 import {
   PROVIDER_ID,
   PROVIDER_NAME,
@@ -40,15 +42,10 @@ import {
   isValidContextTier,
   refreshModels,
 } from "./model-catalog.js";
-import {
-  addPAT,
-  getActivePAT,
-  listPATs,
-  removePAT,
-  switchPAT,
-} from "./pat-store.js";
-import { getRoutingPolicy, updateRoutingPolicy, type RoutingPolicy } from "./routing-policy.js";
+import { addPAT, getActivePAT, listPATs, removePAT, switchPAT } from "./pat-store.js";
+import { getRoutingPolicy, type RoutingPolicy, updateRoutingPolicy } from "./routing-policy.js";
 import { forgetSession, recordSessionParent, resolveRootSession } from "./session-roots.js";
+import { publishSharedApiKey, readShared, readSharedApiKey, writeShared } from "./shared-state.js";
 import {
   clearAllTiers,
   clearSessionTier,
@@ -84,56 +81,15 @@ function logCatalogRegistration(path: "legacy" | "v2"): void {
   );
 }
 
-// The "usable string" guard shared by option and globalThis reads: absent,
-// non-string and empty-string all collapse to undefined. (metadataString next
-// to credentialToOptions deliberately keeps a weaker guard -- it returns "" as
-// a real value -- so it is NOT folded in here.)
-function nonEmptyString(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
+// The "usable string" guard (coerce.ts) is shared by option and globalThis
+// reads. (metadataString next to credentialToOptions deliberately keeps a
+// weaker guard -- it returns "" as a real value -- so it is NOT folded in.)
 
 function optionString(
   options: PluginOptions | undefined,
   key: keyof QoderPluginOptions,
 ): string | undefined {
   return nonEmptyString(options?.[key]);
-}
-
-// Credential channel between the two module instances of this plugin.
-//
-// opencode loads this file twice in one process: once for the legacy config
-// hooks, once for the v2 catalog hooks. Established by logging a per-instance
-// id alongside the pid -- same pid, different instance ids, and neither can
-// read the other's module state. A module-level `configuredApiKey` therefore
-// cannot work: the instance that sees the credential is not the instance that
-// runs discovery.
-//
-// They do share a realm, so globalThis is the one channel available. It carries
-// the token from the legacy config hook (which sees the user's provider options
-// already resolved from `{file:...}`) to discoveryOptions (whose ctx.options is
-// empty and whose ctx exposes no config or provider key).
-//
-// The value stays in process memory: never written to disk, never logged --
-// logPlugin only ever receives tokenShape() of it. The same token already lives
-// in this realm inside opencode's own config object, so this does not widen
-// exposure; the fixed key is a collision risk, not a leak.
-const CREDENTIAL_KEY = "__opencode_qoder_api_key";
-
-function sharedState(): Record<string, unknown> {
-  return globalThis as unknown as Record<string, unknown>;
-}
-
-function readSharedApiKey(): string | undefined {
-  return nonEmptyString(sharedState()[CREDENTIAL_KEY]);
-}
-
-// First writer wins: a later hook invocation must not replace a working token
-// with an empty one, and an unresolved `{file:...}` reference must not overwrite
-// a real token either.
-function writeSharedApiKey(apiKey: string): boolean {
-  if (readSharedApiKey() !== undefined) return false;
-  sharedState()[CREDENTIAL_KEY] = apiKey;
-  return true;
 }
 
 // Cross-instance refresh trigger. The tier/pat tools live on the legacy
@@ -144,7 +100,7 @@ function writeSharedApiKey(apiKey: string): boolean {
 const REFRESH_TRIGGER_KEY = "__opencode_qoder_refresh_trigger";
 
 function triggerCatalogRefresh(): boolean {
-  const trigger = sharedState()[REFRESH_TRIGGER_KEY];
+  const trigger = readShared(REFRESH_TRIGGER_KEY);
   if (typeof trigger !== "function") return false;
   try {
     (trigger as () => void)();
@@ -298,7 +254,7 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   // instance over globalThis, since module state does not reach it.
   {
     const configured = optionString(current.options, "apiKey");
-    if (configured && writeSharedApiKey(configured)) {
+    if (configured && publishSharedApiKey(configured)) {
       logPlugin(`legacy: published apiKey (${tokenShape(configured)}) for discovery`);
       // opencode substitutes `{file:...}` before this hook runs. If a future
       // version hands over the raw reference, discovery would send it as a
@@ -411,17 +367,6 @@ function v2ModelConfig(model: DiscoveredModel) {
     enabled: true,
     limit: modelLimit(model),
   };
-}
-
-// Minimal shape of an opencode-stored credential. The plugin API returns it
-// untyped, so we declare the fields this plugin actually consumes.
-interface StoredCredential {
-  type?: string;
-  key?: string;
-  access?: string;
-  refresh?: string;
-  accountId?: string;
-  metadata?: Record<string, unknown>;
 }
 
 function metadataString(metadata: Record<string, unknown> | undefined, field: string) {
@@ -571,7 +516,7 @@ async function setupV2(ctx: PluginContext): Promise<void> {
     // aisdk log lines across a completed request), so the credential normally
     // arrives from the legacy config hook. Kept because an opencode version that
     // does route requests through here would otherwise leave discovery blind.
-    if (typeof apiKey === "string" && apiKey.length > 0 && writeSharedApiKey(apiKey)) {
+    if (typeof apiKey === "string" && apiKey.length > 0 && publishSharedApiKey(apiKey)) {
       logPlugin(`aisdk: published apiKey (${tokenShape(apiKey)}) for discovery`);
       onCredentialsCaptured?.();
     }
@@ -632,13 +577,12 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   };
   // Armed only now: the aisdk handler above is registered before refreshCatalog
   // exists, so it fires this trigger rather than calling refreshCatalog directly.
-  onCredentialsCaptured = () => {
+  const forceRefresh = (): void => {
     refreshCatalog(true).catch(logRefreshFailure);
   };
+  onCredentialsCaptured = forceRefresh;
   // Published for the legacy instance's tools (see triggerCatalogRefresh).
-  sharedState()[REFRESH_TRIGGER_KEY] = () => {
-    refreshCatalog(true).catch(logRefreshFailure);
-  };
+  writeShared(REFRESH_TRIGGER_KEY, forceRefresh);
   const warm = setTimeout(() => {
     refreshCatalog(true).catch(logRefreshFailure);
   }, 0);
@@ -762,15 +706,16 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
       execute: () => {
         const pats = listPATs();
         const active = getActivePAT();
-        const output = pats.length === 0
-          ? "No PATs stored yet. Use qoder_pat_add to add one."
-          : pats
-              .map((p) => {
-                const marker = p.active ? " [ACTIVE]" : "";
-                const email = p.email ? ` (${p.email})` : "";
-                return `${p.id}: ${p.label}${email}${marker}`;
-              })
-              .join("\n");
+        const output =
+          pats.length === 0
+            ? "No PATs stored yet. Use qoder_pat_add to add one."
+            : pats
+                .map((p) => {
+                  const marker = p.active ? " [ACTIVE]" : "";
+                  const email = p.email ? ` (${p.email})` : "";
+                  return `${p.id}: ${p.label}${email}${marker}`;
+                })
+                .join("\n");
         return Promise.resolve({ output, data: { pats, activeId: active?.id } });
       },
     }),
@@ -818,9 +763,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
       args: { id: tool.schema.string().describe("PAT id from qoder_pat_list") },
       execute: (args) => {
         const success = removePAT(args.id);
-        const output = success
-          ? `Removed ${args.id}.`
-          : `PAT ${args.id} not found.`;
+        const output = success ? `Removed ${args.id}.` : `PAT ${args.id} not found.`;
         return Promise.resolve({ output, data: { success, id: args.id } });
       },
     }),
@@ -903,7 +846,8 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
           });
         }
         if (!isValidContextTier(def, args.tier)) {
-          const offered = def.contextTiers?.join(" / ") ?? `<= ${def.inputWindow ?? def.contextWindow}`;
+          const offered =
+            def.contextTiers?.join(" / ") ?? `<= ${def.inputWindow ?? def.contextWindow}`;
           return Promise.resolve({
             output:
               `Tier ${args.tier} is not valid for ${args.model}. ` +
@@ -949,11 +893,26 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "keep the base model, or enabled=false to disable escalation entirely. Use when the " +
         "user asks which model handles long-context subagents or how compaction fits a 1M tier.",
       args: {
-        enabled: tool.schema.boolean().optional().describe("Master switch; false pins every request to its selected model."),
-        subagentModel: tool.schema.string().optional().describe("The pinned helper model this policy escalates (default lite)."),
-        target: tool.schema.string().optional().describe("Where escalated requests go (default qfmodel)."),
-        threshold: tool.schema.number().optional().describe("Escalate when the conversation tier exceeds this many tokens."),
-        exemptAgents: tool.schema.array(tool.schema.string()).optional().describe("Agents that keep the base model even above the threshold."),
+        enabled: tool.schema
+          .boolean()
+          .optional()
+          .describe("Master switch; false pins every request to its selected model."),
+        subagentModel: tool.schema
+          .string()
+          .optional()
+          .describe("The pinned helper model this policy escalates (default lite)."),
+        target: tool.schema
+          .string()
+          .optional()
+          .describe("Where escalated requests go (default qfmodel)."),
+        threshold: tool.schema
+          .number()
+          .optional()
+          .describe("Escalate when the conversation tier exceeds this many tokens."),
+        exemptAgents: tool.schema
+          .array(tool.schema.string())
+          .optional()
+          .describe("Agents that keep the base model even above the threshold."),
       },
       execute: (args) => {
         const patch: Partial<RoutingPolicy> = {};

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { text } from "./coerce.js";
 import {
   DEVICE_TOKEN_TTL_SECONDS,
   QODER_CLIENT_TYPE,
@@ -13,7 +14,7 @@ import {
   QODER_VERSION,
   REFRESH_SKEW_MS,
 } from "./constants.js";
-import { getMachineId } from "./cosy.js";
+import { type CosyCredentials, getMachineId } from "./cosy.js";
 import { jsonHeaders, readErrorBody } from "./http.js";
 import { errorMessage, logPlugin } from "./log.js";
 import { getActivePatString } from "./pat-store.js";
@@ -179,6 +180,32 @@ export function signingUserID(creds: QoderCredentials): string {
   return identityUnresolved(creds.userID) ? QODER_DEFAULT_USER_ID : creds.userID;
 }
 
+// opencode's auth.json entry for a provider, as read off disk. The tool
+// fallback in capabilities.ts and the auth() hook in index.ts both parse this
+// shape; `refresh` carries the pipe-encoded form above.
+export interface StoredCredential {
+  type?: string;
+  key?: string;
+  access?: string;
+  refresh?: string;
+  accountId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+// QoderCredentials -> CosyCredentials, the projection both signing call sites
+// used to hand-copy: the lenient catalog fetch and the chat request. Kept here
+// so signingUserID() cannot be missed by a future call site (a raw creds.userID
+// would sign the placeholder uid and buy a 105).
+export function cosyCredentialsForSigning(creds: QoderCredentials): CosyCredentials {
+  return {
+    userID: signingUserID(creds),
+    authToken: creds.access,
+    name: creds.name,
+    email: creds.email,
+    machineID: creds.machineID,
+  };
+}
+
 // The auth-failure escape hatch. Without it a credential that the gateway has
 // already rejected -- a revoked job token, or an exchange whose userinfo lookup
 // failed and froze a placeholder identity for the whole TTL -- keeps being
@@ -297,10 +324,6 @@ export function describeTokenShape(value: unknown): string {
   if (value.startsWith("{env:")) return "env-ref";
   if (value.startsWith("pt-")) return "pat";
   return `opaque(${value.length})`;
-}
-
-function text(value: unknown): string {
-  return typeof value === "string" ? value : "";
 }
 
 export async function credentialsFromPat(pat: string): Promise<QoderCredentials> {

@@ -1,4 +1,5 @@
 import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
+import { text } from "./coerce.js";
 import { FETCH_TIMEOUT_MS, QODER_QUOTA_URL } from "./constants.js";
 import { fetchWithTimeout, jsonHeaders, readErrorBody } from "./http.js";
 import { errorMessage, logPlugin } from "./log.js";
@@ -86,10 +87,6 @@ export type QuotaUsage = {
 function finite(value: unknown): number | null {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
-}
-
-function text(value: unknown): string {
-  return typeof value === "string" ? value : "";
 }
 
 function bucketRaw(usage: Record<string, unknown>, keys: readonly string[]) {

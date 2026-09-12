@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { logPlugin } from "./log.js";
+import { statSync } from "node:fs";
+import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
+import { errorMessage, logPlugin } from "./log.js";
+import { readShared, writeShared } from "./shared-state.js";
 
 // Subagent routing policy: which model serves the plugin's pinned helper
 // agents when the conversation runs on an above-default context tier.
@@ -65,23 +65,24 @@ interface Cache {
 }
 
 function storePath(): string {
-  const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(configDir, "opencode", STORE_FILENAME);
+  return opencodeConfigFile(STORE_FILENAME);
 }
 
 function cached(): Cache | undefined {
-  return (globalThis as Record<string, unknown>)[CACHE_KEY] as Cache | undefined;
+  return readShared<Cache>(CACHE_KEY);
 }
 
 function sanitize(raw: unknown): RoutingPolicy {
-  const out: RoutingPolicy = { ...DEFAULT_ROUTING_POLICY, exemptAgents: [...DEFAULT_ROUTING_POLICY.exemptAgents] };
+  const out: RoutingPolicy = {
+    ...DEFAULT_ROUTING_POLICY,
+    exemptAgents: [...DEFAULT_ROUTING_POLICY.exemptAgents],
+  };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
   const data = raw as Record<string, unknown>;
   if (typeof data.enabled === "boolean") out.enabled = data.enabled;
   if (typeof data.subagentModel === "string" && data.subagentModel.trim() !== "")
     out.subagentModel = data.subagentModel.trim();
-  if (typeof data.target === "string" && data.target.trim() !== "")
-    out.target = data.target.trim();
+  if (typeof data.target === "string" && data.target.trim() !== "") out.target = data.target.trim();
   const threshold = Number(data.threshold);
   if (Number.isInteger(threshold) && threshold > 0) out.threshold = threshold;
   if (Array.isArray(data.exemptAgents)) {
@@ -95,19 +96,21 @@ function sanitize(raw: unknown): RoutingPolicy {
 
 function readPolicyFile(): { policy: RoutingPolicy; mtimeMs: number } {
   const path = storePath();
+  let mtimeMs: number;
   try {
-    if (!existsSync(path)) return { policy: sanitize(null), mtimeMs: -1 };
-    const mtimeMs = statSync(path).mtimeMs;
-    const previous = cached();
-    if (previous && previous.mtimeMs === mtimeMs) {
-      return { policy: previous.policy, mtimeMs };
-    }
-    const policy = sanitize(JSON.parse(readFileSync(path, "utf8")));
-    return { policy, mtimeMs };
+    mtimeMs = statSync(path).mtimeMs;
   } catch (error) {
-    logPlugin(`routing-policy: failed to read ${path}: ${error}`);
+    // Missing (the normal fresh state) or unreadable -- say so and default.
+    logPlugin(`routing-policy: no readable policy at ${path} (${errorMessage(error)})`);
     return { policy: sanitize(null), mtimeMs: -1 };
   }
+  const previous = cached();
+  if (previous && previous.mtimeMs === mtimeMs) {
+    return { policy: previous.policy, mtimeMs };
+  }
+  // A corrupt file logs once inside readJsonFile and answers undefined;
+  // sanitize(null) keeps the defaults rather than blocking the request.
+  return { policy: sanitize(readJsonFile("routing-policy", path) ?? null), mtimeMs };
 }
 
 export function getRoutingPolicy(): RoutingPolicy {
@@ -117,26 +120,26 @@ export function getRoutingPolicy(): RoutingPolicy {
 }
 
 function setCachedPolicy(policy: RoutingPolicy, mtimeMs: number): void {
-  (globalThis as Record<string, unknown>)[CACHE_KEY] = {
+  writeShared(CACHE_KEY, {
     policy,
     mtimeMs,
     loadedAt: Date.now(),
-  } satisfies Cache;
+  } satisfies Cache);
 }
 
 export function updateRoutingPolicy(patch: Partial<RoutingPolicy>): RoutingPolicy {
   const merged = sanitize({ ...getRoutingPolicy(), ...patch });
   const path = storePath();
-  const dir = join(path, "..");
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  try {
-    writeFileSync(path, JSON.stringify(merged, null, 2), "utf8");
-    setCachedPolicy(merged, statSync(path).mtimeMs);
+  if (writeJsonFile("routing-policy", path, merged)) {
+    try {
+      setCachedPolicy(merged, statSync(path).mtimeMs);
+    } catch {
+      // The write landed; a stat race only costs one extra reread next call.
+      setCachedPolicy(merged, -1);
+    }
     logPlugin(
       `routing-policy: saved (enabled=${merged.enabled}, ${merged.subagentModel}->${merged.target} above ${merged.threshold})`,
     );
-  } catch (error) {
-    logPlugin(`routing-policy: failed to write ${path}: ${error}`);
   }
   return merged;
 }

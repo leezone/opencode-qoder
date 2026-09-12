@@ -1,7 +1,7 @@
-import type { LanguageModelV3Prompt } from "@ai-sdk/provider";
 import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { LanguageModelV3Prompt } from "@ai-sdk/provider";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseCatalog } from "../model-catalog.js";
 import { transformPrompt } from "../transform.js";
@@ -85,8 +85,16 @@ describe("parseCatalog", () => {
   it("omits contextTiers when upstream lists fewer than two usable windows", () => {
     const models = parseCatalog({
       chat: [
-        { key: "single", max_input_tokens: 180000, context_config: { "200K": { token_count: 200000, is_default: true } } },
-        { key: "garbage", max_input_tokens: 180000, context_config: { a: { token_count: -5 }, b: { token_count: "x" } } },
+        {
+          key: "single",
+          max_input_tokens: 180000,
+          context_config: { "200K": { token_count: 200000, is_default: true } },
+        },
+        {
+          key: "garbage",
+          max_input_tokens: 180000,
+          context_config: { a: { token_count: -5 }, b: { token_count: "x" } },
+        },
         { key: "none", max_input_tokens: 180000 },
       ],
     });
@@ -229,7 +237,10 @@ describe("cross-realm disk-cache adoption", () => {
   }
 
   function writeCache(file: string, withTiers: boolean, fetchedAt: number, mtimeSec: number): void {
-    writeFileSync(file, JSON.stringify({ version: CACHE_VERSION, fetchedAt, models: [cachedModel(withTiers)] }));
+    writeFileSync(
+      file,
+      JSON.stringify({ version: CACHE_VERSION, fetchedAt, models: [cachedModel(withTiers)] }),
+    );
     // Explicit mtimes keep the stat comparison deterministic regardless of how
     // fast the two writes land on the real clock.
     utimesSync(file, mtimeSec, mtimeSec);

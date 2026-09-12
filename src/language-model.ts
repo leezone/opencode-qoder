@@ -12,6 +12,7 @@ import {
   type SharedV3Warning,
 } from "@ai-sdk/provider";
 import {
+  cosyCredentialsForSigning,
   identityUnresolved as identityMissing,
   type QoderCredentials,
   type QoderProviderOptions,
@@ -810,16 +811,11 @@ export class QoderLanguageModel implements LanguageModelV3 {
     const bodyBytes = Buffer.from(JSON.stringify(body));
     const encodedBody = qoderEncodeBody(bodyBytes);
     const encodedBytes = Buffer.from(encodedBody, "utf8");
-    const headers = buildAuthHeaders(encodedBytes, QODER_CHAT_URL, {
-      // signingUserID(), not credentials.userID: an unresolved uid must not
-      // crash the request here (cosy rejects an empty one) -- the uid's absence
-      // is reported alongside a 105 instead. See signingUserID() in auth.ts.
-      userID: signingUserID(credentials),
-      authToken: credentials.access,
-      name: credentials.name,
-      email: credentials.email,
-      machineID: credentials.machineID,
-    });
+    const headers = buildAuthHeaders(
+      encodedBytes,
+      QODER_CHAT_URL,
+      cosyCredentialsForSigning(credentials),
+    );
 
     let response: Response;
     try {
