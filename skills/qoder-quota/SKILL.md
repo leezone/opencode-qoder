@@ -60,6 +60,28 @@ persisted to `~/.config/opencode/qoder-pats.json` (honours `XDG_CONFIG_HOME`).
 The active PAT is used automatically by all requests. Switching is instant — no
 restart needed.
 
+**Seeding from the environment.** A fresh box or CI runner can bootstrap the
+store without any tool call by setting `OPENCODE_QODER_PAT` to a comma- (or
+semicolon-) separated list:
+
+```bash
+export OPENCODE_QODER_PAT="pt-aaa,pt-bbb"   # imported into the store at startup
+```
+
+At plugin setup the value is split, each `pt-` segment that is not already
+stored is imported (first one auto-activates an empty store; existing active
+entries are never stolen), and the rest is logged by count only. This is a
+*one-time import*, not a resolution layer: `OPENCODE_QODER_PAT` is deliberately
+**not** part of the precedence list above, so it never collides with the
+official `QODER_PERSONAL_ACCESS_TOKEN` (which stays single-PAT, unchanged).
+Non-`pt-` segments are dropped (a raw job token must not be persisted as a
+PAT). Unset the variable after seeding so the tokens do not linger in every
+child process's environment.
+
+**At rest:** the store file is written `0600` (owner-only) on Linux/macOS, to
+match opencode's own `auth.json`. On Windows there are no POSIX bits — the file
+is protected by the per-user `%USERPROFILE%` ACL, exactly like `auth.json`.
+
 ## Subagent Model Optimization
 
 The plugin configures opencode's subagents to use free/cheap models by default,

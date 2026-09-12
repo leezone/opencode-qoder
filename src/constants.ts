@@ -19,6 +19,16 @@ export const QODER_USERINFO_URL = `${QODER_OPENAPI_URL}/api/v1/userinfo`;
 export const QODER_REFRESH_URL = `${QODER_CENTER_URL}/algo/api/v3/user/refresh_token`;
 
 export const QODER_PAT_ENV = ["QODER_PERSONAL_ACCESS_TOKEN", "QODER_PAT"] as const;
+// Multi-PAT bootstrap import. Deliberately NOT part of QODER_PAT_ENV: this is
+// not a credential-resolution layer (the chain still ends at the two env vars
+// above). At plugin setup its value is SPLIT on `,`/`;` and IMPORTED into the
+// pat-store, after which the store -- not the variable -- is what authenticates
+// requests. Keeping it out of QODER_PAT_ENV also keeps it out of the `env`
+// auth-method broadcast (index.ts) and the qoder_auth layer table. The name
+// carries the plugin's own prefix so it can never collide with an official Qoder
+// CLI variable: QODER_PERSONAL_ACCESS_TOKEN stays single-PAT and
+// official-CLI-compatible, exactly as before.
+export const QODER_PAT_IMPORT_ENV = "OPENCODE_QODER_PAT";
 export const USER_AGENT = "opencode-qoder";
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cache_read: 0, cache_write: 0 });

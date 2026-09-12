@@ -120,3 +120,16 @@ Or run opencode's auth flow:
 Choose `Personal Access Token` and paste the PAT.
 
 After changing the plugin config, quit and restart opencode. Plugins and provider config are loaded at startup.
+
+## Multiple accounts
+
+Several Qoder accounts can be stored at once and switched at runtime. The store is `~/.config/opencode/qoder-pats.json` (honours `XDG_CONFIG_HOME`), written `0600`; one entry is active and signs every request until you switch. Manage it from the conversation with `qoder_pat_add`, `qoder_pat_list`, `qoder_pat_switch`, `qoder_pat_remove`.
+
+To seed the store without any tool call (a fresh box, a CI runner), set the import variable to a comma- or semicolon-separated list:
+
+```bash
+export OPENCODE_QODER_PAT="pt-aaa,pt-bbb"
+opencode
+```
+
+This is a one-time **import**, not a lookup layer: at startup each unseen `pt-` segment is added (the first activates an empty store), after which the store — not the variable — authenticates requests. `OPENCODE_QODER_PAT` is deliberately separate from `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`, so it never collides with the official Qoder CLI (those stay single-PAT, unchanged). Unset it once imported so the tokens do not linger in child-process environments.

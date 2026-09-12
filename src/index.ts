@@ -42,6 +42,7 @@ import {
   isValidContextTier,
   refreshModels,
 } from "./model-catalog.js";
+import { maybeImportPATsFromEnv } from "./pat-import.js";
 import { addPAT, getActivePAT, listPATs, removePAT, switchPAT } from "./pat-store.js";
 import { getRoutingPolicy, type RoutingPolicy, updateRoutingPolicy } from "./routing-policy.js";
 import { forgetSession, recordSessionParent, resolveRootSession } from "./session-roots.js";
@@ -98,6 +99,12 @@ function optionString(
 // tools call it when present so a switch takes effect without waiting out the
 // 15-minute refresh timer (whose non-forced path is also TTL-throttled).
 const REFRESH_TRIGGER_KEY = "__opencode_qoder_refresh_trigger";
+
+// Once-flag for the OPENCODE_QODER_PAT bootstrap import. opencode loads this
+// plugin twice per process and neither realm sees the other's module state, so
+// the flag lives on globalThis; addPAT's dedup makes a repeat idempotent, the
+// flag only prevents a re-log.
+const PAT_IMPORT_DONE_KEY = "__opencode_qoder_pat_import_done";
 
 function triggerCatalogRefresh(): boolean {
   const trigger = readShared(REFRESH_TRIGGER_KEY);
@@ -437,6 +444,15 @@ async function setupV2(ctx: PluginContext): Promise<void> {
     `setup[v2]: pid=${process.pid} optionsKeys=${JSON.stringify(Object.keys(ctx.options ?? {}))} ` +
       `sharedApiKey=${tokenShape(readSharedApiKey())}`,
   );
+  // Seed the pat-store from OPENCODE_QODER_PAT before anything authenticates.
+  // Runs before discovery/transform so a freshly imported PAT can sign the very
+  // first catalog refresh. The globalThis once-flag keeps a second plugin realm
+  // (opencode loads this plugin twice per process) from re-importing and
+  // re-logging; addPAT's own dedup makes even a repeat idempotent anyway.
+  if (!readShared<boolean>(PAT_IMPORT_DONE_KEY)) {
+    writeShared(PAT_IMPORT_DONE_KEY, true);
+    maybeImportPATsFromEnv();
+  }
   await ctx.integration.transform((integrations) => {
     integrations.update(id, (integration) => {
       integration.name = PROVIDER_NAME;

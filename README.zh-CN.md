@@ -120,3 +120,16 @@ opencode
 选择 `Personal Access Token` 并粘贴 PAT。
 
 修改插件配置后需退出并重启 opencode，插件与提供商配置仅在启动时加载。
+
+## 多账户
+
+可同时存储多个 Qoder 账户并在运行时切换。存储位置为 `~/.config/opencode/qoder-pats.json`（遵循 `XDG_CONFIG_HOME`），以 `0600` 权限写入；其中一个为 active，为所有请求签名，直到你切换。可在对话中用 `qoder_pat_add`、`qoder_pat_list`、`qoder_pat_switch`、`qoder_pat_remove` 管理。
+
+若要在无任何工具调用的情况下预置 store（全新机器、CI runner），把导入变量设为逗号或分号分隔的列表：
+
+```bash
+export OPENCODE_QODER_PAT="pt-aaa,pt-bbb"
+opencode
+```
+
+这是一次性的**导入**，不是查找层：启动时每个未见过的 `pt-` 段会被加入（首个会激活空 store），此后是 store——而非该变量——为请求鉴权。`OPENCODE_QODER_PAT` 刻意与 `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT` 分开，因此永不与官方 Qoder CLI 冲突（那两个仍是单 PAT、保持原样）。导入完成后请 `unset` 该变量，免得令牌滞留在子进程环境里。

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readEnv } from "./env.js";
@@ -72,14 +72,37 @@ export function readJsonFile(label: string, path: string): unknown | undefined {
   }
 }
 
-// mkdir -p + pretty JSON. Returns whether the write landed; the caller logs
-// its own success summary. The mkdir is inside the try on purpose: an
-// unwritable directory must reach the caller as `false`, not as a throw.
+// mkdir -p + pretty JSON + owner-only mode. Returns whether the write landed;
+// the caller logs its own success summary. The mkdir is inside the try on
+// purpose: an unwritable directory must reach the caller as `false`, not as a
+// throw.
+//
+// These files hold secrets (PAT store; tier and routing files ride the same
+// writer). Without an explicit mode, writeFileSync lands at `0666 & ~umask` --
+// 0644 on a typical Linux/macOS box, i.e. readable by every local user --
+// whereas opencode keeps its own `auth.json` at 0600. So the mode is set after
+// the write rather than via writeFileSync's `mode` option, which is only
+// applied when the file is CREATED: an existing 0644 store would never be
+// repaired on the next save.
+//
+// 0600 and not 0400 on purpose. On Windows there are no POSIX bits: libuv's
+// chmod maps to SetFileAttributes and reads only the write bit, so 0400 would
+// mark the file read-only and break every later save. 0600 keeps it writable
+// and is a no-op for secrecy -- there `%USERPROFILE%`'s per-user ACL is what
+// actually protects the file, which is also why the failure of chmod on
+// filesystems without POSIX semantics (FAT32/exFAT, some CI runners) is
+// swallowed instead of reported.
 export function writeJsonFile(label: string, path: string, data: unknown): boolean {
   try {
     const dir = join(path, "..");
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     writeFileSync(path, JSON.stringify(data, null, 2), "utf8");
+    try {
+      chmodSync(path, 0o600);
+    } catch {
+      // The payload landed; a filesystem that cannot express the mode is not a
+      // write failure.
+    }
     return true;
   } catch (error) {
     logPlugin(`${label}: failed to write ${path}: ${errorMessage(error)}`);
