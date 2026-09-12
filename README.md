@@ -133,3 +133,25 @@ opencode
 ```
 
 This is a one-time **import**, not a lookup layer: at startup each unseen `pt-` segment is added (the first activates an empty store), after which the store — not the variable — authenticates requests. `OPENCODE_QODER_PAT` is deliberately separate from `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`, so it never collides with the official Qoder CLI (those stay single-PAT, unchanged). Unset it once imported so the tokens do not linger in child-process environments.
+
+### Recovery when no chat works
+
+If the active credential is revoked or its account lapsed, the in-chat tools cannot save you: they need a working conversation to run in, and every model — including free `lite` (`x0` waives credits, not authentication) — is refused. The `qoder-quota` skill script reads the same store from a bare shell:
+
+```bash
+node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --pats
+node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --use-pat=Work   # id or label
+```
+
+`--pats` probes each stored PAT against the live gateway and classifies it (ALIVE / EXHAUSTED / DEAD / ACCOUNT-INACTIVE / UNREACHABLE); `--use-pat` flips `active` to a healthy entry, refusing an unhealthy one unless `--force`. A running opencode reloads the store by file mtime, so the switch takes effect on the next request — no restart.
+
+### What a dead credential costs you
+
+The tier system can route an over-budget *conversation* to free `lite`, but only if some credential authenticates. Two failure shapes:
+
+| What broke | Who recovers |
+| --- | --- |
+| Exchange token (job token) revoked/expired | the plugin renews it automatically |
+| **The PAT itself** revoked, or the account's subscription lapsed | only you — `--use-pat` to a healthy backup, or `qoder_pat_add` / re-`/connect` a new PAT |
+
+An `ACCOUNT-INACTIVE` verdict means the whole account is down, so a backup on the *same* account won't help; seed a PAT for a different one with `OPENCODE_QODER_PAT`. Switching to a healthy backup is the entire recovery — `--use-pat` flips the store, the next request picks it up, and you keep working in the now-live chat.

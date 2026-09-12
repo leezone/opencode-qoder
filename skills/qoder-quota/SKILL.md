@@ -82,6 +82,35 @@ child process's environment.
 match opencode's own `auth.json`. On Windows there are no POSIX bits — the file
 is protected by the per-user `%USERPROFILE%` ACL, exactly like `auth.json`.
 
+### Recovery when no chat works
+
+A dead credential is a catch-22 for the in-chat tools above: every one of them
+(`qoder_pat_switch`, `qoder_quota`, tier switching) runs *inside* a conversation,
+and a conversation is exactly what a revoked or lapsed credential refuses. Even
+the free `lite` model is no escape — `x0` waives credits, not authentication.
+
+The escape hatch is this script, which runs in a bare shell and needs none of
+that. It reads the same store file the plugin does:
+
+```bash
+# Probe every stored PAT against the live gateway; classify ALIVE / EXHAUSTED /
+# DEAD / ACCOUNT-INACTIVE / UNREACHABLE, and list the usable ids.
+node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --pats
+
+# Make one active by id or label (case-insensitive). Refuses an unhealthy entry
+# unless --force, which means you know better than the probe.
+node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --use-pat=Work
+```
+
+A running opencode picks the flip up on its **next request** — the store is
+reloaded by file mtime, no restart — so `--use-pat` to a healthy backup is the
+whole recovery. Then continue in the (now working) chat.
+
+`--use-pat` writes the file back with its original shape and `0600`. A single
+`ACCOUNT-INACTIVE` verdict means the *account* is down, so a backup on the same
+account won't help; seed a PAT for a different account (see "Seeding from the
+environment").
+
 ## Subagent Model Optimization
 
 The plugin configures opencode's subagents to use free/cheap models by default,

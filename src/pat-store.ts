@@ -1,5 +1,6 @@
+import { statSync } from "node:fs";
+import { errorMessage, logPlugin } from "./log.js";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
-import { logPlugin } from "./log.js";
 import { readShared, writeShared } from "./shared-state.js";
 
 // Multi-PAT storage: lets users store several Qoder accounts and switch between
@@ -35,40 +36,81 @@ const STORE_FILENAME = "qoder-pats.json";
 // Cache lives on globalThis, not module state: a PAT switched by a tool in one
 // plugin instance must be visible to credential resolution in the other. The
 // realm-boundary explanation lives once, in shared-state.ts.
+//
+// It also carries the file's mtime so an OUT-OF-BAND edit -- the standalone
+// recovery script flipping `active`, or a hand edit -- is picked up by a
+// running opencode without a restart. This is the credential that signs every
+// request; when the active PAT is dead, restart-to-apply is exactly the friction
+// the shell escape hatch is supposed to remove. Same mtime-reuse contract as
+// routing-policy.ts.
 const CACHE_KEY = "__opencode_qoder_pat_store";
 
-function cachedStore(): PATStoreData | undefined {
-  return readShared<PATStoreData>(CACHE_KEY);
+interface Cache {
+  data: PATStoreData;
+  mtimeMs: number;
 }
 
-function setCachedStore(data: PATStoreData | undefined): void {
-  writeShared(CACHE_KEY, data);
+function cachedStore(): Cache | undefined {
+  return readShared<Cache>(CACHE_KEY);
+}
+
+function setCachedStore(data: PATStoreData | undefined, mtimeMs: number): void {
+  if (!data) {
+    writeShared(CACHE_KEY, undefined);
+    return;
+  }
+  writeShared(CACHE_KEY, { data, mtimeMs });
 }
 
 function storePath(): string {
   return opencodeConfigFile(STORE_FILENAME);
 }
 
-// Loaded once per process (shared by both plugin instances via globalThis).
-// All mutations write through to disk and refresh the cache; reads hit the
-// cache. Use invalidateStore() after an out-of-band file edit.
-function loadStore(): PATStoreData {
-  const cached = cachedStore();
-  if (cached) return cached;
-  const path = storePath();
-  let data: PATStoreData = { entries: [] };
-  const parsed = readJsonFile("pat-store", path);
-  if (parsed && typeof parsed === "object" && Array.isArray((parsed as PATStoreData).entries)) {
-    data = { entries: (parsed as PATStoreData).entries.filter(isValidEntry) };
+// Where the store lives, for a caller that has to name the file to the user --
+// the auth-failure hint in language-model.ts points its shell recovery at this
+// exact path so the two agree with the writer.
+export function patStoreFile(): string {
+  return storePath();
+}
+
+// File mtime, or -1 for a missing file (the normal fresh-install state, quiet)
+// and for a stat that fails on an existing path (logged once). -1 doubles as
+// the "no file" cache stamp so a create/delete is detected as a change.
+function storeMtime(path: string): number {
+  try {
+    return statSync(path).mtimeMs;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      logPlugin(`pat-store: cannot stat ${path}: ${errorMessage(error)}`);
+    }
+    return -1;
   }
-  setCachedStore(data);
+}
+
+// Re-reads only when the file's mtime moved since the last load, so an external
+// `active` flip is honored on the next request while a steady-state process
+// pays one statSync per read and no parse.
+function loadStore(): PATStoreData {
+  const path = storePath();
+  const mtimeMs = storeMtime(path);
+  const cached = cachedStore();
+  if (cached && cached.mtimeMs === mtimeMs) return cached.data;
+  let data: PATStoreData = { entries: [] };
+  if (mtimeMs !== -1) {
+    const parsed = readJsonFile("pat-store", path);
+    if (parsed && typeof parsed === "object" && Array.isArray((parsed as PATStoreData).entries)) {
+      data = { entries: (parsed as PATStoreData).entries.filter(isValidEntry) };
+    }
+  }
+  setCachedStore(data, mtimeMs);
   return data;
 }
 
-// Drop the in-memory copy so the next loadStore() re-reads the file. Exported
-// for tests and for any future tool that edits the store out of band.
+// Drop the in-memory copy so the next loadStore() re-reads the file. With
+// mtime revalidation this is only needed when a caller wants to force a re-read
+// without a file change; export kept for tests.
 export function invalidateStore(): void {
-  setCachedStore(undefined);
+  setCachedStore(undefined, -1);
 }
 
 function isValidEntry(value: unknown): value is StoredPAT {
@@ -83,11 +125,15 @@ function isValidEntry(value: unknown): value is StoredPAT {
 }
 
 function saveStore(): void {
-  const data = cachedStore();
-  if (!data) return;
+  const cached = cachedStore();
+  if (!cached) return;
   const path = storePath();
-  if (writeJsonFile("pat-store", path, data)) {
-    logPlugin(`pat-store: saved ${data.entries.length} entries to ${path}`);
+  if (writeJsonFile("pat-store", path, cached.data)) {
+    // Re-stamp the cache with the new mtime: this write must not read back as
+    // an out-of-band edit on the next load. A stat failure after a successful
+    // write leaves the stale stamp, whose only cost is one extra re-parse.
+    setCachedStore(cached.data, storeMtime(path));
+    logPlugin(`pat-store: saved ${cached.data.entries.length} entries to ${path}`);
   }
 }
 

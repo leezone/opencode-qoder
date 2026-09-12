@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Qoder account + credit quota reader.
+// Qoder account + credit quota reader, and the out-of-band PAT-store recovery
+// hatch (see --pats / --use-pat under Usage).
 //
 // Plain Bearer calls against openapi.qoder.sh -- no COSY signing, no deps.
 // Reads the same credential layers the opencode-qoder plugin does, caches the
@@ -8,6 +9,8 @@
 //   node qoder-quota.mjs            human summary
 //   node qoder-quota.mjs --json     machine-readable
 //   node qoder-quota.mjs --refresh  ignore the cached job token
+//   node qoder-quota.mjs --pats     probe every PAT in the plugin's store
+//   node qoder-quota.mjs --use-pat=<id>   validate it, then make it active
 
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -45,9 +48,20 @@ if (flag("help")) {
   console.log(
     [
       "Usage: node qoder-quota.mjs [--json] [--refresh] [--pat=<pt-...>] [--token=<jt-...>]",
+      "       node qoder-quota.mjs --pats",
+      "       node qoder-quota.mjs --use-pat=<id|label> [--force]",
       "",
       "Reads Qoder credit quota + account info. Exit 0 = data fetched (even if",
       "credits are spent), 1 = nothing usable came back.",
+      "",
+      "--pats and --use-pat are the shell-side recovery hatch for a dead ACTIVE",
+      "PAT: with no credential no chat can run (not even the free lite model --",
+      "zero credits is still signed auth), which also puts the in-conversation",
+      "switch tool out of reach. These modes need no chat: they probe every PAT",
+      "in the plugin's store with a live exchange + quota read (both unmetered",
+      "identity endpoints) and can rewrite which entry is active. The plugin",
+      "re-reads the store by mtime, so a switch applies to a running opencode",
+      "without a restart.",
     ].join("\n"),
   );
   process.exit(0);
@@ -266,7 +280,206 @@ async function fetchAccount(token) {
   };
 }
 
+// --- PAT store: the shell-side recovery hatch --------------------------------
+//
+// The plugin keeps stored accounts at $XDG_CONFIG_HOME/opencode/qoder-pats.json
+// (one `active` entry signs every request). These helpers read and rewrite that
+// file directly, so recovery works with no running opencode and no working
+// credential. The token VALUES are never printed -- only ids/labels.
+
+function patStorePath() {
+  const base = (process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config")).trim();
+  return path.join(base, "opencode", "qoder-pats.json");
+}
+
+function readPatStore() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(patStorePath(), "utf8"));
+    return raw && Array.isArray(raw.entries) ? raw : null;
+  } catch {
+    return null; // absent or corrupt -- the caller decides whether that is fatal
+  }
+}
+
+// Flip `active` and rewrite the whole file so any other top-level keys survive.
+// Last-writer-wins against a concurrent plugin write -- the same hazard a hand
+// edit carries, acceptable for a tool a human runs deliberately.
+function writePatStoreActive(store, targetId) {
+  const next = {
+    ...store,
+    entries: store.entries.map((e) => ({ ...e, active: e.id === targetId })),
+  };
+  const file = patStorePath();
+  fs.writeFileSync(file, JSON.stringify(next, null, 2), "utf8");
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    /* a filesystem without POSIX bits; the per-user dir already protects it */
+  }
+}
+
+// The credit numbers, shared by the quota report and the probe so "usable" means
+// the same thing in both.
+function creditSummary(quota) {
+  const userQuota = bucket(pick(quota, "userQuota", "user_quota"));
+  const addOn = bucket(pick(quota, "addOnQuota", "add_on_quota"));
+  const org = bucket(pick(quota, "orgResourcePackage", "org_resource_package"), {
+    unlimitedCapIsNegative: true,
+  });
+  const shared = bucket(pick(quota, "sharedQuota", "shared_quota"));
+  const remainingTotal = [userQuota, addOn, org, shared].reduce(
+    (sum, b) => (b && num(b.remaining) !== null ? sum + b.remaining : sum),
+    0,
+  );
+  const flagExceeded = pick(quota, "isQuotaExceeded", "is_quota_exceeded");
+  const exceeded = typeof flagExceeded === "boolean" ? flagExceeded : remainingTotal <= 0;
+  return { userQuota, addOn, org, shared, remainingTotal, exceeded };
+}
+
+function classifyProbeError(error) {
+  const message = String((error && error.message) || error);
+  if (/not active/i.test(message)) return "ACCOUNT-INACTIVE";
+  // The exchange endpoint answers 400 (not 401) to a token it does not accept
+  // at all -- verified live; a revoked one lands on 401/403. Any 4xx here means
+  // "this credential is not accepted", which is exactly what DEAD is for.
+  if (/HTTP 4\d\d/i.test(message)) return "DEAD";
+  if (/network failure|timeout|abort/i.test(message)) return "UNREACHABLE";
+  return "UNKNOWN";
+}
+
+// One stored PAT's live verdict. forceExchange is the point: a CACHED job token
+// would keep calling a just-revoked PAT healthy until the cache lapsed.
+//   ALIVE            credential good, credits left
+//   EXHAUSTED        credential good, zero credits (a free model may still serve)
+//   DEAD             the PAT itself was rejected (revoked / wrong)
+//   ACCOUNT-INACTIVE the whole account is down -- only a PAT on ANOTHER account helps
+//   UNREACHABLE / UNKNOWN   transient; the file is never touched on these
+async function probePAT(pat) {
+  let token;
+  try {
+    ({ token } = await jobToken({ token: pat }, { forceExchange: true }));
+  } catch (error) {
+    return { status: classifyProbeError(error), reason: String((error && error.message) || error) };
+  }
+  try {
+    const account = await fetchAccount(token);
+    const summary = creditSummary(account.quota || {});
+    return {
+      status: summary.exhausted ? "EXHAUSTED" : "ALIVE",
+      remaining: summary.remainingTotal,
+      email: pick(account.user, "email") || "",
+    };
+  } catch (error) {
+    return { status: classifyProbeError(error), reason: String((error && error.message) || error) };
+  }
+}
+
+function noStoreGuidance() {
+  console.error(`No usable PAT store at ${patStorePath()}.`);
+  console.error("Seed one from a shell without a chat:");
+  console.error('  OPENCODE_QODER_PAT="pt-aaa,pt-bbb" opencode   (imported at startup)');
+  console.error("...or add accounts with the qoder_pat_add tool from a working conversation.");
+}
+
+// --pats: probe every stored account, report which are usable.
+async function patsMain() {
+  const store = readPatStore();
+  if (!store || store.entries.length === 0) {
+    noStoreGuidance();
+    process.exit(1);
+  }
+  // Sequential on purpose: a handful of live exchanges, and a dead-PAT burst
+  // against the gateway tells the user nothing extra.
+  const rows = [];
+  for (const entry of store.entries) {
+    rows.push({
+      id: entry.id,
+      label: entry.label || "",
+      active: !!entry.active,
+      email: entry.email || "",
+      ...(await probePAT(entry.pat)),
+    });
+  }
+  const usable = rows.filter((r) => r.status === "ALIVE" || r.status === "EXHAUSTED");
+  if (flag("json")) {
+    console.log(JSON.stringify({ store: patStorePath(), entries: rows, usableIds: usable.map((r) => r.id) }, null, 2));
+    process.exit(usable.length ? 0 : 1);
+  }
+  console.log(`PAT store: ${patStorePath()}`);
+  const idWidth = Math.max(...rows.map((r) => r.id.length));
+  for (const r of rows) {
+    const marker = r.active ? "*" : " ";
+    const who = `${r.id.padEnd(idWidth)}  ${(r.label || "-").padEnd(16)}${r.email ? ` <${r.email}>` : ""}`;
+    const tail =
+      r.status === "ALIVE" || r.status === "EXHAUSTED"
+        ? `  ${r.remaining} credits`
+        : `  ${r.reason || ""}`;
+    console.log(`${marker} ${who}  ${r.status.padEnd(16)}${tail}`.replace(/\s+$/, ""));
+  }
+  console.log("");
+  if (usable.length) {
+    const activeOk = usable.find((r) => r.active);
+    console.log(
+      activeOk
+        ? "Active account is healthy. Switch anyway with:  --use-pat=<id>"
+        : `Switch to a healthy one:  --use-pat=${usable[0].id}`,
+    );
+  } else {
+    const judged = rows.every((r) => r.status === "ACCOUNT-INACTIVE" || r.status === "DEAD");
+    console.error(
+      judged
+        ? "No usable PAT: every stored account is dead or its subscription lapsed. Add a PAT for a DIFFERENT account (OPENCODE_QODER_PAT import, or ~/.config/opencode/qoder-pats.json)."
+        : "No PAT confirmed usable: every probe failed to reach or judge the gateway (see reasons above). This is not proof the accounts are dead -- retry, or check connectivity.",
+    );
+  }
+  process.exit(usable.length ? 0 : 1);
+}
+
+// --use-pat=<id|label>: validate, then make it active. The store is never
+// written for a DEAD/ACCOUNT-INACTIVE/UNREACHABLE target unless --force is given
+// (and never for UNKNOWN -- activating an unproven id would just move the dead
+// end). A confirmed switch needs no opencode restart (the plugin reloads by mtime).
+async function usePatMain(target) {
+  const store = readPatStore();
+  if (!store || store.entries.length === 0) {
+    noStoreGuidance();
+    process.exit(1);
+  }
+  const matches = store.entries.filter(
+    (e) => e.id === target || (e.label || "").toLowerCase() === target.toLowerCase(),
+  );
+  if (matches.length === 0) {
+    console.error(`No stored PAT matches "${target}". Stored:`);
+    for (const e of store.entries) console.error(`  ${e.id}  ${e.label || "-"}${e.active ? "  [active]" : ""}`);
+    process.exit(1);
+  }
+  if (matches.length > 1) {
+    console.error(`"${target}" matches several labels -- use an exact id: ${matches.map((m) => m.id).join(", ")}`);
+    process.exit(1);
+  }
+  const entry = matches[0];
+  const probe = await probePAT(entry.pat);
+  const force = flag("force");
+  if (probe.status !== "ALIVE" && !force) {
+    console.error(`Refusing to activate ${entry.id} (${entry.label}): ${probe.status}${probe.reason ? ` (${probe.reason})` : ""}.`);
+    if (probe.status === "ACCOUNT-INACTIVE")
+      console.error("The whole account is down -- a backup on the SAME account will not help; use one on a different account.");
+    if (probe.status === "EXHAUSTED")
+      console.error("Credential is valid but out of credits; a free model may still serve. Re-run with --force to activate anyway.");
+    console.error("Nothing written. --force writes the entry regardless, if you know better than the probe (e.g. UNREACHABLE was really a VPN blip).");
+    process.exit(1);
+  }
+  writePatStoreActive(store, entry.id);
+  const note = probe.status === "ALIVE" ? `validated live, ${probe.remaining} credits left` : `NOT healthy (${probe.status}) -- activated by --force`;
+  console.log(`Active PAT -> ${entry.id} (${entry.label || "-"}), ${note}.`);
+  console.log("A running opencode picks this up on its next request (mtime reload); no restart needed.");
+}
+
 async function main() {
+  if (flag("pats")) return patsMain();
+  const target = option("use-pat");
+  if (target) return usePatMain(target);
+
   const credential = resolveCredential();
   if (!credential) {
     console.error(
@@ -296,19 +509,7 @@ async function main() {
   }
   const { quota, user, userError } = account;
 
-  const userQuota = bucket(pick(quota, "userQuota", "user_quota"));
-  const addOn = bucket(pick(quota, "addOnQuota", "add_on_quota"));
-  const org = bucket(pick(quota, "orgResourcePackage", "org_resource_package"), {
-    unlimitedCapIsNegative: true,
-  });
-  const shared = bucket(pick(quota, "sharedQuota", "shared_quota"));
-
-  const remainingTotal = [userQuota, addOn, org, shared].reduce(
-    (sum, b) => (b && num(b.remaining) !== null ? sum + b.remaining : sum),
-    0,
-  );
-  const flagExceeded = pick(quota, "isQuotaExceeded", "is_quota_exceeded");
-  const exceeded = typeof flagExceeded === "boolean" ? flagExceeded : remainingTotal <= 0;
+  const { userQuota, addOn, org, shared, remainingTotal, exceeded } = creditSummary(quota);
 
   const expiresAt = num(pick(quota, "expiresAt", "expires_at"));
   const planUsage = num(pick(quota, "totalUsagePercentage", "total_usage_percentage"));

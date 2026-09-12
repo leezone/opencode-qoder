@@ -133,3 +133,28 @@ opencode
 ```
 
 这是一次性的**导入**，不是查找层：启动时每个未见过的 `pt-` 段会被加入（首个会激活空 store），此后是 store——而非该变量——为请求鉴权。`OPENCODE_QODER_PAT` 刻意与 `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT` 分开，因此永不与官方 Qoder CLI 冲突（那两个仍是单 PAT、保持原样）。导入完成后请 `unset` 该变量，免得令牌滞留在子进程环境里。
+
+### 当对话完全打不通时如何恢复
+
+上面的工具全都跑在对话*内部*——所以一旦 active 凭证被吊销或账户订阅过期，本该用来切换账户的东西本身就够不着了。免费的 `lite` 模型也不是出路：`x0` 免的是额度，不是鉴权。随附的 skill 脚本从一个普通 shell 打破这个死锁，读写的是插件用的同一个 store：
+
+```bash
+# 拿每个已存 PAT 打一次真实网关，列出可用的 id。
+node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --pats
+
+# 按 id 或 label 激活一个健康的备用项（不健康者除非 --force 否则拒绝）。
+node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --use-pat=Work
+```
+
+运行中的 opencode 会在**下一个请求**时采纳这次翻转（store 按文件 mtime 重载——无需重启），所以 `--use-pat` 切到一个可用账户就是全部的恢复。`ACCOUNT-INACTIVE` 判定意味着整个账户都停了，因此*同*账户的备用项救不了你；用 `OPENCODE_QODER_PAT` 给另一个账户补一个 PAT。
+
+### 一个死掉的凭证会让你失去什么
+
+档位系统能把一个*超预算的对话*降级路由到免费 `lite`，但前提是得有某个凭证能通过鉴权。两种失效形态：
+
+| 坏掉的东西 | 谁来恢复 |
+| --- | --- |
+| 交换令牌（job token）被吊销/过期 | 插件自动续期 |
+| **PAT 本身**被吊销，或账户订阅过期 | 只能你来——`--use-pat` 切到健康备用项，或 `qoder_pat_add` / 重新 `/connect` 一个新 PAT |
+
+切换到健康备用项就是全部的恢复——`--use-pat` 翻转 store，下一个请求采纳它，你继续在已经活过来的对话里干活。

@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import {
   APICallError,
   type LanguageModelV3,
@@ -30,7 +32,9 @@ import { buildAuthHeaders } from "./cosy.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { readEnv } from "./env.js";
 import { errorMessage, logPlugin } from "./log.js";
+import { opencodeConfigFile } from "./json-store.js";
 import { getModelDefinition, isValidContextTier } from "./model-catalog.js";
+import { listPATs, patStoreFile } from "./pat-store.js";
 import { getRoutingPolicy, resolveRouting } from "./routing-policy.js";
 import { resolveRootSession } from "./session-roots.js";
 import { getSelectedTier, getSessionTier } from "./tier-store.js";
@@ -132,6 +136,52 @@ export function isQoderAuthFailure(error: unknown): boolean {
 }
 
 /**
+ * How to get off a dead credential when talking is what verifies it. With one
+ * account there is no way out but a new login, and the message says so. With
+ * backups in the PAT store there is a second way -- qoder_pat_switch -- and a
+ * third that survives the second being unavailable: a chat call is needed to
+ * run a tool, and a dead credential fails every chat call, including the free
+ * lite model (x0 costs no credits, not no authentication). So the store is
+ * also writable from a bare shell, by path, and the running process reloads it
+ * by mtime. Naming all three is the point of this note; the second one alone
+ * strands a user whose only working session is the one that just errored.
+ */
+function patRecoveryNote(options: QoderProviderOptions): string {
+  let backups: { id: string; label: string }[];
+  try {
+    backups = listPATs()
+      .filter((entry) => !entry.active && entry.pat)
+      .map((entry) => ({ id: entry.id, label: entry.label }));
+  } catch {
+    return "";
+  }
+  if (backups.length === 0) return "";
+  const listed = backups
+    .slice(0, 5)
+    .map((entry) => `${entry.id}${entry.label ? ` ("${entry.label}")` : ""}`)
+    .join(", ");
+  // Name the real script when the skill is installed; otherwise point at the
+  // store file, which any shell can still flip by hand.
+  const script = opencodeConfigFile(join("skills", "qoder-quota", "scripts", "qoder-quota.mjs"));
+  const shell = existsSync(script)
+    ? `from any shell: node ${script} --pats, then --use-pat=<id or label>`
+    : `from any shell: set "active" true on one of those ids in ${patStoreFile()}`;
+  const note =
+    ` The PAT store has ${backups.length} inactive backup(s): ${listed}.` +
+    ` Switch in-chat with qoder_pat_switch(id=...), or -- if no chat works, which is the usual case here --` +
+    ` ${shell}.` +
+    ` A running opencode picks that up on its next request, no restart.`;
+  if (!options.apiKey && !options.personalAccessToken) return note;
+  // The precedence is invisible from the outside: editing the store looks inert
+  // forever when /connect or options.apiKey is what actually signs requests.
+  return (
+    note +
+    ` Caution: this session also has a configured ${options.personalAccessToken ? "personalAccessToken" : "apiKey"},` +
+    ` which outranks the PAT store -- switching stored PATs does nothing until that credential is fixed or removed.`
+  );
+}
+
+/**
  * The final error for a rejection no credential renewal cleared, said as plainly
  * as possible. When the signed uid was the placeholder, that -- not the token's
  * expiry -- is the cause, and it is invisible upstream: the gateway just says
@@ -139,16 +189,32 @@ export function isQoderAuthFailure(error: unknown): boolean {
  * the actionable step is a fresh login, and the message has to be the only place
  * the diagnosis survives.
  */
-function authFailureError(error: unknown, credentials: QoderCredentials): unknown {
-  if (!identityMissing(credentials.userID)) return error;
+function authFailureError(
+  error: unknown,
+  credentials: QoderCredentials,
+  providerOptions: QoderProviderOptions = {},
+): unknown {
+  const note = patRecoveryNote(providerOptions);
+  if (!identityMissing(credentials.userID)) {
+    if (!note) return error;
+    // Mutated in place: a fresh Error would drop the statusCode and response
+    // body that everything downstream (and bug reports) read off an APICallError.
+    if (error instanceof Error) error.message = `${error.message}${note}`;
+    return error;
+  }
   logPlugin("chat: auth rejection with an unresolved account uid -- a placeholder uid was signed");
   return new Error(
     `Qoder rejected this request as "Login expired" and the credential carried no ` +
       `resolvable account uid (userinfo returned nothing, so a placeholder was signed). ` +
-      `Re-run /connect qoder, or check QODER_PERSONAL_ACCESS_TOKEN. ` +
-      `Original error: ${errorMessage(error)}`,
+      `Re-run /connect qoder, or check QODER_PERSONAL_ACCESS_TOKEN.` +
+      note +
+      ` Original error: ${errorMessage(error)}`,
   );
 }
+
+// Exported for tests: the recovery note is the entire payload of this function
+// and every other path into it (retry loops, stream replay) needs a live gateway.
+export const __testAuthFailureError = authFailureError;
 
 function throwQoderApiError(status: number, url: string, body: string): never {
   const message = buildQoderErrorMessage(status, body);
@@ -914,11 +980,11 @@ export class QoderLanguageModel implements LanguageModelV3 {
         };
       } catch (error) {
         if (!isQoderAuthFailure(error) || attempt > 0) {
-          if (isQoderAuthFailure(error)) throw authFailureError(error, current);
+          if (isQoderAuthFailure(error)) throw authFailureError(error, current, this.providerOptions);
           throw error;
         }
         const renewed = await refreshQoderCredentials(current).catch(() => null);
-        if (!renewed) throw authFailureError(error, current);
+        if (!renewed) throw authFailureError(error, current, this.providerOptions);
         logPlugin("chat: HTTP credential rejection -- renewed it and retrying the request once");
         current = renewed;
       }
@@ -1026,7 +1092,7 @@ export class QoderLanguageModel implements LanguageModelV3 {
           // placeholder uid is the likely culprit, in which case the envelope
           // alone would send the user hunting for an expired token.
           if (identityMissing(credentials.userID))
-            finishWithError(authFailureError(rejected.error, credentials));
+            finishWithError(authFailureError(rejected.error, credentials, model.providerOptions));
           else for (const part of rejected.held) controller.enqueue(part);
           controller.close();
           return;
