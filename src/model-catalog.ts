@@ -1,6 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import {
   cosyCredentialsForSigning,
   type QoderProviderOptions,
@@ -11,6 +10,7 @@ import { FETCH_TIMEOUT_MS, QODER_MODEL_LIST_URL, type QoderModelDefinition } fro
 import { buildAuthHeaders } from "./cosy.js";
 import { readEnv } from "./env.js";
 import { fetchWithTimeout, jsonHeaders, readErrorBody } from "./http.js";
+import { opencodeCacheFile } from "./json-store.js";
 import { errorMessage, logPlugin } from "./log.js";
 import { fetchQuotaExhausted, getQuotaExhausted, setQuotaExhausted } from "./quota.js";
 import { QODER_MODELS } from "./static-models.js";
@@ -113,8 +113,9 @@ function cacheTTLMs(): number {
 function diskCachePath(): string {
   const override = readEnv("QODER_MODEL_DISK_CACHE");
   if (override) return override;
-  // Sits next to opencode's own models.dev cache.
-  return join(homedir(), ".cache", "opencode", "opencode-qoder-models.json");
+  // Sits next to opencode's own models.dev cache, under the same
+  // XDG_CACHE_HOME rule opencode uses for it.
+  return opencodeCacheFile("opencode-qoder-models.json");
 }
 
 // The path this module reads at import time and writes on every successful

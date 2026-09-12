@@ -5,17 +5,56 @@ import { readEnv } from "./env.js";
 import { errorMessage, logPlugin } from "./log.js";
 
 // File primitives for the plugin's small JSON state files (PAT store, tier
-// store, routing policy). Each one used to hand-roll the same four things:
-// the XDG config path, a read that treats missing and corrupt as "start
-// empty", a mkdir -p before writing, and pretty JSON. Folding them here means
-// a location change or an atomicity fix lands on every store at once.
+// store, routing policy) and for locating opencode's own files. Each store
+// used to hand-roll the same four things: the config path, a read that treats
+// missing and corrupt as "start empty", a mkdir -p before writing, and pretty
+// JSON. Folding them here means a location change or an atomicity fix lands on
+// every store at once.
 
-// The directory every plugin-side state file lives in, next to opencode's own
-// config. `label` is the module prefix carried into log lines; the failure is
-// reported once here rather than re-typed per store.
+// opencode resolves every XDG base itself, identically on every platform:
+//
+//   config: XDG_CONFIG_HOME || ~/.config      data: XDG_DATA_HOME || ~/.local/share
+//   cache:  XDG_CACHE_HOME || ~/.cache       state: XDG_STATE_HOME || ~/.local/state
+//
+// XDG is a freedesktop spec and Windows sets none of these variables, but
+// opencode has no win32 branch either -- it keeps the same resolution there,
+// so a Windows install really does use %USERPROFILE%\.config\opencode. The
+// plugin must therefore mirror opencode rather than follow the platform's own
+// convention: any file it writes has to be findable by the user's editor and
+// the CLI without a second search path, and any file it reads (auth.json) is
+// written by opencode under this exact rule. Node's path.join() and homedir()
+// handle the separator and the home directory per platform, so nothing else
+// about these paths needs a special case.
+function xdgFile(envName: string, fallback: readonly string[], filename: string): string {
+  return join(readEnv(envName) || join(homedir(), ...fallback), "opencode", filename);
+}
+
+// Config: state the user is expected to edit (routing policy, tier and PAT
+// stores, the static model override).
 export function opencodeConfigFile(filename: string): string {
-  const configDir = readEnv("XDG_CONFIG_HOME") || join(homedir(), ".config");
-  return join(configDir, "opencode", filename);
+  return xdgFile("XDG_CONFIG_HOME", [".config"], filename);
+}
+
+// Data: opencode's own state, read here where the plugin needs to see it
+// (auth.json) or where it keeps an identifier beside the rest.
+export function opencodeDataFile(filename: string): string {
+  return xdgFile("XDG_DATA_HOME", [".local", "share"], filename);
+}
+
+// Cache: disposable, refetched on the next successful live fetch.
+export function opencodeCacheFile(filename: string): string {
+  return xdgFile("XDG_CACHE_HOME", [".cache"], filename);
+}
+
+// The data path as it looked before XDG_DATA_HOME was honoured: $HOME/.local/
+// share/opencode. Only a reader needs this. A store written here while the
+// variable was unset stays put when the variable is later exported, so a path
+// that encodes identity (the machine id, which is a signing input) would
+// otherwise be regenerated at the new location and silently change the
+// fingerprint the server has already seen. Reads fall back to it; writes never
+// do -- the new location is authoritative from the first write onward.
+export function legacyOpencodeDataFile(filename: string): string {
+  return join(join(homedir(), ".local", "share"), "opencode", filename);
 }
 
 // Parses the file, or returns undefined when it is missing, unreadable or

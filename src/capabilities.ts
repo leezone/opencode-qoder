@@ -1,6 +1,4 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import {
   describeTokenShape,
   fetchQoderAccount,
@@ -12,6 +10,7 @@ import {
 import { text } from "./coerce.js";
 import { QODER_PAT_ENV, QODER_VERSION, REFRESH_SKEW_MS } from "./constants.js";
 import { readEnv } from "./env.js";
+import { opencodeDataFile } from "./json-store.js";
 import { errorMessage, logPlugin } from "./log.js";
 import {
   catalogCachePath,
@@ -88,7 +87,7 @@ function toolOptions(explicit?: QoderProviderOptions): QoderProviderOptions {
 // says the credential is absent rather than guessing.
 function readStoredQoderToken(): string {
   try {
-    const file = join(homedir(), ".local", "share", "opencode", "auth.json");
+    const file = opencodeDataFile("auth.json");
     const parsed = JSON.parse(readFileSync(file, "utf8")) as { qoder?: StoredCredential };
     const entry = parsed.qoder;
     if (!entry) return "";

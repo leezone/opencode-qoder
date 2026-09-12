@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { QODER_CLIENT_TYPE, QODER_VERSION } from "./constants.js";
+import { legacyOpencodeDataFile, opencodeDataFile } from "./json-store.js";
 
 const qoderRSAPublicKey = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
@@ -65,13 +66,32 @@ function computeSigPath(urlStr: string): string {
   return sigPath;
 }
 
-export function getMachineId(): string {
-  const paths = [
+// Locations a machine id may live in, most authoritative first:
+//
+//   1. qodercli's own file. If the user has the CLI installed, its id wins, so
+//      the plugin and the CLI sign as the same machine.
+//   2. this plugin's id under opencode's data directory -- XDG_DATA_HOME-aware,
+//      the same rule opencode applies to the directory it writes auth.json into.
+//   3. the path from before the data directory honoured XDG_DATA_HOME, read
+//      only. The id is a signing input, so a user who set the variable after
+//      the file was written keeps their existing id instead of churning to a
+//      fresh one; nothing is ever written here.
+//
+// A miss on all three falls through to a new id, persisted at (2).
+function machineIdCandidates(): { read: string[]; write: string } {
+  const file = opencodeDataFile("qoder-machine-id");
+  const read = [
     join(homedir(), ".qoder", ".auth", "machine_id"),
-    join(homedir(), ".local", "share", "opencode", "qoder-machine-id"),
+    file,
+    legacyOpencodeDataFile("qoder-machine-id"),
   ];
+  return { read: read.filter((path, i) => read.indexOf(path) === i), write: file };
+}
 
-  for (const path of paths) {
+export function getMachineId(): string {
+  const { read, write } = machineIdCandidates();
+
+  for (const path of read) {
     if (!existsSync(path)) continue;
     try {
       const val = readFileSync(path, "utf8").trim();
@@ -81,9 +101,8 @@ export function getMachineId(): string {
 
   const newId = crypto.randomUUID();
   try {
-    const savePath = paths[1];
-    mkdirSync(dirname(savePath), { recursive: true });
-    writeFileSync(savePath, newId, "utf8");
+    mkdirSync(dirname(write), { recursive: true });
+    writeFileSync(write, newId, "utf8");
   } catch {}
   return newId;
 }

@@ -55,7 +55,7 @@ Credit multipliers, context tiers and thinking efforts come from live discovery 
 
 ## Model discovery
 
-The live model list is fetched at startup and refreshed every 15 minutes; when it changes, opencode's catalog reloads automatically. The last live list is cached at `~/.cache/opencode/opencode-qoder-models.json` across restarts. If both live and cache are unavailable, a static fallback table is used.
+The live model list is fetched at startup and refreshed every 15 minutes; when it changes, opencode's catalog reloads automatically. The last live list is cached at `~/.cache/opencode/opencode-qoder-models.json` (honors `XDG_CACHE_HOME`) across restarts. If both live and cache are unavailable, a static fallback table is used.
 
 The static fallback is a prefab JSON file shipped as `models.json` next to the plugin code, holding the current advertised models only. To edit it for a special case, drop your own copy at `~/.config/opencode/qoder-models.json` (honors `XDG_CONFIG_HOME`), or point `QODER_STATIC_MODELS` at any path. Precedence is env → user file → shipped file. Each is a JSON array (or `{"models": [...]}`) of entries with `id`, `name`, `reasoning`, `supportsEffort`, `input`, `contextWindow`, `maxTokens` (and optional `inputWindow` ≤ `contextWindow`); invalid entries are dropped individually so one typo never blanks the table. The live list is authoritative: models it stops advertising are hidden even when offline, so a manually added id shows up only in the fallback path, never overriding a live answer.
 
