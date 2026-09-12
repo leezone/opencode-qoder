@@ -4,12 +4,19 @@ export const PROVIDER_NAME = "Qoder";
 export const QODER_BASE_URL = "https://api3.qoder.sh/";
 export const QODER_OPENAPI_URL = "https://openapi.qoder.sh";
 export const QODER_MANAGE_URL = "https://qoder.com";
+// The centre host owns the refresh_token endpoint. Separated from OPENAPI
+// because the two are different hosts upstream: every job-token endpoint
+// (exchange, userinfo, quota) lives on openapi.qoder.sh, while the OAuth-ish
+// refresh of a device-flow token lives on center.qoder.sh. Reference:
+// pi-provider-qoder's getQoderRefreshURL() = `${centerUrl}/algo/api/v3/user/refresh_token`.
+export const QODER_CENTER_URL = "https://center.qoder.sh";
 
 export const QODER_MODEL_LIST_URL = `${QODER_BASE_URL}algo/api/v2/model/list`;
 export const QODER_QUOTA_URL = `${QODER_OPENAPI_URL}/api/v2/quota/usage`;
 export const QODER_CHAT_URL = `${QODER_BASE_URL}algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
 export const QODER_EXCHANGE_URL = `${QODER_OPENAPI_URL}/api/v1/jobToken/exchange`;
 export const QODER_USERINFO_URL = `${QODER_OPENAPI_URL}/api/v1/userinfo`;
+export const QODER_REFRESH_URL = `${QODER_CENTER_URL}/algo/api/v3/user/refresh_token`;
 
 export const QODER_PAT_ENV = ["QODER_PERSONAL_ACCESS_TOKEN", "QODER_PAT"] as const;
 export const USER_AGENT = "opencode-qoder";
@@ -99,3 +106,10 @@ export type QoderModelDefinition = {
 // The chat endpoint wraps these in its own JSON envelope; the plugin detects
 // them and rewrites the raw HTTP error into a user-facing message.
 export const QODER_ERROR_CODE_QUOTA_EXHAUSTED = "112";
+// "Login expired". NOT a token lifetime: this is what the gateway answers when
+// the identity inside the COSY payload is not the real account uid -- most
+// easily when a placeholder uid was signed because userinfo resolution failed
+// (pi-provider-qoder documents the same failure in resolveQoderIdentity()).
+// Also the code to treat as "the credential this request was signed with is
+// dead", so it is the trigger for invalidating the exchange cache and retrying.
+export const QODER_ERROR_CODE_LOGIN_EXPIRED = "105";

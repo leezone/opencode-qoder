@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
+import { type QoderProviderOptions, resolveQoderCredentials, signingUserID } from "./auth.js";
 import { FETCH_TIMEOUT_MS, QODER_MODEL_LIST_URL, type QoderModelDefinition } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
 import { readEnv } from "./env.js";
@@ -153,7 +153,7 @@ function saveDiskCache(models: DiscoveredModel[]): void {
     mkdirSync(dirname(file), { recursive: true });
     const now = Date.now();
     const persisted = models.map((model) => ({ ...model }));
-    let preservedTiers: Record<string, number> = {};
+    const preservedTiers: Record<string, number> = {};
     try {
       const raw = JSON.parse(readFileSync(file, "utf8")) as {
         version?: unknown;
@@ -192,7 +192,12 @@ function saveDiskCache(models: DiscoveredModel[]): void {
     }
     writeFileSync(
       file,
-      JSON.stringify({ version: DISK_CACHE_VERSION, fetchedAt: now, models: persisted, preservedTiers }),
+      JSON.stringify({
+        version: DISK_CACHE_VERSION,
+        fetchedAt: now,
+        models: persisted,
+        preservedTiers,
+      }),
       "utf8",
     );
   } catch {
@@ -518,9 +523,7 @@ function formatFactor(factor: number): string {
 // "Qwen3.8-Max (0.5x, 1M)", only when it differs from the default window. The
 // label matches qoder's own picker wording ("1M context window").
 function tierLabel(tokens: number): string {
-  return tokens % 1_000_000 === 0
-    ? `${tokens / 1_000_000}M`
-    : `${Math.round(tokens / 1000)}K`;
+  return tokens % 1_000_000 === 0 ? `${tokens / 1_000_000}M` : `${Math.round(tokens / 1000)}K`;
 }
 
 export function displayName(model: DiscoveredModel): string {
@@ -543,7 +546,10 @@ async function fetchModels(options: QoderProviderOptions): Promise<DiscoveredMod
   const headers = jsonHeaders({
     "Accept-Encoding": "identity",
     ...buildAuthHeaders(null, url, {
-      userID: credentials.userID,
+      // Lenient endpoint: the model list accepts a placeholder uid, so a
+      // userinfo outage must not take discovery down with it -- see
+      // signingUserID() in auth.ts.
+      userID: signingUserID(credentials),
       authToken: credentials.access,
       name: credentials.name,
       email: credentials.email,

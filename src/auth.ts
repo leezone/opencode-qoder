@@ -8,12 +8,14 @@ import {
   QODER_EXCHANGE_URL,
   QODER_OPENAPI_URL,
   QODER_PAT_ENV,
+  QODER_REFRESH_URL,
   QODER_USERINFO_URL,
   QODER_VERSION,
   REFRESH_SKEW_MS,
 } from "./constants.js";
 import { getMachineId } from "./cosy.js";
 import { jsonHeaders, readErrorBody } from "./http.js";
+import { errorMessage, logPlugin } from "./log.js";
 import { getActivePatString } from "./pat-store.js";
 
 export interface QoderCredentials {
@@ -29,6 +31,10 @@ export interface QoderCredentials {
 export interface QoderProviderOptions {
   apiKey?: string;
   personalAccessToken?: string;
+  // The pipe-encoded refresh field opencode stores for a device-flow (Browser
+  // Login) credential: `refreshToken|userID|machineID`. Only consumed by the
+  // refresh path; PAT credentials carry their own encoding.
+  refreshToken?: string;
   qoderUserID?: string;
   qoderEmail?: string;
   qoderName?: string;
@@ -80,6 +86,116 @@ export function decodeOAuthRefresh(refresh: string): {
   };
 }
 
+// A credential whose uid never got resolved. The placeholder must stay a
+// DISPLAY fallback: the gateway answers "Login expired" (code 105) to a COSY
+// payload signed with a fake uid, so a signing path that sees this value must
+// resolve the identity first rather than send it. Anything that smells like the
+// placeholder counts as unresolved, including a value that an earlier version
+// persisted into a connection's metadata.
+export function identityUnresolved(userID: string | undefined): boolean {
+  return !userID || userID === QODER_DEFAULT_USER_ID;
+}
+
+type QoderIdentity = { userID: string; email: string; name: string };
+
+// Identity lookups memoize per job token. A conversation that had to resolve
+// its uid once must not re-hit userinfo on every following turn, and a dead
+// token fails resolution forever -- so a miss is memoized too, with a cooldown
+// rather than a final verdict, because the same PAT can be re-exchanged into a
+// token that resolves. Bounded: entries die with their token anyway.
+const identityByToken = new Map<string, { attemptedAt: number; identity: QoderIdentity | null }>();
+const IDENTITY_RETRY_COOLDOWN_MS = 30 * 1000;
+const IDENTITY_CACHE_MAX = 64;
+
+function rememberIdentity(
+  jobToken: string,
+  identity: QoderIdentity | null,
+  attemptedAt = Date.now(),
+): void {
+  if (identityByToken.size >= IDENTITY_CACHE_MAX && !identityByToken.has(jobToken)) {
+    // Oldest-first eviction; Map iteration order is insertion order.
+    const oldest = identityByToken.keys().next().value;
+    if (oldest !== undefined) identityByToken.delete(oldest);
+  }
+  identityByToken.set(jobToken, { attemptedAt, identity });
+}
+
+// The identity a signed request needs, or null when it cannot be had. Unlike
+// fetchQoderUserInfo() this distinguishes "the lookup worked" from "the account
+// record carries an id", because an empty id is exactly the state that produces
+// a 105 and must be retried rather than papered over with a default.
+export async function fetchQoderIdentity(jobToken: string): Promise<QoderIdentity | null> {
+  const memo = identityByToken.get(jobToken);
+  if (memo) {
+    if (memo.identity) return memo.identity;
+    if (Date.now() - memo.attemptedAt < IDENTITY_RETRY_COOLDOWN_MS) return null;
+  }
+
+  const info = await fetchQoderAccount(jobToken);
+  const userID = text(info.id);
+  if (!userID) {
+    rememberIdentity(jobToken, null);
+    return null;
+  }
+  const identity: QoderIdentity = {
+    userID,
+    email: text(info.email),
+    name: text(info.name) || text(info.username),
+  };
+  rememberIdentity(jobToken, identity);
+  return identity;
+}
+
+// Fills in a credential's identity when it is missing, leaving the argument
+// untouched (and the request free to fail loudly) when it cannot be resolved.
+// Every path that signs a request calls this, so the uid that reaches COSY is
+// either the account's real one or the caller is told why there is none.
+export async function ensureQoderIdentity(creds: QoderCredentials): Promise<QoderCredentials> {
+  if (!identityUnresolved(creds.userID)) return creds;
+  const identity = await fetchQoderIdentity(creds.access);
+  if (!identity) return creds;
+  return {
+    ...creds,
+    userID: identity.userID,
+    email: creds.email || identity.email,
+    name: creds.name || identity.name,
+  };
+}
+
+// The uid to put into a signed COSY payload.
+//
+// Upstream is asymmetric about this value, and the asymmetry is why a request
+// cannot simply refuse to sign when the identity is unresolved: the model-list
+// endpoint accepts a placeholder uid (catalog discovery keeps working), while
+// the chat endpoint rejects it with "Login expired" (105). Hard-failing on an
+// unresolved uid would therefore break a working model list over a userinfo
+// outage, which is a worse trade than the status quo.
+//
+// So this returns the real uid when ensureQoderIdentity() got one and the
+// placeholder otherwise -- and callers that can do something better with the
+// distinction check identityUnresolved() themselves, which is exactly what the
+// chat path does to turn a 105 into a diagnosis instead of a raw error blob.
+export function signingUserID(creds: QoderCredentials): string {
+  return identityUnresolved(creds.userID) ? QODER_DEFAULT_USER_ID : creds.userID;
+}
+
+// The auth-failure escape hatch. Without it a credential that the gateway has
+// already rejected -- a revoked job token, or an exchange whose userinfo lookup
+// failed and froze a placeholder identity for the whole TTL -- keeps being
+// served from the per-PAT cache until its local clock lapses, up to ~24h of
+// "Login expired" for a token that a single re-exchange would replace.
+// Keyed by PAT (the exchange cache's key); a passthrough token has no cache
+// entry to drop and simply gets re-resolved by the caller.
+export function invalidateQoderCredentials(pat: string): void {
+  // Read before deleting: the identity memo is keyed by access token, and once
+  // the credential entry is gone that mapping is unrecoverable.
+  const cached = credentialsCache.get(pat);
+  credentialsCache.delete(pat);
+  // The next call exchanges for a new job token, so a "cannot resolve" verdict
+  // recorded against the old one must not survive to shadow it.
+  if (cached && !(cached instanceof Promise)) identityByToken.delete(cached.access);
+}
+
 function getEnvPat(): string {
   for (const key of QODER_PAT_ENV) {
     const value = process.env[key];
@@ -108,17 +224,23 @@ function parseExpiresAt(expiresAt?: string, expiresIn?: number): number {
   return Date.now() + 24 * 60 * 60 * 1000;
 }
 
-// Fallback identity for the profile fields, applied wherever a QoderCredentials
+// Fallback identity for the DISPLAY fields, applied wherever a QoderCredentials
 // is synthesized from a possibly-partial upstream profile. credentialsFromPat(),
-// resolveQoderCredentials() and the device-flow login all needed the same triple;
+// resolveQoderCredentials() and the device-flow login all needed the same pair;
 // it was the copy-paste point, so it is the place a rename used to drift.
+//
+// userID deliberately gets NO default here. It is the field the COSY signature
+// carries as `uid`, and the gateway rejects a placeholder uid with "Login
+// expired" (105) -- so an unresolved uid must stay visibly unresolved and be
+// settled by ensureQoderIdentity(), not silently replaced with a value that
+// then gets signed and memoized for the life of the token.
 export function withProfileDefaults(profile: { userID?: string; email?: string; name?: string }): {
   userID: string;
   email: string;
   name: string;
 } {
   return {
-    userID: profile.userID || QODER_DEFAULT_USER_ID,
+    userID: profile.userID || "",
     email: profile.email || QODER_DEFAULT_EMAIL,
     name: profile.name || QODER_DEFAULT_NAME,
   };
@@ -208,7 +330,18 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
     // encodePatRefresh stores the RAW upstream userID (empty when userinfo was
     // unreachable), while the returned credential carries the defaulted one --
     // so keep the raw profile separate from the applied-defaults one.
-    const rawProfile = await fetchQoderUserInfo(data.token);
+    //
+    // fetchQoderIdentity() rather than fetchQoderUserInfo(): it is the memoized
+    // lookup, so resolveQoderCredentials()'s ensureQoderIdentity() answers from
+    // it instead of fetching userinfo a second time for the same token. Same
+    // endpoint and fields; a null (no usable id) is the same "" uid, only
+    // remembered.
+    const identity = await fetchQoderIdentity(data.token);
+    const rawProfile = {
+      userID: identity?.userID ?? "",
+      email: identity?.email ?? "",
+      name: identity?.name ?? "",
+    };
     const profile = withProfileDefaults(rawProfile);
     const machineID = getMachineId();
     return {
@@ -255,29 +388,141 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
 // credentialsFromPat() (exchange endpoint, memoized per PAT), and anything
 // else is treated as an already-exchanged short-lived job token and passed
 // through as-is -- which is also how the device-flow oauth credential arrives.
+//
+// Both branches then settle the identity. This is the funnel every Qoder call
+// walks through, so it is the one place that can guarantee a signed request
+// carries a real uid rather than the placeholder that gets chat rejected with
+// 105 -- see ensureQoderIdentity(), which memoizes per token and therefore
+// costs a userinfo round trip at most once per credential.
 export async function resolveQoderCredentials(
   options: QoderProviderOptions = {},
 ): Promise<QoderCredentials> {
-  const token = options.personalAccessToken || options.apiKey || getActivePatString() || getEnvPat();
+  const token =
+    options.personalAccessToken || options.apiKey || getActivePatString() || getEnvPat();
   if (!token) {
     throw new Error(
       "Qoder credentials not set. Run `/connect qoder` in opencode or set QODER_PERSONAL_ACCESS_TOKEN.",
     );
   }
 
-  if (token.startsWith("pt-")) return credentialsFromPat(token);
+  if (token.startsWith("pt-")) return ensureQoderIdentity(await credentialsFromPat(token));
 
-  return {
+  return ensureQoderIdentity({
     access: token,
-    refresh: "",
+    refresh: options.refreshToken || "",
     expires: Date.now() + 60 * 60 * 1000,
     ...withProfileDefaults({
-      userID: options.qoderUserID,
+      // A stored connection may still carry the old display placeholder as its
+      // uid (an earlier version persisted it). Treat it as unresolved so
+      // ensureQoderIdentity() settles it instead of signing a fake uid.
+      userID: identityUnresolved(options.qoderUserID) ? "" : options.qoderUserID,
       email: options.qoderEmail,
       name: options.qoderName,
     }),
     machineID: options.qoderMachineID || getMachineId(),
+  });
+}
+
+// PAT-encoded refresh field? credentialsFromPat() writes `pat|<pat>|...` so a
+// stored credential can be told apart from a raw device-flow refresh token.
+export function isPatRefresh(refresh: string): boolean {
+  return refresh.startsWith(`${PAT_REFRESH_PREFIX}|`);
+}
+
+export function decodePatRefresh(refresh: string): {
+  pat: string;
+  jobRefreshToken: string;
+  userID: string;
+  machineID: string;
+} {
+  const parts = refresh.split("|");
+  return {
+    pat: parts[1] || "",
+    jobRefreshToken: parts[2] || "",
+    userID: parts[3] || "",
+    machineID: parts[4] || "",
   };
+}
+
+// Replace a rejected credential. The one recovery both failure modes share --
+// a job token revoked server-side before its stated expiry, and an exchange
+// whose userinfo lookup failed -- is "get a new credential", and which lever
+// that depends on the shape of the stored refresh field:
+//
+//   * PAT-encoded (`pat|<pat>|...`): re-run the exchange. The PAT is long-lived,
+//     so this is the whole story; invalidate first so credentialsFromPat() does
+//     not hand back the same poisoned entry.
+//   * device-flow refresh token: POST it to the refresh endpoint and read a new
+//     job token out of the response. Reference: pi-provider-qoder's
+//     refreshQoderTokenForMode(), which is wired into pi core as the provider's
+//     refreshToken callback -- opencode's plugin API has no such hook, so this
+//     is called from the request path instead.
+//
+// Returns null when there is nothing to refresh from (a bare passthrough token
+// with no refresh field) or the refresh itself failed -- callers surface that
+// as "re-run /connect", never as another silent retry with the dead credential.
+export async function refreshQoderCredentials(
+  creds: QoderCredentials,
+): Promise<QoderCredentials | null> {
+  if (isPatRefresh(creds.refresh)) {
+    const { pat } = decodePatRefresh(creds.refresh);
+    if (!pat) return null;
+    invalidateQoderCredentials(pat);
+    try {
+      const refreshed = await credentialsFromPat(pat);
+      return identityUnresolved(refreshed.userID)
+        ? await ensureQoderIdentity(refreshed)
+        : refreshed;
+    } catch (error) {
+      logRefreshFailure("PAT re-exchange", error);
+      return null;
+    }
+  }
+
+  const { refreshToken, userID, machineID } = decodeOAuthRefresh(creds.refresh);
+  if (!refreshToken) return null;
+
+  try {
+    const res = await fetch(QODER_REFRESH_URL, {
+      method: "POST",
+      headers: openApiHeaders(creds.access),
+      body: JSON.stringify({ refreshToken }),
+    });
+    if (!res.ok) {
+      logRefreshFailure("refresh endpoint", new Error(`${res.status} ${res.statusText}`));
+      return null;
+    }
+    const data = (await res.json()) as QoderTokenResponse;
+    if (!data.token) return null;
+
+    const parsedExpires = data.expires_at ? Date.parse(data.expires_at) : Number.NaN;
+    const expires = Number.isFinite(parsedExpires)
+      ? parsedExpires
+      : Date.now() + (data.expires_in || DEVICE_TOKEN_TTL_SECONDS) * 1000;
+
+    const refreshed: QoderCredentials = {
+      access: data.token,
+      // Upstream may rotate the refresh token; keep the old one if it does not.
+      refresh: encodeOAuthRefresh(data.refresh_token || refreshToken, userID, machineID),
+      expires: expires - REFRESH_SKEW_MS,
+      userID,
+      email: creds.email,
+      name: creds.name,
+      machineID: machineID || creds.machineID,
+    };
+    return identityUnresolved(refreshed.userID) ? await ensureQoderIdentity(refreshed) : refreshed;
+  } catch (error) {
+    logRefreshFailure("refresh endpoint", error);
+    return null;
+  }
+}
+
+// A failed refresh is normally the end of the plugin's recovery options, and
+// the reason it failed is the one thing the user needs to act on. Logged rather
+// than thrown so the caller can still surface its "re-run /connect" verdict
+// without the cause being lost.
+function logRefreshFailure(where: string, error: unknown): void {
+  logPlugin(`auth: refresh failed via ${where} (${errorMessage(error)})`);
 }
 
 export function generatePKCE(): { codeVerifier: string; codeChallenge: string } {

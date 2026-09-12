@@ -11,8 +11,20 @@ import {
   type LanguageModelV3Usage,
   type SharedV3Warning,
 } from "@ai-sdk/provider";
-import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
-import { QODER_CHAT_URL, QODER_ERROR_CODE_QUOTA_EXHAUSTED, USER_AGENT } from "./constants.js";
+import {
+  identityUnresolved as identityMissing,
+  type QoderCredentials,
+  type QoderProviderOptions,
+  refreshQoderCredentials,
+  resolveQoderCredentials,
+  signingUserID,
+} from "./auth.js";
+import {
+  QODER_CHAT_URL,
+  QODER_ERROR_CODE_LOGIN_EXPIRED,
+  QODER_ERROR_CODE_QUOTA_EXHAUSTED,
+  USER_AGENT,
+} from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { readEnv } from "./env.js";
@@ -33,6 +45,45 @@ import { type QoderMessage, type QoderTool, transformPrompt, transformTools } fr
 // ---------------------------------------------------------------------------
 
 type QoderUpstreamBody = { code?: string; message?: string };
+
+/**
+ * An upstream failure that carries Qoder's own error code, from either place
+ * that code can arrive: the HTTP body, or an in-band SSE envelope on a
+ * response whose HTTP status was 200. The distinction matters because the
+ * in-band form -- `{"statusCodeValue":403,"body":"{\"code\":\"105\",...}"}` --
+ * never reaches the HTTP error path, so without this type the one signal that
+ * says "this credential is dead" is thrown away as a plain Error string.
+ */
+export class QoderUpstreamError extends Error {
+  readonly statusCode: number;
+  readonly code: string | undefined;
+  /** True when the identity signed into the COSY payload was a placeholder. */
+  readonly identityUnresolved: boolean;
+
+  constructor(
+    message: string,
+    statusCode: number,
+    code: string | undefined,
+    identityUnresolved = false,
+  ) {
+    super(message);
+    this.name = "QoderUpstreamError";
+    this.statusCode = statusCode;
+    this.code = code;
+    this.identityUnresolved = identityUnresolved;
+  }
+
+  /**
+   * The gateway saying our credential is no longer good: an auth-ish HTTP
+   * status, or its in-band equivalent, or the "Login expired" code on its own.
+   * This is the trigger to drop the cached exchange and get a new credential
+   * rather than replay a dead one -- see QoderLanguageModel.doStream().
+   */
+  get isAuthFailure(): boolean {
+    if (this.code === QODER_ERROR_CODE_LOGIN_EXPIRED) return true;
+    return this.statusCode === 401 || this.statusCode === 403;
+  }
+}
 
 function parseQoderUpstreamBody(text: string): QoderUpstreamBody | undefined {
   try {
@@ -57,10 +108,45 @@ function buildQoderErrorMessage(status: number, body: string): string {
   if (parsed?.code === QODER_ERROR_CODE_QUOTA_EXHAUSTED) {
     return "Qoder credits exhausted — free quota used up. Upgrade at https://qoder.com/pricing";
   }
+  if (parsed?.code === QODER_ERROR_CODE_LOGIN_EXPIRED) {
+    // Names the failure in actionable terms but keeps the upstream wording
+    // verbatim, so a user searching for the message they saw finds this.
+    return `Qoder rejected the credential — ${parsed.message || "Login expired"} (code 105)`;
+  }
   if (parsed?.code && parsed?.message) {
     return `Qoder API error (code ${parsed.code}): ${parsed.message}`;
   }
   return `Qoder API error ${status}`;
+}
+
+// Whether an arbitrary thrown value is the gateway rejecting our credential.
+// Both shapes of that rejection matter: an HTTP 401/403 (an APICallError from
+// throwQoderApiError) and the in-band envelope on a 200 response (a
+// QoderUpstreamError) -- the latter is the one that actually fires for "Login
+// expired", because the chat endpoint wraps the 403 inside an SSE frame.
+export function isQoderAuthFailure(error: unknown): boolean {
+  if (error instanceof QoderUpstreamError) return error.isAuthFailure;
+  if (error instanceof APICallError) return error.statusCode === 401 || error.statusCode === 403;
+  return false;
+}
+
+/**
+ * The final error for a rejection no credential renewal cleared, said as plainly
+ * as possible. When the signed uid was the placeholder, that -- not the token's
+ * expiry -- is the cause, and it is invisible upstream: the gateway just says
+ * "Login expired". The renewal path has already been tried and failed here, so
+ * the actionable step is a fresh login, and the message has to be the only place
+ * the diagnosis survives.
+ */
+function authFailureError(error: unknown, credentials: QoderCredentials): unknown {
+  if (!identityMissing(credentials.userID)) return error;
+  logPlugin("chat: auth rejection with an unresolved account uid -- a placeholder uid was signed");
+  return new Error(
+    `Qoder rejected this request as "Login expired" and the credential carried no ` +
+      `resolvable account uid (userinfo returned nothing, so a placeholder was signed). ` +
+      `Re-run /connect qoder, or check QODER_PERSONAL_ACCESS_TOKEN. ` +
+      `Original error: ${errorMessage(error)}`,
+  );
 }
 
 function throwQoderApiError(status: number, url: string, body: string): never {
@@ -412,7 +498,7 @@ function resolveReasoningEffort(
 function resolveRequestRoute(
   modelID: string,
   options: LanguageModelV3CallOptions,
-): { modelID: string; tier: number | undefined; root: string; agent: string } {
+): { modelID: string; tier: number | undefined; root: string; agent: string; session: string } {
   let agent = "";
   let qoderSession = "";
   let nativeSession = "";
@@ -447,7 +533,7 @@ function resolveRequestRoute(
       `route-probe: headers=${JSON.stringify(Object.keys(options.headers ?? {}))} agent=${agent === "" ? "?" : agent} session=${sessionID === "" ? "?" : sessionID} root=${root === "" ? "?" : root}`,
     );
   }
-  return { modelID: decision.modelID, tier, root, agent };
+  return { modelID: decision.modelID, tier, root, agent, session: sessionID };
 }
 
 let routeProbeLogged = false;
@@ -455,7 +541,7 @@ let routeProbeLogged = false;
 function buildRequestBody(
   modelID: string,
   options: LanguageModelV3CallOptions,
-  userID: string,
+  sessionUID: string,
 ): { body: Record<string, unknown>; warnings: SharedV3Warning[] } {
   const route = resolveRequestRoute(modelID, options);
   modelID = route.modelID;
@@ -475,7 +561,25 @@ function buildRequestBody(
     maxTokens = options.maxOutputTokens;
 
   const recordID = stableChatRecordID(modelID, transformed.messages, tools, maxTokens);
-  const sessionID = stableHash("qoder-session", userID, modelID);
+  // session_id is upstream's cache-affinity key, so it must be stable within a
+  // conversation and distinct across conversations. Both reference clients
+  // (pi-provider-qoder's stream.ts, qoder-bridge's requestSessionID) combine a
+  // stable per-user/model prefix with a per-conversation id, falling back to a
+  // random id when no conversation id is available -- and for the same reason:
+  // the gateway keeps prompt-cache state under it.
+  //
+  // The old code used the prefix ALONE, which was constant for a given
+  // user+model, so every conversation in the process -- plus every subagent --
+  // shared one upstream session and its cache. opencode's own session id
+  // (X-Session-Id, or X-Qoder-Session for a subagent's) arrives on the request
+  // headers and is the per-conversation part. Without it (a bare library use,
+  // or a caller that strips headers) a fresh UUID is strictly better than a
+  // shared constant: cache misses, but no cross-talk.
+  const sessionPrefix = stableHash("qoder-session", sessionUID, modelID);
+  const sessionID =
+    route.session === ""
+      ? `${sessionPrefix}-${crypto.randomUUID()}`
+      : `${sessionPrefix}-${route.session}`;
   const parameters: Record<string, unknown> = { max_tokens: maxTokens };
   if (typeof options.temperature === "number") parameters.temperature = options.temperature;
   if (typeof options.topP === "number") parameters.top_p = options.topP;
@@ -520,7 +624,9 @@ function buildRequestBody(
   } else if (selectedTier !== undefined) {
     // Asked for a tier this model does not advertise: a stale store value or a
     // manual-file mistake. Silently falling back beats a gateway 400.
-    logPlugin(`tier: ${modelID} wanted ${selectedTier} but it is not advertised -> gateway default`);
+    logPlugin(
+      `tier: ${modelID} wanted ${selectedTier} but it is not advertised -> gateway default`,
+    );
   }
 
   return {
@@ -604,7 +710,16 @@ function parseSSELine(line: string): QoderChunk | undefined {
   // judge the envelope on its merits).
   const status = envelope.statusCodeValue;
   if (typeof status === "number" && status !== 0 && status !== 200) {
-    throw new Error(`Upstream status ${status}: ${envelope.body}`);
+    // Thrown as a typed error, not a string: this envelope is how the chat
+    // endpoint reports "Login expired" (403/105) -- over an HTTP 200 -- and the
+    // request path needs the code to know that its credential, not the
+    // conversation, is what the gateway rejected.
+    const body = envelope.body ?? "";
+    throw new QoderUpstreamError(
+      `${buildQoderErrorMessage(status, body)} [upstream status ${status}]`,
+      status,
+      parseQoderUpstreamBody(body)?.code,
+    );
   }
   if (!envelope.body || envelope.body === "[DONE]") return undefined;
   try {
@@ -680,31 +795,31 @@ export class QoderLanguageModel implements LanguageModelV3 {
     };
   }
 
-  async doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
-    const credentials = await resolveQoderCredentials(this.providerOptions);
-    const { body, warnings } = buildRequestBody(this.modelId, options, credentials.userID);
+  /**
+   * One chat POST and its parsed stream. Throws for an HTTP-level failure,
+   * exactly as the single-attempt version of this method did; an in-band
+   * envelope failure surfaces later, as an "error" part on the stream.
+   */
+  private async openAttempt(
+    credentials: QoderCredentials,
+    options: LanguageModelV3CallOptions,
+    abortController: AbortController,
+    detachAbort: () => void,
+  ): Promise<LanguageModelV3StreamResult> {
+    const { body, warnings } = buildRequestBody(this.modelId, options, signingUserID(credentials));
     const bodyBytes = Buffer.from(JSON.stringify(body));
     const encodedBody = qoderEncodeBody(bodyBytes);
     const encodedBytes = Buffer.from(encodedBody, "utf8");
     const headers = buildAuthHeaders(encodedBytes, QODER_CHAT_URL, {
-      userID: credentials.userID,
+      // signingUserID(), not credentials.userID: an unresolved uid must not
+      // crash the request here (cosy rejects an empty one) -- the uid's absence
+      // is reported alongside a 105 instead. See signingUserID() in auth.ts.
+      userID: signingUserID(credentials),
       authToken: credentials.access,
       name: credentials.name,
       email: credentials.email,
       machineID: credentials.machineID,
     });
-
-    const abortController = new AbortController();
-    // detachAbort exists because the listener outlives doStream(): the external
-    // signal may be opencode's long-lived request signal, reused across many
-    // model calls, and a listener added per call would accumulate on it. It is
-    // removed however this exchange ends -- fetch failure, HTTP error, or a
-    // fully consumed stream (see responseToStream's finally).
-    const signal = options.abortSignal;
-    const abort = () => abortController.abort(signal?.reason);
-    if (signal?.aborted) abort();
-    else signal?.addEventListener("abort", abort, { once: true });
-    const detachAbort = () => signal?.removeEventListener("abort", abort);
 
     let response: Response;
     try {
@@ -734,12 +849,209 @@ export class QoderLanguageModel implements LanguageModelV3 {
       throwQoderApiError(response.status, QODER_CHAT_URL, errText);
     }
 
-    const stream = this.responseToStream(response, warnings, detachAbort);
     return {
-      stream,
+      stream: this.responseToStream(response, warnings, detachAbort),
       request: { body },
       response: { headers: Object.fromEntries(response.headers.entries()) },
     };
+  }
+
+  async doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
+    const abortController = new AbortController();
+    // detachAbort exists because the listener outlives doStream(): the external
+    // signal may be opencode's long-lived request signal, reused across many
+    // model calls, and a listener added per call would accumulate on it. It is
+    // removed however this exchange ends -- fetch failure, HTTP error, or a
+    // fully consumed stream (see responseToStream's finally).
+    const signal = options.abortSignal;
+    const abort = () => abortController.abort(signal?.reason);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    const detachAbort = () => signal?.removeEventListener("abort", abort);
+
+    const resolved = await resolveQoderCredentials(this.providerOptions);
+    // Two rejection shapes, two recovery sites, one policy. A rejection that
+    // arrives as an HTTP status is settled here, before a stream exists (see
+    // openWithHttpRetry); one that arrives inside the body can only be seen
+    // while it is consumed (see replayOnAuthFailure).
+    const { credentials, opened } = await this.openWithHttpRetry(
+      resolved,
+      options,
+      abortController,
+      detachAbort,
+    );
+    return {
+      ...opened,
+      stream: this.replayOnAuthFailure(
+        opened.stream,
+        credentials,
+        options,
+        abortController,
+        detachAbort,
+      ),
+    };
+  }
+
+  /**
+   * openAttempt() once, and again after renewing the credential if the gateway
+   * answered with a rejection that a new credential can clear.
+   *
+   * Retrying at this point is always safe: nothing has been forwarded to the
+   * consumer because no stream exists yet. The in-band case cannot claim that,
+   * which is why its replay is gated on "no content emitted".
+   */
+  private async openWithHttpRetry(
+    credentials: QoderCredentials,
+    options: LanguageModelV3CallOptions,
+    abortController: AbortController,
+    detachAbort: () => void,
+  ): Promise<{
+    credentials: QoderCredentials;
+    opened: LanguageModelV3StreamResult;
+  }> {
+    let current = credentials;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return {
+          credentials: current,
+          opened: await this.openAttempt(current, options, abortController, detachAbort),
+        };
+      } catch (error) {
+        if (!isQoderAuthFailure(error) || attempt > 0) {
+          if (isQoderAuthFailure(error)) throw authFailureError(error, current);
+          throw error;
+        }
+        const renewed = await refreshQoderCredentials(current).catch(() => null);
+        if (!renewed) throw authFailureError(error, current);
+        logPlugin("chat: HTTP credential rejection -- renewed it and retrying the request once");
+        current = renewed;
+      }
+    }
+  }
+
+  /**
+   * Forwards a chat stream, replaying the request once -- with a renewed
+   * credential -- if upstream rejects it as an auth failure before any content
+   * reached the consumer.
+   *
+   * Why the retry lives here rather than in doStream: the rejection this is
+   * about does not arrive as an HTTP status. The chat endpoint answers 200 and
+   * wraps the real failure in an SSE envelope
+   * (`{"statusCodeValue":403,"body":"{\"code\":\"105\",\"message\":\"Login expired\"}"}`),
+   * so it surfaces as an "error" part while the stream is being consumed --
+   * long after doStream returned. The credential that produced it is also the
+   * thing that has to change: an exchanged job token revoked server-side, or an
+   * exchange whose userinfo lookup failed and left a placeholder uid to be
+   * signed (Qoder reads that as "Login expired"). Both are cured by a new
+   * credential, and nothing else.
+   *
+   * The replay is gated on "nothing forwarded yet" because a partially rendered
+   * answer cannot be undone: replaying mid-stream would splice two answers into
+   * one assistant message. Held-back parts are replayed verbatim when there is
+   * no recovery, so the consumer still sees the original error and its finish.
+   */
+  private replayOnAuthFailure(
+    stream: ReadableStream<LanguageModelV3StreamPart>,
+    credentials: QoderCredentials,
+    options: LanguageModelV3CallOptions,
+    abortController: AbortController,
+    detachAbort: () => void,
+  ): ReadableStream<LanguageModelV3StreamPart> {
+    const model = this;
+    return new ReadableStream<LanguageModelV3StreamPart>({
+      async start(controller) {
+        // Consumes `source`, forwarding parts to the consumer. Returns the parts
+        // held back from an in-band auth rejection (the "error" part and
+        // whatever follows it), or null when the stream ended for any other
+        // reason -- including a normal finish, or a non-auth error, which are
+        // forwarded untouched.
+        const pump = async (
+          source: ReadableStream<LanguageModelV3StreamPart>,
+          mayRetry: boolean,
+        ): Promise<{ held: LanguageModelV3StreamPart[]; error: unknown } | null> => {
+          const reader = source.getReader();
+          let held: LanguageModelV3StreamPart[] | null = null;
+          let authError: unknown;
+          // Anything past "stream-start" that reached the consumer cannot be
+          // taken back, and a replay would append a second answer to the same
+          // assistant message. Disables the retry rather than the forwarding.
+          let forwarded = false;
+          try {
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (value === undefined) continue;
+              if (held) {
+                held.push(value);
+                continue;
+              }
+              if (
+                mayRetry &&
+                !forwarded &&
+                value.type === "error" &&
+                isQoderAuthFailure(value.error)
+              ) {
+                authError = value.error;
+                held = [value];
+                continue;
+              }
+              if (value.type !== "stream-start") forwarded = true;
+              controller.enqueue(value);
+            }
+          } finally {
+            if (held) await reader.cancel().catch(() => {});
+            reader.releaseLock();
+          }
+          return held ? { held, error: authError } : null;
+        };
+
+        const finishWithError = (error: unknown): void => {
+          controller.enqueue({
+            type: "error",
+            error: error instanceof Error ? error : new Error(String(error)),
+          });
+          controller.enqueue({
+            type: "finish",
+            finishReason: { unified: "error", raw: undefined },
+            usage: usageFromQoder(),
+            providerMetadata: { qoder: {} },
+          });
+        };
+
+        const rejected = await pump(stream, true);
+        if (!rejected) {
+          controller.close();
+          return;
+        }
+
+        const renewed = await refreshQoderCredentials(credentials).catch(() => null);
+        if (!renewed) {
+          // Nothing left to try. The held parts go out verbatim unless the
+          // placeholder uid is the likely culprit, in which case the envelope
+          // alone would send the user hunting for an expired token.
+          if (identityMissing(credentials.userID))
+            finishWithError(authFailureError(rejected.error, credentials));
+          else for (const part of rejected.held) controller.enqueue(part);
+          controller.close();
+          return;
+        }
+
+        logPlugin(
+          "chat: credential rejected upstream -- renewed it and replaying the request once",
+        );
+        try {
+          const replay = await model.openAttempt(renewed, options, abortController, detachAbort);
+          // mayRetry: false -- one replay is the whole policy. A second rejection
+          // means the renewed credential is not the problem, and retrying again
+          // would only loop.
+          const again = await pump(replay.stream, false);
+          if (again) for (const part of again.held) controller.enqueue(part);
+        } catch (error) {
+          finishWithError(error);
+        }
+        controller.close();
+      },
+    });
   }
 
   private responseToStream(
