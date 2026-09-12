@@ -100,8 +100,14 @@ function readPolicyFile(): { policy: RoutingPolicy; mtimeMs: number } {
   try {
     mtimeMs = statSync(path).mtimeMs;
   } catch (error) {
-    // Missing (the normal fresh state) or unreadable -- say so and default.
-    logPlugin(`routing-policy: no readable policy at ${path} (${errorMessage(error)})`);
+    // A missing file is the normal fresh state and stays quiet, exactly like
+    // readJsonFile() below treats one: readPolicyFile() runs on every chat
+    // request, so logging it would bury the diagnostics the log exists to
+    // provide. Only a stat that fails on an existing path (EACCES, ELOOP) is
+    // worth a line.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      logPlugin(`routing-policy: cannot stat ${path} (${errorMessage(error)})`);
+    }
     return { policy: sanitize(null), mtimeMs: -1 };
   }
   const previous = cached();

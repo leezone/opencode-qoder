@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -39,6 +39,25 @@ describe("routing-policy", () => {
   describe("store", () => {
     it("falls back to the built-in defaults without a file", () => {
       expect(getRoutingPolicy()).toEqual(DEFAULT_ROUTING_POLICY);
+    });
+
+    it("stays silent when the policy file is absent", () => {
+      // readPolicyFile() runs on every chat request. A missing file is the
+      // normal fresh state, so it must not log -- otherwise anyone who turns
+      // on OPENCODE_QODER_LOG_FILE gets one line per request forever. The log
+      // target is read per call, so pointing it at a fresh path and asserting
+      // nothing was written is enough.
+      const savedLog = process.env.OPENCODE_QODER_LOG_FILE;
+      const logFile = join(dir, "plugin.log");
+      process.env.OPENCODE_QODER_LOG_FILE = logFile;
+      try {
+        expect(getRoutingPolicy()).toEqual(DEFAULT_ROUTING_POLICY);
+        expect(getRoutingPolicy()).toEqual(DEFAULT_ROUTING_POLICY);
+      } finally {
+        if (savedLog === undefined) delete process.env.OPENCODE_QODER_LOG_FILE;
+        else process.env.OPENCODE_QODER_LOG_FILE = savedLog;
+      }
+      expect(existsSync(logFile)).toBe(false);
     });
 
     it("persists a merged patch and re-reads it from disk cold", () => {
