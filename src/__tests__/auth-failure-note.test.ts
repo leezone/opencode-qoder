@@ -104,11 +104,9 @@ describe("authFailureError recovery note", () => {
     addPAT(ALPHA, "Primary");
     addPAT(BETA, "Backup");
     const err = new Error("rejected");
-    const out = __testAuthFailureError(
-      err,
-      credential("real-uid"),
-      { personalAccessToken: ALPHA },
-    ) as Error;
+    const out = __testAuthFailureError(err, credential("real-uid"), {
+      personalAccessToken: ALPHA,
+    }) as Error;
     expect(out.message).toMatch(/outranks the PAT store/);
     expect(out.message).toMatch(/personalAccessToken/);
   });

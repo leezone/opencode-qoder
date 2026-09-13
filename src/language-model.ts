@@ -31,8 +31,8 @@ import {
 import { buildAuthHeaders } from "./cosy.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { readEnv } from "./env.js";
-import { errorMessage, logPlugin } from "./log.js";
 import { opencodeConfigFile } from "./json-store.js";
+import { errorMessage, logPlugin } from "./log.js";
 import { getModelDefinition, isValidContextTier } from "./model-catalog.js";
 import { listPATs, patStoreFile } from "./pat-store.js";
 import { getRoutingPolicy, resolveRouting } from "./routing-policy.js";
@@ -980,7 +980,8 @@ export class QoderLanguageModel implements LanguageModelV3 {
         };
       } catch (error) {
         if (!isQoderAuthFailure(error) || attempt > 0) {
-          if (isQoderAuthFailure(error)) throw authFailureError(error, current, this.providerOptions);
+          if (isQoderAuthFailure(error))
+            throw authFailureError(error, current, this.providerOptions);
           throw error;
         }
         const renewed = await refreshQoderCredentials(current).catch(() => null);

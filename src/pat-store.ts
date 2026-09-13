@@ -1,6 +1,6 @@
 import { statSync } from "node:fs";
-import { errorMessage, logPlugin } from "./log.js";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
+import { errorMessage, logPlugin } from "./log.js";
 import { readShared, writeShared } from "./shared-state.js";
 
 // Multi-PAT storage: lets users store several Qoder accounts and switch between
@@ -25,6 +25,13 @@ export interface StoredPAT {
   pat: string;
   email?: string;
   active: boolean;
+  // True only when the user CHOSE this entry (qoder_pat_switch). Separates an
+  // explicit pick from whatever addPAT auto-activated as a side effect, so
+  // credential resolution can keep a passive single credential (the key file,
+  // or the apiKey option) above the store and the user's deliberate choice
+  // above that -- see the precedence table in auth.ts. Cleared by
+  // followConfig() to hand control back to the configured credential.
+  selected?: boolean;
 }
 
 interface PATStoreData {
@@ -120,7 +127,8 @@ function isValidEntry(value: unknown): value is StoredPAT {
     typeof entry.id === "string" &&
     typeof entry.label === "string" &&
     typeof entry.pat === "string" &&
-    typeof entry.active === "boolean"
+    typeof entry.active === "boolean" &&
+    (entry.selected === undefined || typeof entry.selected === "boolean")
   );
 }
 
@@ -200,8 +208,9 @@ export function removePAT(id: string): boolean {
   return true;
 }
 
-// Switch the active PAT to the entry with the given ID. Sets active=false on
-// all other entries. Returns true if the ID was found and switched.
+// Switch the active PAT to the entry with the given ID, marking it as the
+// user's explicit choice. Sets active/selected=false on all other entries.
+// Returns true if the ID was found and switched.
 export function switchPAT(id: string): boolean {
   const store = loadStore();
   const target = store.entries.find((e) => e.id === id);
@@ -209,10 +218,40 @@ export function switchPAT(id: string): boolean {
 
   for (const entry of store.entries) {
     entry.active = entry.id === id;
+    entry.selected = entry.id === id;
   }
   saveStore();
   logPlugin(`pat-store: switched to ${id} (${target.label})`);
   return true;
+}
+
+// Returns the raw PAT string of the entry the user explicitly selected (and
+// that is still active), or undefined when nobody has switched. This is what
+// outranks a passive configured credential in the resolution chain; the
+// auto-activated first import does NOT set it (see StoredPAT.selected).
+export function getSelectedPatString(): string | undefined {
+  const entry = loadStore().entries.find((e) => e.active && e.selected);
+  return entry?.pat;
+}
+
+// Hand authentication back to the configured credential (key file / apiKey
+// option) by clearing every explicit selection. The `active` flag is left
+// alone: it still names the entry the store layer falls back to. Returns
+// whether anything changed.
+export function followConfig(): boolean {
+  const store = loadStore();
+  let changed = false;
+  for (const entry of store.entries) {
+    if (entry.selected) {
+      entry.selected = false;
+      changed = true;
+    }
+  }
+  if (changed) {
+    saveStore();
+    logPlugin("pat-store: following the configured credential (selection cleared)");
+  }
+  return changed;
 }
 
 // Update the label or email of an existing entry. Returns true if found.

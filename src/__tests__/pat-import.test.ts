@@ -3,11 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { writeJsonFile } from "../json-store.js";
-import {
-  importPATsFromEnv,
-  maybeImportPATsFromEnv,
-  parseImportValue,
-} from "../pat-import.js";
+import { importPATsFromEnv, maybeImportPATsFromEnv, parseImportValue } from "../pat-import.js";
 import { invalidateStore, listPATs } from "../pat-store.js";
 
 // A valid-looking PAT only has to survive patID()'s slice + the pt- shape test.

@@ -16,8 +16,10 @@ import {
 } from "./constants.js";
 import { type CosyCredentials, getMachineId } from "./cosy.js";
 import { jsonHeaders, readErrorBody } from "./http.js";
+import { keyFileToken } from "./key-file.js";
 import { errorMessage, logPlugin } from "./log.js";
-import { getActivePatString } from "./pat-store.js";
+import { isImportListValue } from "./pat-import.js";
+import { getActivePatString, getSelectedPatString } from "./pat-store.js";
 
 export interface QoderCredentials {
   access: string;
@@ -389,23 +391,33 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
 
 // The credential funnel: every code path that talks to Qoder ends here, which
 // makes this the right place to write down the token precedence it applies.
-// Layers 1-3 are assembled by the callers (index.ts builds the options bag;
-// see discoveryOptions() there); layers 4-6 are applied below.
+// Layers 1-4 are assembled by the callers (index.ts builds the options bag;
+// see discoveryOptions() there); layers 5-8 are applied below.
 //
 // Token precedence, highest first:
 //   1. personalAccessToken option -- explicit, rarely set, but wins over
 //      everything when present (checked first below);
-//   2. connection credential -- what `/connect qoder` stored (a PAT or an
+//   2. explicit store selection -- the entry the user last passed to
+//      qoder_pat_switch (getSelectedPatString). A deliberate act outranks
+//      passive configuration; the auto-activated first import does NOT count;
+//   3. connection credential -- what `/connect qoder` stored (a PAT or an
 //      oauth access token), resolved by authOptionsFromV2Connection() or the
 //      legacy auth loader;
-//   3. plugin options apiKey -- ctx.options / the provider options in
+//   4. plugin options apiKey -- ctx.options / the provider options in
 //      opencode.json, already substituted from `{file:...}` by the time the
-//      legacy config hook runs;
-//   4. shared apiKey -- the token the legacy config hook published over
-//      globalThis for the v2 instance, which cannot see (2)/(3) itself;
-//   5. active PAT from pat-store -- the currently selected multi-account entry
-//      from ~/.config/opencode/qoder-pats.json (getActivePatString);
-//   6. environment -- QODER_PERSONAL_ACCESS_TOKEN, then QODER_PAT (getEnvPat).
+//      legacy config hook runs. An apiKey that parses as a PAT LIST (a config
+//      pointing at a multi-token seed file) is importer input, not a bearer
+//      token, and is skipped here;
+//   5. shared apiKey -- the token the legacy config hook published over
+//      globalThis for the v2 instance, which cannot see (3)/(4) itself;
+//   6. key file, single form -- the token inside ~/.qoderkey_pat (or the
+//      configured keyFile path) when it holds exactly one credential
+//      (keyFileToken); the plugin-owned replacement for option (4), so the
+//      file's location never has to appear in config. A LIST in that file is
+//      consumed by the importer instead and contributes no token here;
+//   7. active PAT from pat-store -- the currently selected multi-account
+//      entry from ~/.config/opencode/qoder-pats.json (getActivePatString);
+//   8. environment -- QODER_PERSONAL_ACCESS_TOKEN, then QODER_PAT (getEnvPat).
 //
 // Once a token is in hand the shape decides the path: a `pt-` prefix routes to
 // credentialsFromPat() (exchange endpoint, memoized per PAT), and anything
@@ -420,8 +432,14 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
 export async function resolveQoderCredentials(
   options: QoderProviderOptions = {},
 ): Promise<QoderCredentials> {
+  const apiKey = options.apiKey && !isImportListValue(options.apiKey) ? options.apiKey : "";
   const token =
-    options.personalAccessToken || options.apiKey || getActivePatString() || getEnvPat();
+    options.personalAccessToken ||
+    getSelectedPatString() ||
+    apiKey ||
+    keyFileToken() ||
+    getActivePatString() ||
+    getEnvPat();
   if (!token) {
     throw new Error(
       "Qoder credentials not set. Run `/connect qoder` in opencode or set QODER_PERSONAL_ACCESS_TOKEN.",

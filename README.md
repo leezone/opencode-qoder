@@ -123,16 +123,38 @@ After changing the plugin config, quit and restart opencode. Plugins and provide
 
 ## Multiple accounts
 
-Several Qoder accounts can be stored at once and switched at runtime. The store is `~/.config/opencode/qoder-pats.json` (honours `XDG_CONFIG_HOME`), written `0600`; one entry is active and signs every request until you switch. Manage it from the conversation with `qoder_pat_add`, `qoder_pat_list`, `qoder_pat_switch`, `qoder_pat_remove`.
+The plugin owns its credential file: `~/.qoderkey_pat` (override with the provider option `keyFile` or the env var `OPENCODE_QODER_KEY_FILE`; `none` disables the layer). No `apiKey: "{file:...}"` indirection in `opencode.jsonc` is needed — the plugin reads the file itself, once at startup and every 60 seconds. The same grammar decides the file's role:
 
-To seed the store without any tool call (a fresh box, a CI runner), set the import variable to a comma- or semicolon-separated list:
+- **A lone token** → your credential. It signs exactly like the old `{file:...}` option did and outranks everything below an explicit switch.
+- **A list** (`,`/`;`/newline-separated, or the `OPENCODE_QODER_PAT=...` assignment form) → a **seed import**: each unseen `pt-` segment is added to the store (the first activates an empty store), after which the store — not the file — authenticates requests.
+
+Detection is mtime-based, so the steady cost of the periodic check is one stat, and editing the file lands on the next tick without a restart.
+
+The store is `~/.config/opencode/qoder-pats.json` (honours `XDG_CONFIG_HOME`), written `0600`. It is only ever created by real input — a list-form key file, the env import, or `qoder_pat_add` — never by placeholder data. Manage it from the conversation with `qoder_pat_add`, `qoder_pat_list`, `qoder_pat_switch`, `qoder_pat_remove`.
+
+To seed it without any file at all (a fresh box, a CI runner), set the import variable to a comma- or semicolon-separated list:
 
 ```bash
 export OPENCODE_QODER_PAT="pt-aaa,pt-bbb"
 opencode
 ```
 
-This is a one-time **import**, not a lookup layer: at startup each unseen `pt-` segment is added (the first activates an empty store), after which the store — not the variable — authenticates requests. `OPENCODE_QODER_PAT` is deliberately separate from `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`, so it never collides with the official Qoder CLI (those stay single-PAT, unchanged). Unset it once imported so the tokens do not linger in child-process environments.
+This is likewise a one-time **import**, not a lookup layer. `OPENCODE_QODER_PAT` is deliberately separate from `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`, so it never collides with the official Qoder CLI (those stay single-PAT, unchanged). Unset it once imported so the tokens do not linger in child-process environments.
+
+### Who signs a request
+
+Highest first:
+
+| # | Layer | Where it comes from |
+| --- | --- | --- |
+| 1 | `personalAccessToken` option | provider config in `opencode.jsonc` |
+| 2 | **Explicit selection** | `qoder_pat_switch <id>` — outranks all passive config until cleared |
+| 3 | Connection credential / `apiKey` option | `/connect` or config; list-form values are skipped (they are importer input, not a bearer token) |
+| 4 | Key-file lone token | `~/.qoderkey_pat` holding exactly one token |
+| 5 | Store active entry | auto-activated on first import; flipped by `qoder_pat_switch` / `--use-pat` |
+| 6 | `QODER_PERSONAL_ACCESS_TOKEN` / `QODER_PAT` | env, unchanged from the official CLI |
+
+The table encodes the compatibility rule: **a single key has the highest priority** (rows 1–4 beat the store, just as the old `{file:...}` config did) — but a **deliberate act outranks passive config**: after `qoder_pat_switch`, that choice signs everything even while the key file still holds a token. `qoder_pat_switch` with no id clears the selection and hands authority back to the file.
 
 ### Recovery when no chat works
 

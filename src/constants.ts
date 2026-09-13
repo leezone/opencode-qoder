@@ -29,6 +29,18 @@ export const QODER_PAT_ENV = ["QODER_PERSONAL_ACCESS_TOKEN", "QODER_PAT"] as con
 // CLI variable: QODER_PERSONAL_ACCESS_TOKEN stays single-PAT and
 // official-CLI-compatible, exactly as before.
 export const QODER_PAT_IMPORT_ENV = "OPENCODE_QODER_PAT";
+// The seed key file: the plugin-owned replacement for opencode's
+// `{file:...}` apiKey option, so the file's LOCATION never has to appear in
+// config (the option is resolved by opencode before the plugin sees it, which
+// is why an absolute path was the only spelling there). Default
+// `~/.qoderkey_pat`, resolved with homedir() and therefore portable; override
+// with the `keyFile` provider option or this env var, disable with "none".
+// The grammar decides the role (classifyImportValue in pat-import.ts): a bare
+// single token is a credential; a list (`,`/`;`/newline, or an
+// `OPENCODE_QODER_PAT=` assignment) seeds the pat-store exactly like the env
+// import above does -- except the file is live, re-read when its mtime moves.
+export const QODER_KEY_FILE_ENV = "OPENCODE_QODER_KEY_FILE";
+export const QODER_KEY_FILE_DEFAULT = ".qoderkey_pat";
 export const USER_AGENT = "opencode-qoder";
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cache_read: 0, cache_write: 0 });

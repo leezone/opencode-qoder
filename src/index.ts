@@ -30,6 +30,7 @@ import {
   ZERO_COST,
 } from "./constants.js";
 import { getMachineId } from "./cosy.js";
+import { refreshKeyFile, setKeyFilePath } from "./key-file.js";
 import { createQoder, QoderLanguageModel } from "./language-model.js";
 import { errorMessage, logPlugin } from "./log.js";
 import {
@@ -43,7 +44,7 @@ import {
   refreshModels,
 } from "./model-catalog.js";
 import { maybeImportPATsFromEnv } from "./pat-import.js";
-import { addPAT, getActivePAT, listPATs, removePAT, switchPAT } from "./pat-store.js";
+import { addPAT, followConfig, getActivePAT, listPATs, removePAT, switchPAT } from "./pat-store.js";
 import { getRoutingPolicy, type RoutingPolicy, updateRoutingPolicy } from "./routing-policy.js";
 import { forgetSession, recordSessionParent, resolveRootSession } from "./session-roots.js";
 import { publishSharedApiKey, readShared, readSharedApiKey, writeShared } from "./shared-state.js";
@@ -64,9 +65,16 @@ type QoderPluginOptions = PluginOptions & {
   providerID?: string;
   setDefault?: boolean;
   apiKey?: string;
+  // Path to the seed key file (see key-file.ts). Relative paths resolve from
+  // the home directory; "none" disables the layer. Default ~/.qoderkey_pat.
+  keyFile?: string;
 };
 
 const REFRESH_INTERVAL_MS = 15 * 60 * 1000;
+
+// How often the live key-file check runs. One statSync per tick until the
+// mtime moves; the import only re-parses on a real change.
+const KEY_FILE_CHECK_INTERVAL_MS = 60 * 1000;
 
 // Emitted from both registration paths, so the log shows where the names came
 // from whichever opencode version is driving. `source` is the field that
@@ -254,6 +262,18 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
       `apiKey=${tokenShape(current.options.apiKey)}`,
   );
   current.options.baseURL ??= QODER_BASE_URL;
+  // The seed key file lives here because this hook is the only place that sees
+  // the user's provider options. Record the configured path, then run the
+  // first check immediately so a list-form file has seeded the store before
+  // discovery authenticates its first request.
+  {
+    const keyFile = optionString(options, "keyFile") ?? optionString(current.options, "keyFile");
+    if (keyFile) setKeyFilePath(keyFile);
+    const state = refreshKeyFile();
+    if (state.kind === "list") {
+      logPlugin(`legacy: key file ${state.path} is a PAT list; the pat-store drives auth`);
+    }
+  }
   const apiKey = optionString(options, "apiKey");
   if (apiKey && current.options.apiKey === undefined) current.options.apiKey = apiKey;
   // Captured after the assignment above so either source -- plugin options or
@@ -451,6 +471,10 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   // re-logging; addPAT's own dedup makes even a repeat idempotent anyway.
   if (!readShared<boolean>(PAT_IMPORT_DONE_KEY)) {
     writeShared(PAT_IMPORT_DONE_KEY, true);
+    // The seed key file first: it is the plugin-owned credential source, and a
+    // list-form file must have seeded the store before the env import's log
+    // lines (or any discovery request) compare against it.
+    refreshKeyFile();
     maybeImportPATsFromEnv();
   }
   await ctx.integration.transform((integrations) => {
@@ -607,6 +631,15 @@ async function setupV2(ctx: PluginContext): Promise<void> {
     refreshCatalog(false).catch(logRefreshFailure);
   }, REFRESH_INTERVAL_MS);
   timer.unref?.();
+  // The live key-file check. Much faster cadence than the catalog refresh
+  // because it is a single statSync until the mtime moves, and it is what makes
+  // "edit the file, it re-seeds without a restart" true rather than a startup
+  // once. A list-to-new-member edit lands on the store within one tick; the
+  // next request authenticates with it (pat-store reloads by its own mtime).
+  const keyFileTimer = setInterval(() => {
+    refreshKeyFile();
+  }, KEY_FILE_CHECK_INTERVAL_MS);
+  keyFileTimer.unref?.();
 }
 
 // pollDeviceFlow() and its delay() helper live in auth.ts alongside every
@@ -720,16 +753,21 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "or 'which PAT is active'.",
       args: {},
       execute: () => {
+        // Refresh the seed key file first, so a file the user just edited shows
+        // up in this answer rather than only after the next 60s tick.
+        refreshKeyFile();
         const pats = listPATs();
         const active = getActivePAT();
         const output =
           pats.length === 0
-            ? "No PATs stored yet. Use qoder_pat_add to add one."
+            ? "No PATs stored yet. Seed them from the key file (default ~/.qoderkey_pat, one " +
+              "pt- token per line), the OPENCODE_QODER_PAT env var, or qoder_pat_add."
             : pats
                 .map((p) => {
                   const marker = p.active ? " [ACTIVE]" : "";
+                  const selected = p.selected ? " (explicitly selected)" : "";
                   const email = p.email ? ` (${p.email})` : "";
-                  return `${p.id}: ${p.label}${email}${marker}`;
+                  return `${p.id}: ${p.label}${email}${marker}${selected}`;
                 })
                 .join("\n");
         return Promise.resolve({ output, data: { pats, activeId: active?.id } });
@@ -740,12 +778,30 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
       description:
         "Switch the active Qoder PAT to a different stored account. The id must match " +
         "one shown by qoder_pat_list. Use when the user says 'switch to account X' or " +
-        "'use my other PAT'.",
-      args: { id: tool.schema.string().describe("PAT id from qoder_pat_list") },
+        "'use my other PAT'. An explicit switch OUTRANKS a configured credential (the " +
+        "key file or apiKey option) until it is cleared; omit the id to clear it and " +
+        "let the configured single credential sign again.",
+      args: {
+        id: tool.schema
+          .string()
+          .optional()
+          .describe("PAT id from qoder_pat_list; omit to follow the configured credential"),
+      },
       execute: (args) => {
+        if (args.id === undefined) {
+          const cleared = followConfig();
+          return Promise.resolve({
+            output: cleared
+              ? "Selection cleared. Requests now use the configured credential " +
+                "(key file / apiKey option) as if no switch had happened."
+              : "Nothing was explicitly selected, so requests already follow the configured credential.",
+            data: { success: true, cleared },
+          });
+        }
         const success = switchPAT(args.id);
         const output = success
-          ? `Switched to ${args.id}. This PAT will be used for all subsequent requests.`
+          ? `Switched to ${args.id}. This PAT signs all subsequent requests, overriding ` +
+            `the configured credential until qoder_pat_switch is called without an id.`
           : `PAT ${args.id} not found. Run qoder_pat_list to see available accounts.`;
         return Promise.resolve({ output, data: { success, id: args.id } });
       },

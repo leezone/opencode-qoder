@@ -123,16 +123,38 @@ opencode
 
 ## 多账户
 
-可同时存储多个 Qoder 账户并在运行时切换。存储位置为 `~/.config/opencode/qoder-pats.json`（遵循 `XDG_CONFIG_HOME`），以 `0600` 权限写入；其中一个为 active，为所有请求签名，直到你切换。可在对话中用 `qoder_pat_add`、`qoder_pat_list`、`qoder_pat_switch`、`qoder_pat_remove` 管理。
+插件自己接管凭证文件：`~/.qoderkey_pat`（可用提供商选项 `keyFile` 或环境变量 `OPENCODE_QODER_KEY_FILE` 覆盖路径，设为 `none` 关闭该层）。不再需要在 `opencode.jsonc` 里写 `apiKey: "{file:...}"` 转发——插件在启动时以及每 60 秒自行读取该文件。同一套语法规则决定文件的角色：
 
-若要在无任何工具调用的情况下预置 store（全新机器、CI runner），把导入变量设为逗号或分号分隔的列表：
+- **孤立的单个令牌** → 就是你的凭证。它的签名行为与旧的 `{file:...}` 选项完全一致，优先级仅次于显式切换。
+- **列表**（`,`/`;`/换行分隔，或 `OPENCODE_QODER_PAT=...` 赋值形式）→ 是**种子导入**：每个未见过的 `pt-` 段被加入 store（首个会激活空 store），此后由 store——而非文件——为请求鉴权。
+
+变更检测基于 mtime：周期检查在稳态下只是一次 stat，代价可忽略；编辑文件后下一个 tick 即生效，无需重启。
+
+store 位于 `~/.config/opencode/qoder-pats.json`（遵循 `XDG_CONFIG_HOME`），以 `0600` 权限写入。它只会被真实输入创建——列表形式的关键字文件、环境变量导入、或 `qoder_pat_add`——绝不会出现占位的假数据。可在对话中用 `qoder_pat_add`、`qoder_pat_list`、`qoder_pat_switch`、`qoder_pat_remove` 管理。
+
+若要在完全不碰文件的情况下预置 store（全新机器、CI runner），把导入变量设为逗号或分号分隔的列表：
 
 ```bash
 export OPENCODE_QODER_PAT="pt-aaa,pt-bbb"
 opencode
 ```
 
-这是一次性的**导入**，不是查找层：启动时每个未见过的 `pt-` 段会被加入（首个会激活空 store），此后是 store——而非该变量——为请求鉴权。`OPENCODE_QODER_PAT` 刻意与 `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT` 分开，因此永不与官方 Qoder CLI 冲突（那两个仍是单 PAT、保持原样）。导入完成后请 `unset` 该变量，免得令牌滞留在子进程环境里。
+这同样是一次性的**导入**，不是查找层：启动时每个未见过的 `pt-` 段会被加入（首个会激活空 store），此后是 store——而非该变量——为请求鉴权。`OPENCODE_QODER_PAT` 刻意与 `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT` 分开，因此永不与官方 Qoder CLI 冲突（那两个仍是单 PAT、保持原样）。导入完成后请 `unset` 该变量，免得令牌滞留在子进程环境里。
+
+### 谁来为请求签名
+
+从高到低：
+
+| # | 层 | 来源 |
+| --- | --- | --- |
+| 1 | `personalAccessToken` 选项 | `opencode.jsonc` 提供商配置 |
+| 2 | **显式选定** | `qoder_pat_switch <id>`——在被清除之前压过一切被动配置 |
+| 3 | 连接凭证 / `apiKey` 选项 | `/connect` 或配置；列表形式的值会被跳过（那是导入种子，不是 bearer token） |
+| 4 | 关键字文件中的孤立令牌 | `~/.qoderkey_pat` 里恰好只有一个令牌 |
+| 5 | store 的 active 条目 | 首次导入时自动激活；由 `qoder_pat_switch` / `--use-pat` 翻转 |
+| 6 | `QODER_PERSONAL_ACCESS_TOKEN` / `QODER_PAT` | 环境变量，与官方 CLI 保持一致、原样未动 |
+
+这张表编码的就是兼容性规则：**单密钥优先级最高**（第 1–4 行压过 store，与旧的 `{file:...}` 配置行为一致）——但**主动行为压过被动配置**：`qoder_pat_switch` 之后，即使 `~/.qoderkey_pat` 里仍有令牌，也由选定的账户签名。不带 id 调用 `qoder_pat_switch` 即清除选定，把签名权交还给文件。
 
 ### 当对话完全打不通时如何恢复
 

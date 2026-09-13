@@ -11,6 +11,7 @@ import { text } from "./coerce.js";
 import { QODER_PAT_ENV, QODER_VERSION, REFRESH_SKEW_MS } from "./constants.js";
 import { readEnv } from "./env.js";
 import { opencodeDataFile } from "./json-store.js";
+import { describeKeyFile } from "./key-file.js";
 import { errorMessage, logPlugin } from "./log.js";
 import {
   catalogCachePath,
@@ -21,6 +22,7 @@ import {
   displayName,
   getModelDefinition,
 } from "./model-catalog.js";
+import { getActivePatString, getSelectedPatString } from "./pat-store.js";
 import { fetchQuotaUsage, type QuotaUsage, setQuotaExhausted } from "./quota.js";
 import { readSharedApiKey } from "./shared-state.js";
 import { QODER_MODELS, STATIC_MODELS_ORIGIN } from "./static-models.js";
@@ -396,11 +398,18 @@ export function renderAuth(
  */
 export async function reportAuth(explicit?: QoderProviderOptions): Promise<CapabilityReport> {
   const options = toolOptions(explicit);
+  const keyFile = describeKeyFile();
   const layers = [
     { layer: "personalAccessToken option", shape: describeTokenShape(options.personalAccessToken) },
+    {
+      layer: "pat-store selection (qoder_pat_switch)",
+      shape: describeTokenShape(getSelectedPatString() ?? ""),
+    },
     { layer: "apiKey option", shape: describeTokenShape(options.apiKey) },
     { layer: "shared channel (config hook)", shape: describeTokenShape(readSharedApiKey()) },
     { layer: "opencode auth.json", shape: describeTokenShape(readStoredQoderToken()) },
+    { layer: "key file (~/.qoderkey_pat)", shape: keyFile },
+    { layer: "pat-store active", shape: describeTokenShape(getActivePatString() ?? "") },
     ...QODER_PAT_ENV.map((key) => ({
       layer: `env ${key}`,
       shape: describeTokenShape(readEnv(key)),
