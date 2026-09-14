@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
 import { errorMessage, logPlugin } from "./log.js";
@@ -10,7 +11,7 @@ import { readShared, writeShared } from "./shared-state.js";
 // Storage location: ~/.config/opencode/qoder-pats.json (honours XDG_CONFIG_HOME)
 //
 // Each entry carries:
-//   - id: stable identifier (short hash of the PAT prefix)
+//   - id: stable identifier (truncated SHA-256 of the token, never the token)
 //   - label: human-readable name (e.g. "Work Account", "Personal")
 //   - pat: the raw Personal Access Token (pt-...)
 //   - email: account email (fetched on add, for display)
@@ -145,11 +146,15 @@ function saveStore(): void {
   }
 }
 
-// Generate a stable short ID from a PAT. Uses the first 12 chars after "pt-"
-// so the ID is recognizable but not the full token.
+// Generate a stable short ID from a PAT: a truncated SHA-256 of the whole
+// token. The old scheme used the first 12 characters of the token itself,
+// which replicated a slice of the secret into every place the ID is shown --
+// tool output, error hints, the recovery script's table. A hash keeps the ID
+// stable per token (the same PAT always resolves to the same handle) without
+// being reversible. Entries stored under the old prefix-IDs keep working:
+// addPAT dedupes by the raw token, not by this derivation.
 function patID(pat: string): string {
-  const prefix = pat.startsWith("pt-") ? pat.slice(3, 15) : pat.slice(0, 12);
-  return `pat_${prefix}`;
+  return `pat_${createHash("sha256").update(pat).digest("hex").slice(0, 12)}`;
 }
 
 // Returns all stored PATs (shape only, never the full token in logs).
@@ -170,13 +175,15 @@ export function getActivePatString(): string | undefined {
 
 // Add a new PAT to the store. If it is the first entry, it becomes active
 // automatically. Returns the stored entry, or undefined if the PAT already
-// exists (duplicate detection by ID).
+// exists (duplicate detection by the raw token, or by ID).
 export function addPAT(pat: string, label: string, email?: string): StoredPAT | undefined {
   const store = loadStore();
   const id = patID(pat);
 
-  // Duplicate check.
-  if (store.entries.some((e) => e.id === id)) {
+  // Duplicate check: the raw token is the durable identity (an ID re-derivation
+  // must not turn a re-import into a second entry), the ID catches hand-edited
+  // collisions.
+  if (store.entries.some((e) => e.pat === pat || e.id === id)) {
     logPlugin(`pat-store: PAT ${id} already exists`);
     return undefined;
   }
@@ -252,16 +259,4 @@ export function followConfig(): boolean {
     logPlugin("pat-store: following the configured credential (selection cleared)");
   }
   return changed;
-}
-
-// Update the label or email of an existing entry. Returns true if found.
-export function updatePAT(id: string, updates: { label?: string; email?: string }): boolean {
-  const store = loadStore();
-  const target = store.entries.find((e) => e.id === id);
-  if (!target) return false;
-  if (updates.label !== undefined) target.label = updates.label;
-  if (updates.email !== undefined) target.email = updates.email;
-  saveStore();
-  logPlugin(`pat-store: updated ${id}`);
-  return true;
 }

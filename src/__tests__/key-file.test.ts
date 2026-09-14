@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +15,13 @@ import { invalidateStore, listPATs } from "../pat-store.js";
 const ALPHA = "pt-aaaaaaaaaaaaaaaa";
 const BETA = "pt-bbbbbbbbbbbbbbbb";
 const GAMMA = "pt-cccccccccccccccc";
+
+// Mirrors pat-store.ts's patID() -- the id a token lands under. Inlining the
+// derivation here (rather than exporting patID) makes the test fail loudly if
+// the scheme changes, which is the point of asserting exact ids.
+function hashID(pat: string): string {
+  return `pat_${createHash("sha256").update(pat).digest("hex").slice(0, 12)}`;
+}
 
 let dir: string;
 let file: string;
@@ -163,11 +171,10 @@ describe("key file as a shell env file", () => {
     expect(keyFileToken()).toBe(""); // a list never authenticates as one token
     // The list wins over the single-token variable, and the imported ids prove
     // the tokens came from the assignment's VALUE -- never the whole
-    // `export ...` line (patID = "pat_" + the 12 chars after "pt-").
-    expect(listPATs().map((p) => p.id)).toEqual([
-      `pat_${ALPHA.slice(3, 15)}`,
-      `pat_${BETA.slice(3, 15)}`,
-    ]);
+    // `export ...` line. The id is a truncated SHA-256 of the token, so
+    // matching it against the expected hash confirms the exact bytes that
+    // entered the store.
+    expect(listPATs().map((p) => p.id)).toEqual([hashID(ALPHA), hashID(BETA)]);
   });
 
   it("uses QODER_PERSONAL_ACCESS_TOKEN as the credential when no list exists", () => {

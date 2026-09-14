@@ -44,7 +44,15 @@ import {
   refreshModels,
 } from "./model-catalog.js";
 import { maybeImportPATsFromEnv } from "./pat-import.js";
-import { addPAT, followConfig, getActivePAT, listPATs, removePAT, switchPAT } from "./pat-store.js";
+import {
+  addPAT,
+  followConfig,
+  getActivePAT,
+  listPATs,
+  removePAT,
+  type StoredPAT,
+  switchPAT,
+} from "./pat-store.js";
 import { getRoutingPolicy, type RoutingPolicy, updateRoutingPolicy } from "./routing-policy.js";
 import { forgetSession, recordSessionParent, resolveRootSession } from "./session-roots.js";
 import { publishSharedApiKey, readShared, readSharedApiKey, writeShared } from "./shared-state.js";
@@ -654,6 +662,30 @@ function capabilityOptions(options?: PluginOptions): QoderProviderOptions {
   return apiKey ? { apiKey } : {};
 }
 
+// A stored PAT with the token replaced by its shape. Tool results land in
+// opencode's session storage, so `data` must carry the same redaction the
+// human-readable `output` already had -- a raw entry there would replicate
+// the plaintext token from the 0600 store into session storage. The report
+// carries everything the output text shows, plus a token SHAPE -- the same
+// "describe, never print" rule the log lines and qoder_auth follow.
+function redactPAT(entry: StoredPAT): {
+  id: string;
+  label: string;
+  email: string;
+  active: boolean;
+  selected: boolean;
+  shape: string;
+} {
+  return {
+    id: entry.id,
+    label: entry.label,
+    email: entry.email ?? "",
+    active: entry.active,
+    selected: entry.selected === true,
+    shape: tokenShape(entry.pat),
+  };
+}
+
 // Wraps a capability so a throw becomes a readable answer instead of a tool
 // error with no cause. The structured half of the report rides along as the
 // result metadata, so anything downstream of the tool call can compute on it
@@ -770,7 +802,10 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
                   return `${p.id}: ${p.label}${email}${marker}${selected}`;
                 })
                 .join("\n");
-        return Promise.resolve({ output, data: { pats, activeId: active?.id } });
+        return Promise.resolve({
+          output,
+          data: { accounts: pats.map(redactPAT), activeId: active?.id },
+        });
       },
     }),
     // Multi-PAT management: switch active account.
@@ -823,7 +858,10 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         const output = entry
           ? `Added ${entry.id} (${entry.label}). ${entry.active ? "This is now the active PAT." : "Use qoder_pat_switch to activate it."}`
           : `PAT already exists (duplicate detected).`;
-        return Promise.resolve({ output, data: { entry } });
+        return Promise.resolve({
+          output,
+          data: { entry: entry ? redactPAT(entry) : null },
+        });
       },
     }),
     // Multi-PAT management: remove a PAT.

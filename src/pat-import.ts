@@ -16,8 +16,8 @@ import { addPAT, listPATs } from "./pat-store.js";
 //
 // Precedence is untouched: OPENCODE_QODER_PAT is NOT a credential-resolution
 // layer (see constants.ts). It is consumed here and nowhere else. Importing is
-// idempotent (addPAT dedupes by patID), so re-running it with the same value
-// is a no-op.
+// idempotent (addPAT dedupes by the raw token), so re-running it with the same
+// value is a no-op.
 //
 // We deliberately require the `pt-` prefix for store-bound segments. The
 // resolution chain treats a non-pt- token as an already-exchanged job token
