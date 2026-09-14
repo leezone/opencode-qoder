@@ -85,7 +85,7 @@ Once loaded, the plugin registers read-only tools that answer account questions 
 | `qoder_catalog` | Where the model table came from (live / cache / fallback), freshness, cache path |
 | `qoder_auth` | Which credential layer is in effect and what it resolves to -- shape only, never the token value |
 | `qoder_tier_list` | See each model's advertised tiers, this conversation's tier, and the active routing policy |
-| `qoder_tier_switch` | Switch the current conversation's context tier (model + tier; omit tier to restore default) |
+| `qoder_tier_switch` | Switch the current conversation's context tier (`model` + `tier`; `model: "*"` applies to every model advertising the tier; omit `tier` to restore default) |
 | `qoder_routing_policy` | View or edit the lite→qfmodel auto-escalation policy (no params = show) |
 
 Reading quota is unmetered: ten consecutive reads leave the usage counters unchanged (verified 2026-09-08). If the numbers move between reads, that is model usage, not these tools.

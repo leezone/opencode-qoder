@@ -141,6 +141,18 @@ function triggerCatalogRefresh(labelChanged = false): boolean {
   }
 }
 
+// Subagent caveat shared by both faces of qoder_tier_switch: above the pinned
+// helper model's window the routing policy escalates compaction/task requests
+// to a model that advertises the tier, so the whole exchange -- not just the
+// main thread -- fits.
+function routingNote(tier: number): string {
+  const policy = getRoutingPolicy();
+  if (tier <= policy.threshold) return "";
+  return policy.enabled
+    ? `\n\nPinned subagents (compaction, task children) auto-escalate to ${policy.target} at this tier (policy: qoder_routing_policy).`
+    : `\n\nWarning: routing is disabled, so the compaction agent stays on a ${policy.threshold}-token model and cannot compact this conversation above that. Re-enable with qoder_routing_policy, or override agent.compaction in opencode.json.`;
+}
+
 // Wired by setupV2 once refreshCatalog() exists, and invoked when a credential
 // first becomes available -- so discovery starts immediately rather than waiting
 // out the next 15-minute tick. Deferred rather than called directly because the
@@ -926,28 +938,99 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
                   return `${entry.model}: ${entry.availableTiers.join(" / ")}${selected}`;
                 })
                 .join("\n") +
-              "\n\nSwitch for THIS conversation with qoder_tier_switch(model, tier); subagent " +
-              "requests (compaction, task children) follow the same tier automatically.");
+              "\n\nSwitch for THIS conversation with qoder_tier_switch(model, tier) -- or " +
+              'model "*" to set every model that advertises the tier; subagent requests ' +
+              "(compaction, task children) follow the same tier automatically.");
         return Promise.resolve({ output, data: { tiers, sessionTier: sessionTier ?? null } });
       },
     }),
-    // Context tiers: select a tier for THIS conversation (or clear it).
+    // Context tiers: select a tier for THIS conversation (or clear it). `model`
+    // accepts "*" to fan one tier out over every model that advertises it.
     qoder_tier_switch: tool({
       description:
         "Select a context tier for THIS conversation's Qoder model, e.g. 1000000 for the " +
         "1M window. The tier must be one of the model's advertised tiers (see " +
-        "qoder_tier_list); omit it to return the conversation to its default. The binding " +
-        "is per-conversation: this chat and its subagents (compaction, task children) all " +
-        "run at the chosen tier, while a brand-new chat still defaults. Use when the user " +
-        "says 'switch to 1M context' or 'reset the context tier'.",
+        "qoder_tier_list); omit it to return the conversation to its default. Pass " +
+        '"*" as the model to apply the tier to every model that advertises it, or to ' +
+        "clear all selections. The binding is per-conversation: this chat and its " +
+        "subagents (compaction, task children) all run at the chosen tier, while a " +
+        "brand-new chat still defaults. Use when the user says 'switch to 1M context' " +
+        "or 'reset the context tier'.",
       args: {
-        model: tool.schema.string().describe("Model id, e.g. cmodel or ultimate"),
+        model: tool.schema
+          .string()
+          .describe(
+            'Model id (e.g. cmodel or ultimate), or "*" for every model that advertises the tier',
+          ),
         tier: tool.schema
           .number()
           .optional()
           .describe("Tier in tokens (e.g. 1000000). Omit to restore the default tier."),
       },
       execute: (args, ctx) => {
+        const root = ctx.sessionID ? resolveRootSession(ctx.sessionID) : "";
+        if (args.model === "*") {
+          // Bulk: the per-conversation session binding is a single number, so
+          // only the display-mode map fans out; a skipped model keeps its own
+          // advertised default rather than an unsupported ceiling.
+          if (args.tier === undefined) {
+            const clearedMode = clearAllTiers();
+            const clearedSession = root ? clearSessionTier(root) : false;
+            triggerCatalogRefresh(clearedMode);
+            return Promise.resolve({
+              output:
+                clearedMode || clearedSession
+                  ? "All tier selections cleared; every model is back on its advertised default."
+                  : "Nothing was selected, so nothing to clear.",
+              data: { success: true, model: "*", cleared: clearedMode || clearedSession },
+            });
+          }
+          const tier = args.tier;
+          const matches = catalogModels().filter((model) => model.contextTiers?.includes(tier));
+          if (matches.length === 0) {
+            const offered = [
+              ...new Set(
+                catalogModels()
+                  .flatMap((model) => model.contextTiers ?? [])
+                  .sort((a, b) => a - b),
+              ),
+            ];
+            return Promise.resolve({
+              output:
+                `No advertised model offers a ${tier}-token tier. ` +
+                `Tiers in use: ${offered.join(" / ")}. Run qoder_tier_list for the per-model table.`,
+              data: { success: false, model: "*", tier },
+            });
+          }
+          if (root) setSessionTier(root, tier);
+          for (const model of matches) setTier(model.id, tier);
+          const unsupported = catalogModels()
+            .filter((model) => !model.contextTiers?.includes(tier))
+            .map((model) => model.id);
+          const refreshed = triggerCatalogRefresh(true);
+          return Promise.resolve({
+            output:
+              `Set the ${tier}-token tier on ${matches.length} model(s): ` +
+              `${matches.map((model) => model.id).join(", ")}. ` +
+              (root
+                ? `This conversation now runs at that tier whichever of them it uses. `
+                : `No conversation id yet, so only the picker labels were set. `) +
+              (unsupported.length > 0
+                ? `${unsupported.length} model(s) left unchanged (no such tier): ${unsupported.join(", ")}. `
+                : "") +
+              (refreshed
+                ? "The picker labels and compaction limits are reloading now."
+                : "Restart opencode to update the picker labels and limits.") +
+              routingNote(tier),
+            data: {
+              success: true,
+              model: "*",
+              tier: args.tier,
+              applied: matches.map((model) => model.id),
+              session: root || null,
+            },
+          });
+        }
         const def = catalogModels().find((model) => model.id === args.model);
         if (!def) {
           return Promise.resolve({
@@ -955,7 +1038,6 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
             data: { success: false },
           });
         }
-        const root = ctx.sessionID ? resolveRootSession(ctx.sessionID) : "";
         if (args.tier === undefined) {
           const clearedSession = root ? clearSessionTier(root) : false;
           const clearedMode = clearTier(args.model);
@@ -984,23 +1066,13 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         if (root) setSessionTier(root, args.tier);
         setTier(args.model, args.tier);
         const refreshed = triggerCatalogRefresh(true);
-        // Subagent handling: above the pinned helper model's window the routing
-        // policy escalates compaction/task requests to a model that advertises
-        // this tier, so the whole exchange -- not just the main thread -- fits.
-        const policy = getRoutingPolicy();
-        const routingNote =
-          args.tier > policy.threshold
-            ? policy.enabled
-              ? `\n\nPinned subagents (compaction, task children) auto-escalate to ${policy.target} at this tier (policy: qoder_routing_policy).`
-              : `\n\nWarning: routing is disabled, so the compaction agent stays on a ${policy.threshold}-token model and cannot compact this conversation above that. Re-enable with qoder_routing_policy, or override agent.compaction in opencode.json.`
-            : "";
         return Promise.resolve({
           output:
             `This conversation now runs at the ${args.tier}-token tier on ${args.model} (was ${def.contextWindow}). ` +
             (refreshed
               ? "The picker label and compaction limits are reloading now."
               : "Restart opencode to update the picker label and limits.") +
-            routingNote,
+            routingNote(args.tier),
           data: { success: true, model: args.model, tier: args.tier, session: root || null },
         });
       },
