@@ -38,7 +38,22 @@ const HEADERS = {
 };
 
 const PAT_ENV = ["QODER_PERSONAL_ACCESS_TOKEN", "QODER_PAT"];
-const CACHE_FILE = path.join(os.homedir(), ".cache", "opencode-qoder", "job-token.json");
+
+// XDG bases, resolved the way the plugin's json-store.ts resolves them:
+// honour the variable, fall back to the dotted directory under HOME. The
+// PAT-store reader below already did this; the cache and opencode-file
+// readers hardcoded ~/.cache and ~/.local/share, so anyone who moved those
+// bases got a script looking in the wrong tree for the very credentials
+// --resolve claims to rank.
+function xdgDir(variable, fallback) {
+  return (process.env[variable] || path.join(os.homedir(), ...fallback)).trim();
+}
+
+const CACHE_FILE = path.join(
+  xdgDir("XDG_CACHE_HOME", [".cache"]),
+  "opencode-qoder",
+  "job-token.json",
+);
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
@@ -106,10 +121,11 @@ function stripCommentLines(text) {
 }
 
 function patFromOpencodeConfig() {
+  const configDir = xdgDir("XDG_CONFIG_HOME", [".config"]);
   for (const file of [
     process.env.OPENCODE_CONFIG,
-    path.join(os.homedir(), ".config", "opencode", "opencode.json"),
-    path.join(os.homedir(), ".config", "opencode", "opencode.jsonc"),
+    path.join(configDir, "opencode", "opencode.json"),
+    path.join(configDir, "opencode", "opencode.jsonc"),
   ]) {
     if (!file) continue;
     const text = readIf(file);
@@ -135,7 +151,9 @@ function patFromOpencodeConfig() {
 
 // opencode's own credential store, when someone used /connect qoder.
 function tokenFromOpencodeAuth() {
-  const text = readIf(path.join(os.homedir(), ".local", "share", "opencode", "auth.json"));
+  const text = readIf(
+    path.join(xdgDir("XDG_DATA_HOME", [".local", "share"]), "opencode", "auth.json"),
+  );
   if (!text) return "";
   try {
     const entry = JSON.parse(text).qoder;
@@ -298,6 +316,22 @@ async function fetchJson(url, init = {}, label) {
 
 // A `pt-` PAT must be exchanged for a job token; anything else (a `jt-` token or
 // an OAuth access token) is already bearer-ready.
+// Port of the plugin's parseExpiresAt (auth.ts). The exchange endpoint answers
+// expires_in in MILLISECONDS; the >7-days threshold is what distinguishes that
+// from a seconds-unit value, which only an upstream change could send. Reading
+// seconds as milliseconds used to expire the cache within a minute -- every
+// probe then re-ran a live exchange, which is exactly the traffic this cache
+// exists to avoid.
+function expiresFromExchange(data) {
+  const absolute = Date.parse(data.expires_at || "");
+  if (Number.isFinite(absolute)) return absolute;
+  const span = Number(data.expires_in);
+  if (Number.isFinite(span) && span > 0) {
+    return Date.now() + (span > 7 * 24 * 60 * 60 ? span : span * 1000);
+  }
+  return Date.now() + 86_400_000;
+}
+
 async function jobToken(credential, { forceExchange }) {
   if (!credential.token.startsWith("pt-")) {
     return { token: credential.token, exchanged: false };
@@ -317,10 +351,7 @@ async function jobToken(credential, { forceExchange }) {
     "PAT exchange",
   );
   if (!data?.token) throw new Error("PAT exchange returned no job token");
-  const parsed = Date.parse(data.expires_at || "");
-  const expiresAt = Number.isFinite(parsed)
-    ? parsed
-    : Date.now() + (Number(data.expires_in) > 0 ? Number(data.expires_in) : 86_400_000);
+  const expiresAt = expiresFromExchange(data);
   saveCache({ patHash, token: data.token, expiresAt });
   return { token: data.token, exchanged: true };
 }
@@ -401,7 +432,7 @@ async function fetchAccount(token) {
 // VALUES are never printed -- only ids/labels.
 
 function patStorePath() {
-  const base = (process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config")).trim();
+  const base = xdgDir("XDG_CONFIG_HOME", [".config"]);
   return path.join(base, "opencode", "qoder-pats.json");
 }
 
