@@ -115,6 +115,13 @@ function optionString(
 // tools call it when present so a switch takes effect without waiting out the
 // 15-minute refresh timer (whose non-forced path is also TTL-throttled).
 const REFRESH_TRIGGER_KEY = "__opencode_qoder_refresh_trigger";
+// Marks that the DISPLAY mode just changed (a tier switch/clear), before the
+// next refreshCatalog(). The picker labels are rendered from getSelectedTier,
+// while refreshCatalog's change detection compares signatures taken AFTER the
+// mutation already landed -- a tier switch alone therefore always "looks
+// unchanged" and the reload gets suppressed, which is exactly why switching
+// showed nothing until some unrelated refresh or restart happened.
+const LABEL_DIRTY_KEY = "__opencode_qoder_label_dirty";
 
 // Once-flag for the OPENCODE_QODER_PAT bootstrap import. opencode loads this
 // plugin twice per process and neither realm sees the other's module state, so
@@ -122,7 +129,8 @@ const REFRESH_TRIGGER_KEY = "__opencode_qoder_refresh_trigger";
 // flag only prevents a re-log.
 const PAT_IMPORT_DONE_KEY = "__opencode_qoder_pat_import_done";
 
-function triggerCatalogRefresh(): boolean {
+function triggerCatalogRefresh(labelChanged = false): boolean {
+  if (labelChanged) writeShared(LABEL_DIRTY_KEY, true);
   const trigger = readShared(REFRESH_TRIGGER_KEY);
   if (typeof trigger !== "function") return false;
   try {
@@ -609,7 +617,12 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   const refreshCatalog = async (force: boolean): Promise<void> => {
     const before = catalogSignature();
     const status = await refreshModels(await discoveryOptions(), force);
-    if (status.source !== "qoder" || catalogSignature() === before) return;
+    if (status.source !== "qoder") return;
+    // Consume the flag only once the reload actually fires; an offline tick
+    // leaves it set so the next successful refresh still delivers it.
+    const labelDirty = readShared(LABEL_DIRTY_KEY) === true;
+    if (!labelDirty && catalogSignature() === before) return;
+    writeShared(LABEL_DIRTY_KEY, undefined);
     if (typeof ctx.catalog.reload === "function") {
       // Fires exactly when a rendered name changed -- a new model, an edited
       // multiplier, or the Unavailable suffix appearing/disappearing, since
@@ -946,7 +959,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         if (args.tier === undefined) {
           const clearedSession = root ? clearSessionTier(root) : false;
           const clearedMode = clearTier(args.model);
-          triggerCatalogRefresh();
+          triggerCatalogRefresh(clearedMode);
           return Promise.resolve({
             output:
               clearedSession || clearedMode
@@ -970,7 +983,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         // (no session yet) degrades to the global mode alone.
         if (root) setSessionTier(root, args.tier);
         setTier(args.model, args.tier);
-        const refreshed = triggerCatalogRefresh();
+        const refreshed = triggerCatalogRefresh(true);
         // Subagent handling: above the pinned helper model's window the routing
         // policy escalates compaction/task requests to a model that advertises
         // this tier, so the whole exchange -- not just the main thread -- fits.
@@ -985,7 +998,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
           output:
             `This conversation now runs at the ${args.tier}-token tier on ${args.model} (was ${def.contextWindow}). ` +
             (refreshed
-              ? "The picker label and compaction limits update on the next model re-select; restart opencode if they lag."
+              ? "The picker label and compaction limits are reloading now."
               : "Restart opencode to update the picker label and limits.") +
             routingNote,
           data: { success: true, model: args.model, tier: args.tier, session: root || null },
@@ -1086,7 +1099,7 @@ function legacyHooks(options?: PluginOptions): Hooks {
         if (info.id === undefined || info.id === "") return;
         recordSessionParent(info.id, info.parentID);
         if (info.parentID === undefined && clearAllTiers()) {
-          triggerCatalogRefresh();
+          triggerCatalogRefresh(true);
         }
         return;
       }
