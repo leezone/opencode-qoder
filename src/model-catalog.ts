@@ -260,8 +260,12 @@ function adoptNewerDiskCache(): void {
   const now = Date.now();
   // Own live data, still fresh: nothing on disk could be newer.
   if (source === "qoder" && now < expiresAt) return;
-  // Throttle the stat probe; -1 forces the very first call to run.
-  if (now - lastAdoptProbeAt < ADOPT_POLL_MS && lastAdoptProbeMtimeMs !== -1) return;
+  // Throttle the stat probe to one per interval. lastAdoptProbeAt starts at 0
+  // so the first call always runs; a FAILED probe (no cache file yet) must
+  // throttle too -- the old -1 exception re-ran the statSync on every call
+  // for the life of a missing file, which is the steady state of a fresh
+  // install or a redirected QODER_MODEL_DISK_CACHE.
+  if (now - lastAdoptProbeAt < ADOPT_POLL_MS) return;
   lastAdoptProbeAt = now;
   let mtimeMs: number;
   try {

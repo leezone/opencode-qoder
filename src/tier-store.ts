@@ -221,11 +221,3 @@ export function clearSessionTier(sessionID: string): boolean {
   logPlugin(`tier-store: session ${id} -> default tier`);
   return true;
 }
-
-// All live session tiers (root session id -> tokens), for the listing tools.
-export function listSessionTiers(): Record<string, number> {
-  const data = loadStore();
-  const out: Record<string, number> = {};
-  for (const [session, entry] of Object.entries(data.sessions)) out[session] = entry.tokens;
-  return out;
-}

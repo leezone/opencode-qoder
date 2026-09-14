@@ -531,6 +531,8 @@ const EFFORT_LADDER = ["none", "low", "medium", "high", "xhigh", "max"] as const
 //
 // Returns undefined for models that advertise no efforts (no thinking_config), so
 // their payload stays byte-identical to before this change.
+let warnedInvalidEffortEnv = false;
+
 function resolveReasoningEffort(
   options: LanguageModelV3CallOptions,
   model: ReturnType<typeof getModelDefinition>,
@@ -538,7 +540,20 @@ function resolveReasoningEffort(
   const supported = model?.efforts ?? [];
   if (supported.length === 0) return undefined;
   const env = readEnv("QODER_REASONING_EFFORT").toLowerCase();
-  if (env) return (EFFORT_LADDER as readonly string[]).includes(env) ? env : undefined;
+  if (env) {
+    if ((EFFORT_LADDER as readonly string[]).includes(env)) return env;
+    // A typo'd override otherwise looks exactly like the gateway ignoring
+    // thinking. The value repeats on every request, so the warning is
+    // once-per-realm.
+    if (!warnedInvalidEffortEnv) {
+      warnedInvalidEffortEnv = true;
+      logPlugin(
+        `effort: QODER_REASONING_EFFORT="${env}" is not on the ladder ` +
+          `(${EFFORT_LADDER.join(", ")}); ignoring the override`,
+      );
+    }
+    return undefined;
+  }
   const optionBag = options as Record<string, unknown>;
   const picked = String(optionBag?.reasoningEffort ?? optionBag?.reasoning_effort ?? "")
     .trim()

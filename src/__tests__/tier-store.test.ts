@@ -9,7 +9,6 @@ import {
   getSelectedTier,
   getSessionTier,
   listSelectedTiers,
-  listSessionTiers,
   setSessionTier,
   setTier,
 } from "../tier-store.js";
@@ -98,7 +97,6 @@ describe("tier-store", () => {
   describe("session tiers", () => {
     it("defaults to undefined -- a session that never switched rides the model default", () => {
       expect(getSessionTier("ses_new")).toBeUndefined();
-      expect(listSessionTiers()).toEqual({});
     });
 
     it("persists as {tokens, at} entries", () => {
