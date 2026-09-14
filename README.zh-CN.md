@@ -55,7 +55,7 @@ credit 倍率、上下文档位与思考档位来自线上发现（下一节）�
 
 ## 模型发现
 
-启动时拉取线上模型列表，之后每 15 分钟刷新一次；列表变化时自动重载 opencode 的目录。最近的线上列表缓存在 `~/.cache/opencode/opencode-qoder-models.json`，重启后仍可用。线上与缓存都不可用时，使用静态兜底表。
+启动时拉取线上模型列表，之后在目录 TTL 到期时重新拉取（默认 1 小时，`QODER_MODEL_CACHE_SECONDS`；定时器每 15 分钟检查一次，因此实际刷新节奏由 TTL 决定，而非定时器）。列表变化时自动重载 opencode 的目录。最近的线上列表缓存在 `~/.cache/opencode/opencode-qoder-models.json`（遵循 `XDG_CACHE_HOME`），重启后仍可用。线上与缓存都不可用时，使用静态兜底表。
 
 静态兜底表是随插件代码一起发布的预制 JSON 文件 `models.json`，仅保留当前上线的模型。需要为特殊情况手改时，把你的副本放到 `~/.config/opencode/qoder-models.json`（遵循 `XDG_CONFIG_HOME`），或用 `QODER_STATIC_MODELS` 指向任意路径。优先级为：环境变量 → 用户文件 → 预制文件。每个文件是 JSON 数组（或 `{"models": [...]}`），条目需含 `id`、`name`、`reasoning`、`supportsEffort`、`input`、`contextWindow`、`maxTokens`（可选 `inputWindow`，须 ≤ `contextWindow`）；无效条目逐条丢弃，一处笔误不会清空整表。线上列表具有权威性：它已不再展示的模型，即使离线也会被隐藏，因此手动添加的 id 只在兜底路径生效，不会覆盖线上结果。
 
