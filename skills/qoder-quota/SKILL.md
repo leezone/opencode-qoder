@@ -46,19 +46,40 @@ persisted to `~/.config/opencode/qoder-pats.json` (honours `XDG_CONFIG_HOME`).
 **Workflow:**
 1. Add accounts: `qoder_pat_add(pat="pt-...", label="Work", email="work@example.com")`
 2. List accounts: `qoder_pat_list()` — shows which is active
-3. Switch: `qoder_pat_switch(id="pat_abc123")` — subsequent requests use that PAT
+3. Switch: `qoder_pat_switch(id="pat_abc123")` — pins the entry as *selected*,
+   which outranks every passive source below
 4. Remove: `qoder_pat_remove(id="pat_abc123")`
 
-**Credential precedence** (highest first):
-1. `personalAccessToken` option (explicit, rare)
-2. Connection credential (`/connect qoder`)
-3. Plugin options `apiKey` (from opencode.json)
-4. Shared apiKey (legacy → v2 bridge)
-5. **Active PAT from pat-store** ← new
-6. Environment variables (`QODER_PERSONAL_ACCESS_TOKEN`, `QODER_PAT`)
+**Credential precedence** (highest first, mirrors `src/auth.ts`):
 
-The active PAT is used automatically by all requests. Switching is instant — no
-restart needed.
+1. `personalAccessToken` option (explicit, rare)
+2. **Selected PAT** — the entry the last `qoder_pat_switch` / `--use-pat` pinned
+   (`active && selected`). A deliberate act outranks passive configuration.
+3. Connection credential — what `/connect qoder` stored (PAT or OAuth token)
+4. Plugin options `apiKey` (from opencode.json; a value that parses as a PAT
+   *list* is seed input, not a bearer token, so it is skipped here)
+5. Shared apiKey (legacy → v2 bridge)
+6. Key file, single form — `~/.qoderkey_env` (`OPENCODE_QODER_KEY_FILE`, or
+   `none` to disable). A PAT *list* in it feeds the importer and contributes no token.
+7. **Active PAT from pat-store** ← the store's ordinary fallback
+8. Environment variables (`QODER_PERSONAL_ACCESS_TOKEN`, `QODER_PAT`)
+
+Switching is instant — no restart needed, because the store is re-read by file
+mtime. Note where item 4 and item 6 sit: a config that pins `apiKey` to a file
+holding **one** token outranks the store's `active` entry, so until something is
+explicitly *selected* every `qoder_pat_switch` looks like it worked while
+requests keep signing with the configured credential. Diagnose it in one line:
+
+```bash
+node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --resolve
+```
+
+That prints the layer table (hashes only, no token bytes, no network) and names
+the layer that answered — so a switch that is silently shadowed is visible
+instead of inferred. `qoder_auth` in a chat is the plugin's own view of the same
+chain; a disagreement between the two is a bug in one of them. The script's
+`--pat` / `--token` flags sit above the whole table on purpose (an explicit CLI
+act), where `auth.ts`'s environment row sits at the bottom.
 
 **Seeding from the environment.** A fresh box or CI runner can bootstrap the
 store without any tool call by setting `OPENCODE_QODER_PAT` to a comma- (or
