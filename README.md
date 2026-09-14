@@ -98,7 +98,7 @@ node skills/qoder-quota/scripts/qoder-quota.mjs --json     # structured
 node skills/qoder-quota/scripts/qoder-quota.mjs --refresh  # skip the cached job token
 ```
 
-The script resolves credentials in the same order the plugin does: `--pat`/`--token`, then `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`, then `provider.qoder.options.apiKey` in `opencode.jsonc` (expanding `{file:...}`), then `~/.qoderkey_pat`, then opencode's own `auth.json`.
+The script resolves credentials in the same order the plugin does: `--pat`/`--token`, then `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`, then `provider.qoder.options.apiKey` in `opencode.jsonc` (expanding `{file:...}`), then `~/.qoderkey_env`, then opencode's own `auth.json`.
 
 ## Authenticate
 
@@ -123,10 +123,11 @@ After changing the plugin config, quit and restart opencode. Plugins and provide
 
 ## Multiple accounts
 
-The plugin owns its credential file: `~/.qoderkey_pat` (override with the provider option `keyFile` or the env var `OPENCODE_QODER_KEY_FILE`; `none` disables the layer). No `apiKey: "{file:...}"` indirection in `opencode.jsonc` is needed — the plugin reads the file itself, once at startup and every 60 seconds. The same grammar decides the file's role:
+The plugin owns its credential file: `~/.qoderkey_env` (override with the provider option `keyFile` or the env var `OPENCODE_QODER_KEY_FILE`; `none` disables the layer). No `apiKey: "{file:...}"` indirection in `opencode.jsonc` is needed — the plugin reads the file itself, once at startup and every 60 seconds. The same grammar decides the file's role:
 
 - **A lone token** → your credential. It signs exactly like the old `{file:...}` option did and outranks everything below an explicit switch.
 - **A list** (`,`/`;`/newline-separated, or the `OPENCODE_QODER_PAT=...` assignment form) → a **seed import**: each unseen `pt-` segment is added to the store (the first activates an empty store), after which the store — not the file — authenticates requests.
+- **A shell env file** (`export OPENCODE_QODER_PAT="pt-a,pt-b"` / `export QODER_PERSONAL_ACCESS_TOKEN="pt-a"`) → the variable's value is extracted and treated by the two rules above. `OPENCODE_QODER_PAT` wins when both are present; so a sourced shell snippet and a bare token file both work as the same file.
 
 Detection is mtime-based, so the steady cost of the periodic check is one stat, and editing the file lands on the next tick without a restart.
 
@@ -150,7 +151,7 @@ Highest first:
 | 1 | `personalAccessToken` option | provider config in `opencode.jsonc` |
 | 2 | **Explicit selection** | `qoder_pat_switch <id>` — outranks all passive config until cleared |
 | 3 | Connection credential / `apiKey` option | `/connect` or config; list-form values are skipped (they are importer input, not a bearer token) |
-| 4 | Key-file lone token | `~/.qoderkey_pat` holding exactly one token |
+| 4 | Key-file lone token | `~/.qoderkey_env` holding exactly one token |
 | 5 | Store active entry | auto-activated on first import; flipped by `qoder_pat_switch` / `--use-pat` |
 | 6 | `QODER_PERSONAL_ACCESS_TOKEN` / `QODER_PAT` | env, unchanged from the official CLI |
 

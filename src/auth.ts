@@ -410,7 +410,7 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
 //      token, and is skipped here;
 //   5. shared apiKey -- the token the legacy config hook published over
 //      globalThis for the v2 instance, which cannot see (3)/(4) itself;
-//   6. key file, single form -- the token inside ~/.qoderkey_pat (or the
+//   6. key file, single form -- the token inside ~/.qoderkey_env (or the
 //      configured keyFile path) when it holds exactly one credential
 //      (keyFileToken); the plugin-owned replacement for option (4), so the
 //      file's location never has to appear in config. A LIST in that file is

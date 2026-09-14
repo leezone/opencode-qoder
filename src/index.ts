@@ -66,7 +66,7 @@ type QoderPluginOptions = PluginOptions & {
   setDefault?: boolean;
   apiKey?: string;
   // Path to the seed key file (see key-file.ts). Relative paths resolve from
-  // the home directory; "none" disables the layer. Default ~/.qoderkey_pat.
+  // the home directory; "none" disables the layer. Default ~/.qoderkey_env.
   keyFile?: string;
 };
 
@@ -760,7 +760,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         const active = getActivePAT();
         const output =
           pats.length === 0
-            ? "No PATs stored yet. Seed them from the key file (default ~/.qoderkey_pat, one " +
+            ? "No PATs stored yet. Seed them from the key file (default ~/.qoderkey_env, one " +
               "pt- token per line), the OPENCODE_QODER_PAT env var, or qoder_pat_add."
             : pats
                 .map((p) => {

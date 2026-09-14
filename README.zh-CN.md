@@ -98,7 +98,7 @@ node skills/qoder-quota/scripts/qoder-quota.mjs --json     # 结构化输出
 node skills/qoder-quota/scripts/qoder-quota.mjs --refresh  # 跳过缓存的 job token
 ```
 
-脚本的凭证解析顺序与插件一致：`--pat`/`--token`，其次 `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`，再次 `opencode.jsonc` 中的 `provider.qoder.options.apiKey`（自动展开 `{file:...}`），然后 `~/.qoderkey_pat`，最后 opencode 自身的 `auth.json`。
+脚本的凭证解析顺序与插件一致：`--pat`/`--token`，其次 `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`，再次 `opencode.jsonc` 中的 `provider.qoder.options.apiKey`（自动展开 `{file:...}`），然后 `~/.qoderkey_env`，最后 opencode 自身的 `auth.json`。
 
 ## 认证
 
@@ -123,10 +123,11 @@ opencode
 
 ## 多账户
 
-插件自己接管凭证文件：`~/.qoderkey_pat`（可用提供商选项 `keyFile` 或环境变量 `OPENCODE_QODER_KEY_FILE` 覆盖路径，设为 `none` 关闭该层）。不再需要在 `opencode.jsonc` 里写 `apiKey: "{file:...}"` 转发——插件在启动时以及每 60 秒自行读取该文件。同一套语法规则决定文件的角色：
+插件自己接管凭证文件：`~/.qoderkey_env`（可用提供商选项 `keyFile` 或环境变量 `OPENCODE_QODER_KEY_FILE` 覆盖路径，设为 `none` 关闭该层）。不再需要在 `opencode.jsonc` 里写 `apiKey: "{file:...}"` 转发——插件在启动时以及每 60 秒自行读取该文件。同一套语法规则决定文件的角色：
 
 - **孤立的单个令牌** → 就是你的凭证。它的签名行为与旧的 `{file:...}` 选项完全一致，优先级仅次于显式切换。
 - **列表**（`,`/`;`/换行分隔，或 `OPENCODE_QODER_PAT=...` 赋值形式）→ 是**种子导入**：每个未见过的 `pt-` 段被加入 store（首个会激活空 store），此后由 store——而非文件——为请求鉴权。
+- **shell env 文件**（`export OPENCODE_QODER_PAT="pt-a,pt-b"` / `export QODER_PERSONAL_ACCESS_TOKEN="pt-a"`）→ 提取该变量的值，再套用上面两条规则。两者都在时 `OPENCODE_QODER_PAT` 优先；因此一份可 source 的 shell 片段与一个裸令牌文件，作为同一个文件都能用。
 
 变更检测基于 mtime：周期检查在稳态下只是一次 stat，代价可忽略；编辑文件后下一个 tick 即生效，无需重启。
 
@@ -150,11 +151,11 @@ opencode
 | 1 | `personalAccessToken` 选项 | `opencode.jsonc` 提供商配置 |
 | 2 | **显式选定** | `qoder_pat_switch <id>`——在被清除之前压过一切被动配置 |
 | 3 | 连接凭证 / `apiKey` 选项 | `/connect` 或配置；列表形式的值会被跳过（那是导入种子，不是 bearer token） |
-| 4 | 关键字文件中的孤立令牌 | `~/.qoderkey_pat` 里恰好只有一个令牌 |
+| 4 | 关键字文件中的孤立令牌 | `~/.qoderkey_env` 里恰好只有一个令牌 |
 | 5 | store 的 active 条目 | 首次导入时自动激活；由 `qoder_pat_switch` / `--use-pat` 翻转 |
 | 6 | `QODER_PERSONAL_ACCESS_TOKEN` / `QODER_PAT` | 环境变量，与官方 CLI 保持一致、原样未动 |
 
-这张表编码的就是兼容性规则：**单密钥优先级最高**（第 1–4 行压过 store，与旧的 `{file:...}` 配置行为一致）——但**主动行为压过被动配置**：`qoder_pat_switch` 之后，即使 `~/.qoderkey_pat` 里仍有令牌，也由选定的账户签名。不带 id 调用 `qoder_pat_switch` 即清除选定，把签名权交还给文件。
+这张表编码的就是兼容性规则：**单密钥优先级最高**（第 1–4 行压过 store，与旧的 `{file:...}` 配置行为一致）——但**主动行为压过被动配置**：`qoder_pat_switch` 之后，即使 `~/.qoderkey_env` 里仍有令牌，也由选定的账户签名。不带 id 调用 `qoder_pat_switch` 即清除选定，把签名权交还给文件。
 
 ### 当对话完全打不通时如何恢复
 

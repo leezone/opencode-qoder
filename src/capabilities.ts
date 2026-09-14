@@ -408,7 +408,7 @@ export async function reportAuth(explicit?: QoderProviderOptions): Promise<Capab
     { layer: "apiKey option", shape: describeTokenShape(options.apiKey) },
     { layer: "shared channel (config hook)", shape: describeTokenShape(readSharedApiKey()) },
     { layer: "opencode auth.json", shape: describeTokenShape(readStoredQoderToken()) },
-    { layer: "key file (~/.qoderkey_pat)", shape: keyFile },
+    { layer: "key file (~/.qoderkey_env)", shape: keyFile },
     { layer: "pat-store active", shape: describeTokenShape(getActivePatString() ?? "") },
     ...QODER_PAT_ENV.map((key) => ({
       layer: `env ${key}`,

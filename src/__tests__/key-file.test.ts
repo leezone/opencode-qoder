@@ -150,3 +150,40 @@ describe("key file as seed import", () => {
     expect(listPATs()).toHaveLength(2);
   });
 });
+
+describe("key file as a shell env file", () => {
+  it("extracts OPENCODE_QODER_PAT from export lines and imports the list", () => {
+    writeFileSync(
+      file,
+      `export QODER_PERSONAL_ACCESS_TOKEN="${GAMMA}"\n` +
+        `export OPENCODE_QODER_PAT="${ALPHA},${BETA}"\n` +
+        `# qoderkey: someone\n`,
+    );
+    expect(refreshKeyFile().kind).toBe("list");
+    expect(keyFileToken()).toBe(""); // a list never authenticates as one token
+    // The list wins over the single-token variable, and the imported ids prove
+    // the tokens came from the assignment's VALUE -- never the whole
+    // `export ...` line (patID = "pat_" + the 12 chars after "pt-").
+    expect(listPATs().map((p) => p.id)).toEqual([
+      `pat_${ALPHA.slice(3, 15)}`,
+      `pat_${BETA.slice(3, 15)}`,
+    ]);
+  });
+
+  it("uses QODER_PERSONAL_ACCESS_TOKEN as the credential when no list exists", () => {
+    writeFileSync(file, `export QODER_PERSONAL_ACCESS_TOKEN="${ALPHA}"\n# comment\n`);
+    expect(refreshKeyFile().kind).toBe("single");
+    expect(keyFileToken()).toBe(ALPHA); // not `export QODER_...="pt-..."` verbatim
+    expect(listPATs()).toHaveLength(0);
+  });
+
+  it("handles single quotes and unquoted assignments", () => {
+    writeFileSync(file, `export OPENCODE_QODER_PAT='${ALPHA}'`);
+    expect(refreshKeyFile().kind).toBe("single");
+    expect(keyFileToken()).toBe(ALPHA);
+    writeFileSync(file, `export OPENCODE_QODER_PAT=${ALPHA},${BETA}`);
+    utimesSync(file, new Date(), new Date(Date.now() + 1000));
+    expect(refreshKeyFile().kind).toBe("list");
+    expect(listPATs()).toHaveLength(2);
+  });
+});

@@ -116,6 +116,28 @@ function tokenFromOpencodeAuth() {
   }
 }
 
+// Key-file content -> one token, mirroring the plugin's seed-file grammar:
+// a shell-style env file (`export QODER_PERSONAL_ACCESS_TOKEN="pt-..."` /
+// `export OPENCODE_QODER_PAT="pt-a,pt-b"`) yields the variable's value (for a
+// list, its first entry), anything else is a bare token file used verbatim.
+function tokenFromKeyFile(content) {
+  const text = content.trim();
+  if (!text) return "";
+  const assignment = (name) => {
+    const m = text.match(
+      new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s#]*))`, "m"),
+    );
+    return m ? (m[1] ?? m[2] ?? m[3] ?? "").trim() : "";
+  };
+  if (/(^|\n)\s*(export\s+)?(QODER_PERSONAL_ACCESS_TOKEN|OPENCODE_QODER_PAT)\s*=/.test(text)) {
+    const single = assignment("QODER_PERSONAL_ACCESS_TOKEN");
+    if (single) return single;
+    const list = assignment("OPENCODE_QODER_PAT");
+    if (list) return list.split(/[;,]/)[0].trim();
+  }
+  return text;
+}
+
 function resolveCredential() {
   const explicitPat = option("pat") || PAT_ENV.map((k) => process.env[k]).find(Boolean) || "";
   if (explicitPat) return { token: explicitPat, source: flag("pat") ? "--pat" : "env" };
@@ -126,11 +148,11 @@ function resolveCredential() {
   const fromConfig = patFromOpencodeConfig();
   if (fromConfig) return { token: fromConfig, source: "opencode config" };
 
-  const keyFile = (process.env.QODER_PAT_FILE || "~/.qoderkey_pat").replace(
+  const keyFile = (process.env.QODER_PAT_FILE || "~/.qoderkey_env").replace(
     /^~(?=\/|$)/,
     os.homedir(),
   );
-  const fromFile = readIf(keyFile).trim();
+  const fromFile = tokenFromKeyFile(readIf(keyFile));
   if (fromFile) return { token: fromFile, source: keyFile };
 
   const fromAuth = tokenFromOpencodeAuth();
@@ -485,7 +507,7 @@ async function main() {
     console.error(
       "No Qoder credential found. Tried: --pat, " +
         PAT_ENV.join(", ") +
-        ", opencode.jsonc provider.qoder.options.apiKey, ~/.qoderkey_pat, opencode auth.json.",
+        ", opencode.jsonc provider.qoder.options.apiKey, ~/.qoderkey_env, opencode auth.json.",
     );
     console.error(
       "Set one with:  opencode auth login qoder   (or export QODER_PERSONAL_ACCESS_TOKEN)",

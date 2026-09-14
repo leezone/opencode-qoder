@@ -21,13 +21,17 @@ import { readShared, writeShared } from "./shared-state.js";
 //
 //   * a bare single token (any shape) -- a CREDENTIAL. Resolution uses it
 //     above the store's auto-active entry and below an explicit switch and the
-//     config options, so a plain `~/.qoderkey_pat` behaves exactly like the
+//     config options, so a plain `~/.qoderkey_env` behaves exactly like the
 //     old `{file:...}` option did. Nothing is written to the store.
 //   * a list (`pt-a,pt-b`, one per line, or an `OPENCODE_QODER_PAT=...`
 //     assignment) -- an IMPORT SOURCE. Seeds the pat-store on demand (the
 //     store file is only created once something is actually imported), and the
 //     store -- not this file -- then authenticates requests, exactly as if
 //     OPENCODE_QODER_PAT had seeded it.
+//
+// The file can also be a shell-style env file (`export OPENCODE_QODER_PAT=...`).
+// When that format is detected, the variable's value is extracted and used as
+// the effective content -- so `~/.qoderkey_env` works out of the box.
 //
 // And unlike the env variable, which is read once at process startup, the file
 // is LIVE: every refresh tick (and every qoder_pat_list call) pays one
@@ -59,7 +63,7 @@ export function setKeyFilePath(path: string): void {
 }
 
 // Resolution order: the configured option, then the env override, then
-// ~/.qoderkey_pat. "none" in any of them turns the layer off.
+// ~/.qoderkey_env. "none" in any of them turns the layer off.
 export function keyFilePath(): string {
   const configured = readShared<string>(PATH_KEY) || readEnv(QODER_KEY_FILE_ENV);
   if (configured && configured.trim().toLowerCase() === "none") return "";
@@ -85,6 +89,23 @@ function rememberedMtimes(): Record<string, number> {
 
 function readState(): KeyFileState | undefined {
   return readShared<KeyFileState>(STATE_KEY);
+}
+
+// Parse a shell-style env file and extract the value of a specific variable.
+// Handles: export KEY="value", export KEY='value', export KEY=value, KEY="value", etc.
+// Returns the value if found, otherwise undefined.
+function extractEnvVar(content: string, varName: string): string | undefined {
+  // Match: [export] VAR_NAME=["']value["'] or [export] VAR_NAME=value
+  const pattern = new RegExp(
+    `^(?:export\\s+)?${varName}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s#]*))`,
+    "m",
+  );
+  const match = content.match(pattern);
+  if (match) {
+    // Return the first non-undefined capture group (double-quoted, single-quoted, or unquoted)
+    return match[1] ?? match[2] ?? match[3];
+  }
+  return undefined;
 }
 
 // Re-reads and re-imports only when the file's mtime moved since the last
@@ -120,7 +141,16 @@ export function refreshKeyFile(): KeyFileState {
     return absent;
   }
 
-  const shape = classifyImportValue(content);
+  // Try to extract env vars from shell-style env file first.
+  // Priority: OPENCODE_QODER_PAT (list import) > QODER_PERSONAL_ACCESS_TOKEN (single credential)
+  // If neither found, fall back to the whole file content (plain token file).
+  const importValue = extractEnvVar(content, "OPENCODE_QODER_PAT");
+  const singleValue = importValue
+    ? undefined
+    : extractEnvVar(content, "QODER_PERSONAL_ACCESS_TOKEN");
+  const effectiveContent = importValue ?? singleValue ?? content;
+
+  const shape = classifyImportValue(effectiveContent);
   if (shape.kind === "empty") {
     // An empty (or comment-only) file behaves like no file at all: no
     // credential, nothing to import, quiet -- the layers below it decide.
@@ -141,7 +171,7 @@ export function refreshKeyFile(): KeyFileState {
   writeShared(STATE_KEY, state);
   if (shape.kind === "list") {
     try {
-      const result = importPATsFromValue(content);
+      const result = importPATsFromValue(effectiveContent);
       logPlugin(
         `key-file: ${path} holds a PAT list -- imported ${result.imported}, ` +
           `skipped ${result.duplicates} already stored` +
