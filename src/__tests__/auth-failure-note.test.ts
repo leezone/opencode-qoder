@@ -66,10 +66,11 @@ describe("authFailureError recovery note", () => {
     expect(out).toBe(err);
     expect(out.message).toContain("Qoder rejected the credential");
     expect(out.message).toContain("qoder_pat_switch");
-    // No skill script under the temp XDG, so the note falls back to naming the
-    // store file for a hand edit.
+    // The skill script ships inside the package, so in any real checkout the
+    // note can name it; the store-file fallback only applies when neither a
+    // manual config-dir copy nor the bundled script exists.
     expect(out.message).toContain("inactive backup");
-    expect(out.message).toContain("qoder-pats.json");
+    expect(out.message).toContain("--pats");
     expect(out.message).toContain("no restart");
   });
 
@@ -80,8 +81,9 @@ describe("authFailureError recovery note", () => {
     mkdirSync(dirname(script), { recursive: true });
     writeFileSync(script, "#!/usr/bin/env node\n");
     const out = __testAuthFailureError(new Error("rejected"), credential("real-uid")) as Error;
-    expect(out.message).toContain("node ");
-    expect(out.message).toContain("--pats");
+    // A config-dir copy outranks the bundled script (it is what the host's
+    // source dedup actually loads), so the note names that exact path.
+    expect(out.message).toContain(`node ${script} --pats`);
     expect(out.message).toContain("--use-pat");
     expect(beta.id).toBeTruthy();
   });

@@ -12,7 +12,9 @@ Two surfaces, one implementation:
    plugin's own process, reuse its warm catalog state, and are self-describing.
 2. **Shell script (fallback)** — `scripts/qoder-quota.mjs`, for contexts where
    no opencode session is running (cron, heartbeat, a bare shell). It reads the
-   same credential layers; see its `--help`.
+   same credential layers; see its `--help`. In commands below, `<skill-dir>`
+   is the directory holding this file — the plugin auto-registers the skill
+   from its own package, so no manual install step is involved.
 
 Both answer the same questions, so pick by context, not by habit. Neither prints
 a token.
@@ -71,7 +73,7 @@ explicitly *selected* every `qoder_pat_switch` looks like it worked while
 requests keep signing with the configured credential. Diagnose it in one line:
 
 ```bash
-node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --resolve
+node <skill-dir>/scripts/qoder-quota.mjs --resolve
 ```
 
 That prints the layer table (hashes only, no token bytes, no network) and names
@@ -116,11 +118,11 @@ that. It reads the same store file the plugin does:
 ```bash
 # Probe every stored PAT against the live gateway; classify ALIVE / EXHAUSTED /
 # DEAD / ACCOUNT-INACTIVE / UNREACHABLE, and list the usable ids.
-node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --pats
+node <skill-dir>/scripts/qoder-quota.mjs --pats
 
 # Make one active by id or label (case-insensitive). Refuses an unhealthy entry
 # unless --force, which means you know better than the probe.
-node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --use-pat=Work
+node <skill-dir>/scripts/qoder-quota.mjs --use-pat=Work
 ```
 
 A running opencode picks the flip up on its **next request** — the store is
@@ -227,9 +229,9 @@ these tools.
 ## Script fallback
 
 ```bash
-node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs            # human summary
-node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --json     # structured
-node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --refresh  # skip cached job token
+node <skill-dir>/scripts/qoder-quota.mjs            # human summary
+node <skill-dir>/scripts/qoder-quota.mjs --json     # structured
+node <skill-dir>/scripts/qoder-quota.mjs --refresh  # skip cached job token
 ```
 
 Exit `0` = data fetched (credits may still be spent); exit `1` = nothing usable,

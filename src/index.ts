@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { type Hooks, type PluginInput, type PluginOptions, tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "@opencode-ai/plugin/v2/promise";
 import {
@@ -30,6 +32,7 @@ import {
   ZERO_COST,
 } from "./constants.js";
 import { getMachineId } from "./cosy.js";
+import { readEnv } from "./env.js";
 import { refreshKeyFile, setKeyFilePath } from "./key-file.js";
 import { createQoder, QoderLanguageModel } from "./language-model.js";
 import { errorMessage, logPlugin } from "./log.js";
@@ -483,6 +486,44 @@ async function authOptionsFromV2Connection(
   return credential ? credentialToOptions(credential) : {};
 }
 
+// Installs the skills/ folder shipped inside the package by registering it as a
+// v2 skill source. Verified on opencode 1.18.30: ctx.skill.transform() only
+// stores the hook -- the draft callback runs when the host next builds the
+// skill list, so we call ctx.skill.reload() right after registering to force
+// that rebuild (without it the bundled source stays invisible until some
+// other event rebuilds the draft). The skill then shows up in GET /api/skill
+// with no manual copy step. The path resolves relative to this module, so the
+// skill always matches the plugin actually loaded (repo checkout in dev, cache
+// package when installed). Escape hatch: QODER_DISABLE_BUNDLED_SKILL=1.
+// Non-fatal by design: a host without ctx.skill, a missing folder, or a
+// rejected transform must not take the provider down -- worst case the skill
+// is absent, exactly like before this existed.
+function registerBundledSkills(ctx: PluginContext): void {
+  if (readEnv("QODER_DISABLE_BUNDLED_SKILL")) {
+    logPlugin("skill: bundled-source registration disabled by env");
+    return;
+  }
+  const dir = fileURLToPath(new URL("../skills/", import.meta.url));
+  if (!existsSync(dir)) {
+    logPlugin(`skill: bundled dir missing (${dir}), no source registered`);
+    return;
+  }
+  const skill = ctx.skill;
+  if (!skill || typeof skill.transform !== "function") {
+    logPlugin(
+      `skill: host has no ctx.skill surface (skill=${typeof skill}), bundled source skipped`,
+    );
+    return;
+  }
+  void skill
+    .transform((skills) => {
+      skills.source({ type: "directory", path: dir });
+      logPlugin(`skill: source added (${dir})`);
+    })
+    .then(() => skill.reload())
+    .catch((error) => logPlugin(`skill: registration failed (${errorMessage(error)})`));
+}
+
 async function setupV2(ctx: PluginContext): Promise<void> {
   const id = providerID(ctx.options);
   // Key names only. Records what this instance can see for itself -- ctx.options
@@ -556,6 +597,11 @@ async function setupV2(ctx: PluginContext): Promise<void> {
     if (shouldSetDefault(ctx.options)) catalog.model.default.set(id, "auto");
   });
   logCatalogRegistration("v2");
+
+  // Install the bundled skill alongside the plugin itself: registering the
+  // package's skills/ dir as a v2 source means "plugin installed == skill
+  // installed", with no manual copy step that can half-fail.
+  registerBundledSkills(ctx);
 
   await ctx.aisdk.language(async (event) => {
     // Once per instance, not per request. Whether this handler is invoked at all

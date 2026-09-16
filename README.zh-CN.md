@@ -90,7 +90,7 @@ credit 倍率、上下文档位与思考档位来自线上发现（下一节）�
 
 查询配额本身不计费：连续十次读取，用量计数器纹丝不动（2026-09-08 实测）。两次读取之间数字若发生变化，那是模型消耗，与这些工具无关。
 
-仓库同时附带 `qoder-quota` 技能（`skills/qoder-quota/`），内含独立脚本，用于没有 opencode 会话在跑的场景（cron、裸 shell）：
+插件同时内置了 `qoder-quota` 技能（`skills/qoder-quota/`），并在加载时自动注册——装插件即装技能，无需任何手动拷贝（`QODER_DISABLE_BUNDLED_SKILL=1` 可关闭）。技能自带的独立脚本也适用于没有 opencode 会话在跑的场景（cron、裸 shell）：
 
 ```bash
 node skills/qoder-quota/scripts/qoder-quota.mjs            # 人类可读
@@ -159,14 +159,14 @@ opencode
 
 ### 当对话完全打不通时如何恢复
 
-上面的工具全都跑在对话*内部*——所以一旦 active 凭证被吊销或账户订阅过期，本该用来切换账户的东西本身就够不着了。免费的 `lite` 模型也不是出路：`x0` 免的是额度，不是鉴权。随附的 skill 脚本从一个普通 shell 打破这个死锁，读写的是插件用的同一个 store：
+上面的工具全都跑在对话*内部*——所以一旦 active 凭证被吊销或账户订阅过期，本该用来切换账户的东西本身就够不着了。免费的 `lite` 模型也不是出路：`x0` 免的是额度，不是鉴权。随附的 skill 脚本从一个普通 shell 打破这个死锁，读写的是插件用的同一个 store。脚本随插件包一起发布（`<plugin-dir>` 开发时是仓库 checkout，安装后是 opencode 的插件缓存目录）：
 
 ```bash
 # 拿每个已存 PAT 打一次真实网关，列出可用的 id。
-node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --pats
+node <plugin-dir>/skills/qoder-quota/scripts/qoder-quota.mjs --pats
 
 # 按 id 或 label 激活一个健康的备用项（不健康者除非 --force 否则拒绝）。
-node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --use-pat=Work
+node <plugin-dir>/skills/qoder-quota/scripts/qoder-quota.mjs --use-pat=Work
 ```
 
 运行中的 opencode 会在**下一个请求**时采纳这次翻转（store 按文件 mtime 重载——无需重启），所以 `--use-pat` 切到一个可用账户就是全部的恢复。`ACCOUNT-INACTIVE` 判定意味着整个账户都停了，因此*同*账户的备用项救不了你；用 `OPENCODE_QODER_PAT` 给另一个账户补一个 PAT。

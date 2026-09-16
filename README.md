@@ -90,7 +90,7 @@ Once loaded, the plugin registers read-only tools that answer account questions 
 
 Reading quota is unmetered: ten consecutive reads leave the usage counters unchanged (verified 2026-09-08). If the numbers move between reads, that is model usage, not these tools.
 
-The repo also ships the `qoder-quota` skill (`skills/qoder-quota/`) with a standalone script for contexts without a running opencode session (cron, a bare shell):
+The plugin also bundles the `qoder-quota` skill (`skills/qoder-quota/`) and registers it automatically on load -- installing the plugin installs the skill, with no manual copy step (`QODER_DISABLE_BUNDLED_SKILL=1` opts out). The skill's standalone script also works in contexts without a running opencode session (cron, a bare shell):
 
 ```bash
 node skills/qoder-quota/scripts/qoder-quota.mjs            # human-readable
@@ -159,11 +159,11 @@ The table encodes the compatibility rule: **a single key has the highest priorit
 
 ### Recovery when no chat works
 
-If the active credential is revoked or its account lapsed, the in-chat tools cannot save you: they need a working conversation to run in, and every model — including free `lite` (`x0` waives credits, not authentication) — is refused. The `qoder-quota` skill script reads the same store from a bare shell:
+If the active credential is revoked or its account lapsed, the in-chat tools cannot save you: they need a working conversation to run in, and every model — including free `lite` (`x0` waives credits, not authentication) — is refused. The `qoder-quota` skill script reads the same store from a bare shell. It ships inside the plugin package (`<plugin-dir>` = the checkout when developing, the opencode plugin cache dir once installed):
 
 ```bash
-node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --pats
-node ~/.config/opencode/skills/qoder-quota/scripts/qoder-quota.mjs --use-pat=Work   # id or label
+node <plugin-dir>/skills/qoder-quota/scripts/qoder-quota.mjs --pats
+node <plugin-dir>/skills/qoder-quota/scripts/qoder-quota.mjs --use-pat=Work   # id or label
 ```
 
 `--pats` probes each stored PAT against the live gateway and classifies it (ALIVE / EXHAUSTED / DEAD / ACCOUNT-INACTIVE / UNREACHABLE); `--use-pat` flips `active` to a healthy entry, refusing an unhealthy one unless `--force`. A running opencode reloads the store by file mtime, so the switch takes effect on the next request — no restart.

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   APICallError,
   type LanguageModelV3,
@@ -161,9 +162,18 @@ function patRecoveryNote(options: QoderProviderOptions): string {
     .map((entry) => `${entry.id}${entry.label ? ` ("${entry.label}")` : ""}`)
     .join(", ");
   // Name the real script when the skill is installed; otherwise point at the
-  // store file, which any shell can still flip by hand.
-  const script = opencodeConfigFile(join("skills", "qoder-quota", "scripts", "qoder-quota.mjs"));
-  const shell = existsSync(script)
+  // store file, which any shell can still flip by hand. The plugin auto-registers
+  // its bundled skills/ dir on v2 hosts, so the in-package copy counts too --
+  // but check the config-dir copy first, since a manual copy there is what the
+  // host's source dedup actually loads.
+  const bundledScript = fileURLToPath(
+    new URL("../skills/qoder-quota/scripts/qoder-quota.mjs", import.meta.url),
+  );
+  const copiedScript = opencodeConfigFile(
+    join("skills", "qoder-quota", "scripts", "qoder-quota.mjs"),
+  );
+  const script = [copiedScript, bundledScript].find((p) => existsSync(p)) ?? "";
+  const shell = script
     ? `from any shell: node ${script} --pats, then --use-pat=<id or label>`
     : `from any shell: set "active" true on one of those ids in ${patStoreFile()}`;
   const note =
