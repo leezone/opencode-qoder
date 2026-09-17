@@ -51,28 +51,11 @@ import {
   refreshModels,
 } from "./model-catalog.js";
 import { maybeImportPATsFromEnv } from "./pat-import.js";
-import {
-  addPAT,
-  followConfig,
-  getActivePAT,
-  listPATs,
-  removePAT,
-  type StoredPAT,
-  switchPAT,
-} from "./pat-store.js";
-import { getRoutingPolicy, type RoutingPolicy, updateRoutingPolicy } from "./routing-policy.js";
-import { forgetSession, recordSessionParent, resolveRootSession } from "./session-roots.js";
+import { reportPatAdd, reportPatList, reportPatRemove, reportPatSwitch } from "./pat-tools.js";
+import { forgetSession, recordSessionParent } from "./session-roots.js";
 import { publishSharedApiKey, readShared, readSharedApiKey, writeShared } from "./shared-state.js";
-import {
-  clearAllTiers,
-  clearSessionTier,
-  clearTier,
-  getSelectedTier,
-  getSessionTier,
-  listSelectedTiers,
-  setSessionTier,
-  setTier,
-} from "./tier-store.js";
+import { clearAllTiers, getSelectedTier } from "./tier-store.js";
+import { reportRoutingPolicy, reportTierList, reportTierSwitch } from "./tier-tools.js";
 
 export { createQoder, QoderLanguageModel };
 
@@ -146,18 +129,6 @@ function triggerCatalogRefresh(labelChanged = false): boolean {
   } catch {
     return false;
   }
-}
-
-// Subagent caveat shared by both faces of qoder_tier_switch: above the pinned
-// helper model's window the routing policy escalates compaction/task requests
-// to a model that advertises the tier, so the whole exchange -- not just the
-// main thread -- fits.
-function routingNote(tier: number): string {
-  const policy = getRoutingPolicy();
-  if (tier <= policy.threshold) return "";
-  return policy.enabled
-    ? `\n\nPinned subagents (compaction, task children) auto-escalate to ${policy.target} at this tier (policy: qoder_routing_policy).`
-    : `\n\nWarning: routing is disabled, so the compaction agent stays on a ${policy.threshold}-token model and cannot compact this conversation above that. Re-enable with qoder_routing_policy, or override agent.compaction in opencode.json.`;
 }
 
 // Wired by setupV2 once refreshCatalog() exists, and invoked when a credential
@@ -747,30 +718,6 @@ function capabilityOptions(options?: PluginOptions): QoderProviderOptions {
   return apiKey ? { apiKey } : {};
 }
 
-// A stored PAT with the token replaced by its shape. Tool results land in
-// opencode's session storage, so `data` must carry the same redaction the
-// human-readable `output` already had -- a raw entry there would replicate
-// the plaintext token from the 0600 store into session storage. The report
-// carries everything the output text shows, plus a token SHAPE -- the same
-// "describe, never print" rule the log lines and qoder_auth follow.
-function redactPAT(entry: StoredPAT): {
-  id: string;
-  label: string;
-  email: string;
-  active: boolean;
-  selected: boolean;
-  shape: string;
-} {
-  return {
-    id: entry.id,
-    label: entry.label,
-    email: entry.email ?? "",
-    active: entry.active,
-    selected: entry.selected === true,
-    shape: tokenShape(entry.pat),
-  };
-}
-
 // Wraps a capability so a throw becomes a readable answer instead of a tool
 // error with no cause. The structured half of the report rides along as the
 // result metadata, so anything downstream of the tool call can compute on it
@@ -869,29 +816,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "and which one is currently active. Use when the user asks 'which accounts do I have' " +
         "or 'which PAT is active'.",
       args: {},
-      execute: () => {
-        // Refresh the seed key file first, so a file the user just edited shows
-        // up in this answer rather than only after the next 60s tick.
-        refreshKeyFile();
-        const pats = listPATs();
-        const active = getActivePAT();
-        const output =
-          pats.length === 0
-            ? "No PATs stored yet. Seed them from the key file (default ~/.qoderkey_env, one " +
-              "pt- token per line), the OPENCODE_QODER_PAT env var, or qoder_pat_add."
-            : pats
-                .map((p) => {
-                  const marker = p.active ? " [ACTIVE]" : "";
-                  const selected = p.selected ? " (explicitly selected)" : "";
-                  const email = p.email ? ` (${p.email})` : "";
-                  return `${p.id}: ${p.label}${email}${marker}${selected}`;
-                })
-                .join("\n");
-        return Promise.resolve({
-          output,
-          data: { accounts: pats.map(redactPAT), activeId: active?.id },
-        });
-      },
+      execute: () => Promise.resolve(reportPatList()),
     }),
     // Multi-PAT management: switch active account.
     qoder_pat_switch: tool({
@@ -907,24 +832,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
           .optional()
           .describe("PAT id from qoder_pat_list; omit to follow the configured credential"),
       },
-      execute: (args) => {
-        if (args.id === undefined) {
-          const cleared = followConfig();
-          return Promise.resolve({
-            output: cleared
-              ? "Selection cleared. Requests now use the configured credential " +
-                "(key file / apiKey option) as if no switch had happened."
-              : "Nothing was explicitly selected, so requests already follow the configured credential.",
-            data: { success: true, cleared },
-          });
-        }
-        const success = switchPAT(args.id);
-        const output = success
-          ? `Switched to ${args.id}. This PAT signs all subsequent requests, overriding ` +
-            `the configured credential until qoder_pat_switch is called without an id.`
-          : `PAT ${args.id} not found. Run qoder_pat_list to see available accounts.`;
-        return Promise.resolve({ output, data: { success, id: args.id } });
-      },
+      execute: (args) => Promise.resolve(reportPatSwitch(args.id)),
     }),
     // Multi-PAT management: add a new PAT.
     qoder_pat_add: tool({
@@ -938,16 +846,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         label: tool.schema.string().describe("Human-readable label, e.g. 'Work Account'"),
         email: tool.schema.string().optional().describe("Account email (optional, for display)"),
       },
-      execute: (args) => {
-        const entry = addPAT(args.pat, args.label, args.email);
-        const output = entry
-          ? `Added ${entry.id} (${entry.label}). ${entry.active ? "This is now the active PAT." : "Use qoder_pat_switch to activate it."}`
-          : `PAT already exists (duplicate detected).`;
-        return Promise.resolve({
-          output,
-          data: { entry: entry ? redactPAT(entry) : null },
-        });
-      },
+      execute: (args) => Promise.resolve(reportPatAdd(args.pat, args.label, args.email)),
     }),
     // Multi-PAT management: remove a PAT.
     qoder_pat_remove: tool({
@@ -956,11 +855,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "If the removed PAT was active, no other PAT becomes active automatically. " +
         "Use when the user says 'remove account X' or 'delete my old PAT'.",
       args: { id: tool.schema.string().describe("PAT id from qoder_pat_list") },
-      execute: (args) => {
-        const success = removePAT(args.id);
-        const output = success ? `Removed ${args.id}.` : `PAT ${args.id} not found.`;
-        return Promise.resolve({ output, data: { success, id: args.id } });
-      },
+      execute: (args) => Promise.resolve(reportPatRemove(args.id)),
     }),
     // Context tiers: what each model offers and what is currently selected.
     qoder_tier_list: tool({
@@ -970,39 +865,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "nothing is selected. Use when the user asks about 上下文档位/1M/long context or " +
         "before switching a model's context window.",
       args: {},
-      execute: (_args, ctx) => {
-        const selections = listSelectedTiers();
-        const root = ctx.sessionID ? resolveRootSession(ctx.sessionID) : "";
-        const sessionTier = root ? getSessionTier(root) : undefined;
-        const tiers = catalogModels()
-          .filter((model) => (model.contextTiers?.length ?? 0) > 0 || model.id in selections)
-          .map((model) => ({
-            model: model.id,
-            defaultTier: model.contextWindow,
-            availableTiers: model.contextTiers ?? [model.contextWindow],
-            selected: selections[model.id] ?? null,
-          }));
-        const header =
-          sessionTier !== undefined
-            ? `This conversation runs at the ${sessionTier}-token tier (session ${root}).\n\n`
-            : "This conversation runs at each model's default tier (no switch yet).\n\n";
-        const output =
-          header +
-          (tiers.length === 0
-            ? "No model advertises multiple context tiers. All run at their default tier."
-            : tiers
-                .map((entry) => {
-                  const selected = entry.selected
-                    ? ` [displayed: ${entry.selected}]`
-                    : " [default]";
-                  return `${entry.model}: ${entry.availableTiers.join(" / ")}${selected}`;
-                })
-                .join("\n") +
-              "\n\nSwitch for THIS conversation with qoder_tier_switch(model, tier) -- or " +
-              'model "*" to set every model that advertises the tier; subagent requests ' +
-              "(compaction, task children) follow the same tier automatically.");
-        return Promise.resolve({ output, data: { tiers, sessionTier: sessionTier ?? null } });
-      },
+      execute: (_args, ctx) => Promise.resolve(reportTierList(ctx.sessionID)),
     }),
     // Context tiers: select a tier for THIS conversation (or clear it). `model`
     // accepts "*" to fan one tier out over every model that advertises it.
@@ -1027,115 +890,8 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
           .optional()
           .describe("Tier in tokens (e.g. 1000000). Omit to restore the default tier."),
       },
-      execute: (args, ctx) => {
-        const root = ctx.sessionID ? resolveRootSession(ctx.sessionID) : "";
-        if (args.model === "*") {
-          // Bulk: the per-conversation session binding is a single number, so
-          // only the display-mode map fans out; a skipped model keeps its own
-          // advertised default rather than an unsupported ceiling.
-          if (args.tier === undefined) {
-            const clearedMode = clearAllTiers();
-            const clearedSession = root ? clearSessionTier(root) : false;
-            triggerCatalogRefresh(clearedMode);
-            return Promise.resolve({
-              output:
-                clearedMode || clearedSession
-                  ? "All tier selections cleared; every model is back on its advertised default."
-                  : "Nothing was selected, so nothing to clear.",
-              data: { success: true, model: "*", cleared: clearedMode || clearedSession },
-            });
-          }
-          const tier = args.tier;
-          const matches = catalogModels().filter((model) => model.contextTiers?.includes(tier));
-          if (matches.length === 0) {
-            const offered = [
-              ...new Set(
-                catalogModels()
-                  .flatMap((model) => model.contextTiers ?? [])
-                  .sort((a, b) => a - b),
-              ),
-            ];
-            return Promise.resolve({
-              output:
-                `No advertised model offers a ${tier}-token tier. ` +
-                `Tiers in use: ${offered.join(" / ")}. Run qoder_tier_list for the per-model table.`,
-              data: { success: false, model: "*", tier },
-            });
-          }
-          if (root) setSessionTier(root, tier);
-          for (const model of matches) setTier(model.id, tier);
-          const unsupported = catalogModels()
-            .filter((model) => !model.contextTiers?.includes(tier))
-            .map((model) => model.id);
-          const refreshed = triggerCatalogRefresh(true);
-          return Promise.resolve({
-            output:
-              `Set the ${tier}-token tier on ${matches.length} model(s): ` +
-              `${matches.map((model) => model.id).join(", ")}. ` +
-              (root
-                ? `This conversation now runs at that tier whichever of them it uses. `
-                : `No conversation id yet, so only the picker labels were set. `) +
-              (unsupported.length > 0
-                ? `${unsupported.length} model(s) left unchanged (no such tier): ${unsupported.join(", ")}. `
-                : "") +
-              (refreshed
-                ? "The picker labels and compaction limits are reloading now."
-                : "Restart opencode to update the picker labels and limits.") +
-              routingNote(tier),
-            data: {
-              success: true,
-              model: "*",
-              tier: args.tier,
-              applied: matches.map((model) => model.id),
-              session: root || null,
-            },
-          });
-        }
-        const def = catalogModels().find((model) => model.id === args.model);
-        if (!def) {
-          return Promise.resolve({
-            output: `Model "${args.model}" not found. Run qoder_models to list available models.`,
-            data: { success: false },
-          });
-        }
-        if (args.tier === undefined) {
-          const clearedSession = root ? clearSessionTier(root) : false;
-          const clearedMode = clearTier(args.model);
-          triggerCatalogRefresh(clearedMode);
-          return Promise.resolve({
-            output:
-              clearedSession || clearedMode
-                ? `This conversation returns to ${args.model}'s default tier (${def.contextWindow} tokens).`
-                : `This conversation had no tier switch for ${args.model}; it already runs at the default.`,
-            data: { success: true, cleared: clearedSession || clearedMode },
-          });
-        }
-        if (!isValidContextTier(def, args.tier)) {
-          const offered =
-            def.contextTiers?.join(" / ") ?? `<= ${def.inputWindow ?? def.contextWindow}`;
-          return Promise.resolve({
-            output:
-              `Tier ${args.tier} is not valid for ${args.model}. ` +
-              `Accepted values: ${offered}. Run qoder_tier_list for the full table.`,
-            data: { success: false },
-          });
-        }
-        // The session binding drives the wire; the mode drives the picker label
-        // and the registered (compaction-threshold) limits. A missing root id
-        // (no session yet) degrades to the global mode alone.
-        if (root) setSessionTier(root, args.tier);
-        setTier(args.model, args.tier);
-        const refreshed = triggerCatalogRefresh(true);
-        return Promise.resolve({
-          output:
-            `This conversation now runs at the ${args.tier}-token tier on ${args.model} (was ${def.contextWindow}). ` +
-            (refreshed
-              ? "The picker label and compaction limits are reloading now."
-              : "Restart opencode to update the picker label and limits.") +
-            routingNote(args.tier),
-          data: { success: true, model: args.model, tier: args.tier, session: root || null },
-        });
-      },
+      execute: (args, ctx) =>
+        Promise.resolve(reportTierSwitch(args, ctx.sessionID, triggerCatalogRefresh)),
     }),
     // Subagent routing: which model serves pinned helpers above the default tier.
     qoder_routing_policy: tool({
@@ -1169,37 +925,9 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
           .optional()
           .describe("Agents that keep the base model even above the threshold."),
       },
-      execute: (args) => {
-        const patch: Partial<RoutingPolicy> = {};
-        if (typeof args.enabled === "boolean") patch.enabled = args.enabled;
-        if (args.subagentModel) patch.subagentModel = args.subagentModel;
-        if (args.target) patch.target = args.target;
-        if (args.threshold !== undefined) patch.threshold = args.threshold;
-        if (args.exemptAgents) patch.exemptAgents = args.exemptAgents;
-        const changed = Object.keys(patch).length > 0;
-        const policy = changed ? updateRoutingPolicy(patch) : getRoutingPolicy();
-        if (changed && args.target && !catalogModels().some((m) => m.id === args.target)) {
-          return Promise.resolve({
-            output: `Target "${args.target}" is not a known model. Policy left as: ${describePolicy(policy)}.`,
-            data: { success: false, policy },
-          });
-        }
-        return Promise.resolve({
-          output: `${changed ? "Updated " : ""}routing policy: ${describePolicy(policy)}.`,
-          data: { success: true, policy },
-        });
-      },
+      execute: (args) => Promise.resolve(reportRoutingPolicy(args)),
     }),
   };
-}
-
-// One-line rendering of the routing policy for the tool surface.
-function describePolicy(policy: RoutingPolicy): string {
-  if (!policy.enabled) return "disabled (subagents stay on their selected model)";
-  return (
-    `${policy.subagentModel} -> ${policy.target} above ${policy.threshold} tokens` +
-    ` (exempt: ${policy.exemptAgents.join(", ") || "none"})`
-  );
 }
 
 // The campaign surface, kept as its own map so the marketing scope stays a

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { QoderCredentials } from "../auth.js";
-import { __testAuthFailureError } from "../language-model.js";
+import { authFailureError as __testAuthFailureError } from "../errors.js";
 import { addPAT, invalidateStore } from "../pat-store.js";
 
 // The point of the note: a dead credential blocks every model, including free
