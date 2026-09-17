@@ -22,6 +22,10 @@ import {
   reportModels,
   reportQuota,
 } from "./capabilities.js";
+// The daily-campaign surface (qodercli's /claim equivalent). Marketing scope:
+// nothing here is on the model/chat/quota path, and claimDisabled() removes both
+// tools and the campaign skill in one switch. See claim.ts for the contract.
+import { claimDisabled, reportCampaigns, runClaim } from "./claim.js";
 import { nonEmptyString } from "./coerce.js";
 import {
   PROVIDER_ID,
@@ -503,25 +507,35 @@ function registerBundledSkills(ctx: PluginContext): void {
     logPlugin("skill: bundled-source registration disabled by env");
     return;
   }
-  const dir = fileURLToPath(new URL("../skills/", import.meta.url));
-  if (!existsSync(dir)) {
-    logPlugin(`skill: bundled dir missing (${dir}), no source registered`);
-    return;
+  // The campaign skill is the /qoder-claim command surface for the daily
+  // check-in. It lives in its own folder, outside skills/, so withdrawing the
+  // marketing activity means deleting one directory and one line here -- the
+  // permanent skills stay untouched. Same switch as the tools.
+  const dirs = [
+    new URL("../skills/", import.meta.url),
+    ...(claimDisabled() ? [] : [new URL("../skills-campaign/", import.meta.url)]),
+  ];
+  for (const url of dirs) {
+    const dir = fileURLToPath(url);
+    if (!existsSync(dir)) {
+      logPlugin(`skill: bundled dir missing (${dir}), no source registered`);
+      continue;
+    }
+    const skill = ctx.skill;
+    if (!skill || typeof skill.transform !== "function") {
+      logPlugin(
+        `skill: host has no ctx.skill surface (skill=${typeof skill}), bundled source skipped`,
+      );
+      return;
+    }
+    void skill
+      .transform((skills) => {
+        skills.source({ type: "directory", path: dir });
+        logPlugin(`skill: source added (${dir})`);
+      })
+      .then(() => skill.reload())
+      .catch((error) => logPlugin(`skill: registration failed (${errorMessage(error)})`));
   }
-  const skill = ctx.skill;
-  if (!skill || typeof skill.transform !== "function") {
-    logPlugin(
-      `skill: host has no ctx.skill surface (skill=${typeof skill}), bundled source skipped`,
-    );
-    return;
-  }
-  void skill
-    .transform((skills) => {
-      skills.source({ type: "directory", path: dir });
-      logPlugin(`skill: source added (${dir})`);
-    })
-    .then(() => skill.reload())
-    .catch((error) => logPlugin(`skill: registration failed (${errorMessage(error)})`));
 }
 
 async function setupV2(ctx: PluginContext): Promise<void> {
@@ -1188,6 +1202,50 @@ function describePolicy(policy: RoutingPolicy): string {
   );
 }
 
+// The campaign surface, kept as its own map so the marketing scope stays a
+// separate object that disappears wholesale when the activity is withdrawn.
+// Both tools are server-authoritative: eligibility, the window and the reward
+// all come from the campaign response, never from a clock in here.
+function campaignTools(options?: PluginOptions): Hooks["tool"] {
+  return {
+    qoder_campaign: tool({
+      description:
+        "Show the Qoder daily campaign (check-in) as the server describes it: which " +
+        "accounts see it, each window's start/end, claim status and the reward. " +
+        "Read-only -- it never claims. Use for 'is there a check-in today / did I " +
+        "already claim'. Pass all to sweep every stored PAT instead of the active one.",
+      args: {
+        all: tool.schema
+          .boolean()
+          .optional()
+          .describe("Sweep every stored PAT; defaults to the active credential only."),
+      },
+      execute: (args, ctx) =>
+        capabilityTool("campaign", () => reportCampaigns(capabilityOptions(options), args), ctx),
+    }),
+    qoder_claim: tool({
+      description:
+        "Claim today's Qoder campaign reward(s) for accounts that report CLAIMABLE. " +
+        "This spends a marketing grant: it POSTs the claim the server is currently " +
+        "offering and nothing else. A window already claimed from this machine is " +
+        "skipped, so it is safe to re-run. Returns a per-account verdict. Pass all to " +
+        "collect across every stored PAT. reset=true clears local cooldown markers.",
+      args: {
+        all: tool.schema
+          .boolean()
+          .optional()
+          .describe("Claim for every stored PAT, not just the active one."),
+        reset: tool.schema
+          .boolean()
+          .optional()
+          .describe("Clear local campaign state and return without claiming."),
+      },
+      execute: (args, ctx) =>
+        capabilityTool("claim", () => runClaim(capabilityOptions(options), args), ctx),
+    }),
+  };
+}
+
 function legacyHooks(options?: PluginOptions): Hooks {
   const id = providerID(options);
   return {
@@ -1225,7 +1283,9 @@ function legacyHooks(options?: PluginOptions): Hooks {
         forgetSession(event.properties.info.id);
       }
     },
-    tool: capabilityTools(options),
+    tool: claimDisabled()
+      ? capabilityTools(options)
+      : { ...capabilityTools(options), ...campaignTools(options) },
     auth: {
       provider: id,
       loader: async (auth) => {

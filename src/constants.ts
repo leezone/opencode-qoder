@@ -19,6 +19,27 @@ export const QODER_USERINFO_URL = `${QODER_OPENAPI_URL}/api/v1/userinfo`;
 export const QODER_REFRESH_URL = `${QODER_CENTER_URL}/algo/api/v3/user/refresh_token`;
 
 export const QODER_PAT_ENV = ["QODER_PERSONAL_ACCESS_TOKEN", "QODER_PAT"] as const;
+// --- promotional campaign surface ("签到领积分") ------------------------------
+//
+// The daily reward endpoints qodercli's `/claim` drives. Isolated on purpose:
+// this is a MARKETING activity, not a product API, so it is allowed to vanish
+// between two calls (observed live: the same account went from one CLAIMED
+// campaign to `showCampaign:false` in 25 minutes). Nothing on the model, chat,
+// catalog or quota path may import claim.ts -- the dependency runs one way, and
+// a test in __tests__/claim.test.ts fails the build if that ever inverts.
+//
+// Reference: GET /sash/api/v1/me/campaigns then POST .../campaigns/{id}/claim,
+// both plain Bearer on the OpenAPI host -- the same auth shape as QODER_QUOTA_URL.
+export const QODER_CAMPAIGNS_URL = `${QODER_OPENAPI_URL}/sash/api/v1/me/campaigns`;
+// Master switch for the whole promotional surface: set to 0/off/false/none and
+// the claim tools stop being registered AND the campaign skill stops being
+// offered, so `/qoder-claim` disappears instead of lingering as a dead command.
+// Read on every call, never cached at import -- turning an abandoned campaign
+// off must not need a rebuild or a restart.
+export const QODER_CLAIM_ENV = "OPENCODE_QODER_CLAIM";
+// A promo host must never hold a conversation turn open for as long as the
+// model list or quota call is allowed to.
+export const QODER_CLAIM_TIMEOUT_MS = 10 * 1000;
 // Multi-PAT bootstrap import. Deliberately NOT part of QODER_PAT_ENV: this is
 // not a credential-resolution layer (the chain still ends at the two env vars
 // above). At plugin setup its value is SPLIT on `,`/`;` and IMPORTED into the
