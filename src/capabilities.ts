@@ -1,16 +1,14 @@
-import { readFileSync } from "node:fs";
 import {
   describeTokenShape,
   fetchQoderAccount,
   identityUnresolved,
   type QoderProviderOptions,
   resolveQoderCredentials,
-  type StoredCredential,
+  storedConnectionToken,
 } from "./auth.js";
 import { text } from "./coerce.js";
 import { QODER_PAT_ENV, QODER_VERSION, REFRESH_SKEW_MS } from "./constants.js";
 import { readEnv } from "./env.js";
-import { opencodeDataFile } from "./json-store.js";
 import { describeKeyFile } from "./key-file.js";
 import { errorMessage, logPlugin } from "./log.js";
 import {
@@ -64,39 +62,22 @@ function pad(value: string, width: number): string {
 // --- credential funnel for tools -------------------------------------------
 
 // The tool surface runs in the legacy plugin instance, which sees the plugin's
-// own options but NOT the credential opencode resolved through auth.loader or a
-// `/connect` record. Those reach this instance over the globalThis channel the
-// legacy config hook publishes to, and -- last -- from opencode's own store on
-// disk.
-//
-// This ordering is deliberately NOT folded into resolveQoderCredentials(): the
-// discovery path must keep exactly the precedence documented in auth.ts, where
-// opencode hands the credential over itself. Reading the store off disk is a
-// tool-only fallback so that `/connect qoder` users can ask about their quota at
-// all; discovery is unaffected by it.
+// own options but NOT the credential opencode resolved through a `/connect`
+// record. The fold below recovers it the way the v2 realm assembles it
+// (discoveryOptions in index.ts: connection > plugin option > shared channel)
+// -- the same three sources, the same order, auth.json read off opencode's
+// store when nothing delivered it. Reading the store off disk is a tool-only
+// fallback so that `/connect qoder` users can ask about their quota at all;
+// this ordering is deliberately NOT folded into resolveQoderCredentials(),
+// which keeps exactly the precedence documented in auth.ts.
 function toolOptions(explicit?: QoderProviderOptions): QoderProviderOptions {
   const shared = readSharedApiKey();
-  const stored = shared ? "" : readStoredQoderToken();
-  const apiKey = explicit?.apiKey || shared || stored;
+  const stored = storedConnectionToken();
+  const apiKey = stored || explicit?.apiKey || shared;
   return {
     ...explicit,
     ...(apiKey ? { apiKey } : {}),
   };
-}
-
-// opencode's own credential store. Best-effort and read-only: a missing file, a
-// different install layout, or a corrupt JSON all collapse to "" and the report
-// says the credential is absent rather than guessing.
-function readStoredQoderToken(): string {
-  try {
-    const file = opencodeDataFile("auth.json");
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as { qoder?: StoredCredential };
-    const entry = parsed.qoder;
-    if (!entry) return "";
-    return text(entry.key) || text(entry.access);
-  } catch {
-    return "";
-  }
 }
 
 // --- quota ------------------------------------------------------------------
@@ -405,9 +386,9 @@ export async function reportAuth(explicit?: QoderProviderOptions): Promise<Capab
       layer: "pat-store selection (qoder_pat_switch)",
       shape: describeTokenShape(getSelectedPatString() ?? ""),
     },
-    { layer: "apiKey option", shape: describeTokenShape(options.apiKey) },
+    { layer: "opencode auth.json (/connect)", shape: describeTokenShape(storedConnectionToken()) },
+    { layer: "apiKey option", shape: describeTokenShape(explicit?.apiKey) },
     { layer: "shared channel (config hook)", shape: describeTokenShape(readSharedApiKey()) },
-    { layer: "opencode auth.json", shape: describeTokenShape(readStoredQoderToken()) },
     { layer: "key file (~/.qoderkey_env)", shape: keyFile },
     { layer: "pat-store active", shape: describeTokenShape(getActivePatString() ?? "") },
     ...QODER_PAT_ENV.map((key) => ({

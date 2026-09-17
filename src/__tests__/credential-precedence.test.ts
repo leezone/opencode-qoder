@@ -1,10 +1,12 @@
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invalidateQoderCredentials, resolveQoderCredentials } from "../auth.js";
+import { reportAuth } from "../capabilities.js";
 import { refreshKeyFile } from "../key-file.js";
 import { addPAT, followConfig, invalidateStore, switchPAT } from "../pat-store.js";
+import { publishSharedApiKey } from "../shared-state.js";
 
 // The precedence table in auth.ts is the contract that decides WHICH account a
 // request signs with, and this file is the only place that exercises it as a
@@ -162,5 +164,61 @@ describe("mtime liveness", () => {
     refreshKeyFile();
     await resolveQoderCredentials({});
     expect(requested).toEqual([ALPHA, BETA]);
+  });
+});
+
+describe("the tool surface folds like the model path (M1 regression)", () => {
+  // The capability tools run in the legacy realm, which never receives the
+  // /connect credential through options -- capabilities.toolOptions recovers
+  // it from disk. That fold must mirror discoveryOptions in index.ts
+  // (connection > apiKey option > shared channel), or the tools answer about
+  // one account while models/discovery sign with another -- exactly the drift
+  // this repo's --resolve table exists to catch.
+  function seedAuthJson(token: string): void {
+    process.env.XDG_DATA_HOME = dir;
+    mkdirSync(join(dir, "opencode"), { recursive: true });
+    writeFileSync(join(dir, "opencode", "auth.json"), JSON.stringify({ qoder: { key: token } }));
+  }
+
+  it("the /connect record outranks the plugin apiKey option and the shared channel", async () => {
+    const savedData = process.env.XDG_DATA_HOME;
+    try {
+      seedAuthJson(ALPHA); // the connection credential
+      publishSharedApiKey(BETA); // the legacy hook's published token
+      const requested = recordExchanges();
+      await reportAuth({ apiKey: GAMMA }); // a stale plugin option must lose
+      expect(requested).toEqual([ALPHA]);
+    } finally {
+      process.env.XDG_DATA_HOME = savedData;
+      delete (globalThis as Record<string, unknown>).__opencode_qoder_api_key;
+    }
+  });
+
+  it("without auth.json the option outranks the shared channel", async () => {
+    const savedData = process.env.XDG_DATA_HOME;
+    try {
+      process.env.XDG_DATA_HOME = dir; // exists, but holds no auth.json
+      publishSharedApiKey(BETA);
+      const requested = recordExchanges();
+      await reportAuth({ apiKey: GAMMA });
+      expect(requested).toEqual([GAMMA]);
+    } finally {
+      process.env.XDG_DATA_HOME = savedData;
+      delete (globalThis as Record<string, unknown>).__opencode_qoder_api_key;
+    }
+  });
+
+  it("with neither option nor auth.json, the shared channel still answers", async () => {
+    const savedData = process.env.XDG_DATA_HOME;
+    try {
+      process.env.XDG_DATA_HOME = dir;
+      publishSharedApiKey(BETA);
+      const requested = recordExchanges();
+      await reportAuth({});
+      expect(requested).toEqual([BETA]);
+    } finally {
+      process.env.XDG_DATA_HOME = savedData;
+      delete (globalThis as Record<string, unknown>).__opencode_qoder_api_key;
+    }
   });
 });
