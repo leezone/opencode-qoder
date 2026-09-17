@@ -11,10 +11,12 @@ Two surfaces, one implementation:
    tools via `Hooks.tool`. Prefer these inside a conversation: they run in the
    plugin's own process, reuse its warm catalog state, and are self-describing.
 2. **Shell script (fallback)** — `scripts/qoder-quota.mjs`, for contexts where
-   no opencode session is running (cron, heartbeat, a bare shell). It reads the
-   same credential layers; see its `--help`. In commands below, `<skill-dir>`
-   is the directory holding this file — the plugin auto-registers the skill
-   from its own package, so no manual install step is involved.
+   no opencode session is running (cron, heartbeat, a bare shell). A thin
+   wrapper over the plugin's own compiled modules, so it reads the *same*
+   credential chain and PAT store the tools do; see its `--help`. In commands
+   below, `<skill-dir>` is the directory holding this file — the plugin
+   auto-registers the skill from its own package, so no manual install step is
+   involved.
 
 Both answer the same questions, so pick by context, not by habit. Neither prints
 a token.
@@ -204,7 +206,8 @@ can reduce quota usage by 50-80% for typical sessions.
 ## Failures that are not failures
 
 - A quota tool error naming credentials means the **tool process** saw no
-  credential layer. Check `qoder_auth` first: it lists every layer by shape
+  credential layer. Check `qoder_auth` first (or `--resolve` from a bare shell
+  for the same table): it lists every layer by shape
   (`pat`, `opaque(27)`, `absent`). `absent` everywhere = set
   `QODER_PERSONAL_ACCESS_TOKEN` or run `/connect qoder`.
 - `qoder_catalog` showing `source=fallback` means discovery never succeeded; its
@@ -231,8 +234,29 @@ these tools.
 ```bash
 node <skill-dir>/scripts/qoder-quota.mjs            # human summary
 node <skill-dir>/scripts/qoder-quota.mjs --json     # structured
-node <skill-dir>/scripts/qoder-quota.mjs --refresh  # skip cached job token
+node <skill-dir>/scripts/qoder-quota.mjs --resolve  # which layer answers, offline (see below)
+node <skill-dir>/scripts/qoder-quota.mjs --pats     # probe every stored PAT (see Recovery)
+node <skill-dir>/scripts/qoder-quota.mjs --use-pat=Work  # switch the store from the shell
 ```
+
+This is a thin wrapper over the plugin's compiled `dist/quota-cli.js`, not a
+second implementation — the credential chain, the PAT store and the quota
+buckets are the *same code* the chat tools run, so the shell and a chat cannot
+drift apart (they once did). In a source checkout `npm run build` first; an
+installed plugin already ships the build.
+
+`--resolve` answers "which credential layer wins" with no network and no token
+bytes — a SHA-256 fingerprint per layer, walking exactly the `auth.ts`
+precedence (the store's `selected` entry above `auth.json`, the configured
+apiKey, the key file, the store's `active` entry, the environment *last*). Use
+it when a switch "didn't take": it shows what would sign, so you see the layer
+that outranks the one you changed. `--pat` / `--token` sit above the whole
+table on purpose (an explicit CLI act).
+
+`--json` reports the buckets under `userQuota` / `addOnQuota` / `orgPackage` /
+`sharedPackage` (each present or not), plus `remainingTotal`, `exhausted` and a
+`credential` fingerprint. An org package and a shared package are separate
+lines — read both before calling an account dry.
 
 Exit `0` = data fetched (credits may still be spent); exit `1` = nothing usable,
 with the reason on stderr. Read the stderr; never report a number you did not

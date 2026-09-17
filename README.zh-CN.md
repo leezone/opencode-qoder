@@ -87,6 +87,8 @@ credit 倍率、上下文档位与思考档位来自线上发现（下一节）�
 | `qoder_tier_list` | 查看每个模型的可选上下文档位、本会话当前档位以及活跃的路由策略 |
 | `qoder_tier_switch` | 为当前会话切换上下文档位（`model` + `tier`；`model: "*"` 表示对所有支持该档的模型生效；省略 `tier` 恢复默认） |
 | `qoder_routing_policy` | 查看/设置子代理超档自动升级策略（无参数=查看） |
+| `qoder_campaign` | 只读查询当日签到活动：窗口、状态、奖励；`all: true` 可扫全部已存 PAT |
+| `qoder_claim` | 执行领取本身——一次显式变更操作；`all: true` 可扫多账号 |
 
 查询配额本身不计费：连续十次读取，用量计数器纹丝不动（2026-09-08 实测）。两次读取之间数字若发生变化，那是模型消耗，与这些工具无关。
 
@@ -95,10 +97,10 @@ credit 倍率、上下文档位与思考档位来自线上发现（下一节）�
 ```bash
 node skills/qoder-quota/scripts/qoder-quota.mjs            # 人类可读
 node skills/qoder-quota/scripts/qoder-quota.mjs --json     # 结构化输出
-node skills/qoder-quota/scripts/qoder-quota.mjs --refresh  # 跳过缓存的 job token
+node skills/qoder-quota/scripts/qoder-quota.mjs --resolve  # 离线打印哪层凭证在应答
 ```
 
-脚本的凭证解析顺序与插件一致：`--pat`/`--token`，其次 `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`，再次 `opencode.jsonc` 中的 `provider.qoder.options.apiKey`（自动展开 `{file:...}`），然后 `~/.qoderkey_env`，最后 opencode 自身的 `auth.json`。
+脚本是插件编译模块的薄封装，因此凭证解析顺序与插件严格一致：`--pat`/`--token`（显式 CLI 行为）最高，其次 store 中被手动切换到的条目、opencode 自身的 `auth.json`、配置的 `apiKey`、密钥文件、store 自动激活的条目，环境变量（`QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`）殿后。
 
 ## 认证
 
@@ -181,3 +183,43 @@ node <plugin-dir>/skills/qoder-quota/scripts/qoder-quota.mjs --use-pat=Work
 | **PAT 本身**被吊销，或账户订阅过期 | 只能你来——`--use-pat` 切到健康备用项，或 `qoder_pat_add` / 重新 `/connect` 一个新 PAT |
 
 切换到健康备用项就是全部的恢复——`--use-pat` 翻转 store，下一个请求采纳它，你继续在已经活过来的对话里干活。
+
+## 每日签到领取（营销活动面）
+
+Qoder 会不定时上架限时营销活动——通常是每天签到送 credits——其官方 CLI 通过一条服务端下发的 `/claim` 命令来领取。本插件只用一个朴素的 Bearer 客户端驱动同样的两个端点：既不下载也不执行任何远程代码，资格与时间窗口一律以服务端为准（代码里任何地方都没有硬编码 12:00）。
+
+这是**一个营销面，不是 provider 的一部分**。活动随时可能撤下，所以它被设计成"安静地失败、整块地拆走"：`src/claim.ts` 是一片叶子——模型、目录、配额路径上的任何模块都不许 import 它，而 `src/__tests__/claim.test.ts` 会在这一约束被破坏时让构建失败。
+
+| 工具 | 行为 |
+| --- | --- |
+| `qoder_campaign` | 只读：服务端此刻给出什么活动、窗口、状态、奖励。`all: true` 扫描全部已存 PAT。 |
+| `qoder_claim` | 领取本身——一次显式变更操作；`all: true` 可扫多账号。 |
+
+一个 200 但列表为空，就是"这个活动此刻与你无关"的常态形状，因此它照实这么说，并且**完全不进入冷却**：实测 `showCampaign` 会在日窗口仍开着的时候反复抖动，一旦睡过去就会直接错过奖励。只有路由真的不存在才配得上长冷却（404/410 → 6 小时，好让一个死掉的活动不再骚扰网关）；瞬时 5xx 给 45 分钟；409 被读作"不在窗口内"，而不是"服务坏了"。这里的公开函数永不 throw——每一种失败都作为一条结论返回。
+
+活动技能（`skills-campaign/qoder-claim/`，暴露为 `/qoder-claim`）只在营销面启用时才注册，所以关掉开关会连命令一起摘掉：
+
+```bash
+export OPENCODE_QODER_CLAIM=off   # 0 / off / false / none / disable / disabled，不区分大小写
+```
+
+此后活动路径上的一切只报告"已关闭"，不发任何请求；插件其余部分毫无变化。若想永久下线这个活动，删掉 `src/claim.ts`、它在 `src/index.ts` 里的接线，以及 `skills-campaign/` 目录即可。
+
+要无人值守地每日领取，自带脚本会打印出**适配本机**的定时任务行，node 与脚本的绝对路径都已填好——它只负责打印，装不装由你决定：
+
+```bash
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs           # 为当前激活账号领取
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs --status  # 只问不给
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs --all     # 扫描全部已存 PAT
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs --schedule # 打印 cron / 任务计划程序命令
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs --reset    # 清除本地冷却状态
+```
+
+```bash
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs --json --all \
+  | jq -r '.attempts[] | "\(.account)\t\(.outcome)\t\(.awarded // 0)"'
+```
+
+退出码 `0` 表示任务跑过了——包括"今天没奖可领"与"正在冷却"——所以一个健康的定时任务会保持沉默；`1` 是需要人来判断的结论；`2` 表示开关已关闭而定时任务还在触发，也就是该把那个任务摘掉了。重复运行是安全的：本机已领过的窗口会被跳过。`~/.config/opencode/qoder-claim.json`（遵循 `XDG_CONFIG_HOME`）只保存这条去重记录与冷却状态——它是本地礼遇，永远不是事实来源。
+
+`--schedule` 在 Linux/macOS 上输出一行 crontab，在 Windows 上输出 PowerShell 的 `Register-ScheduledTask`。任务计划程序不会继承你的 shell 环境变量，因此装配 Windows 任务时，要让凭证在脱离环境的情况下也能解析到（用户级环境变量、`auth.json`，或那个 key 文件），而不是依赖你在测试用的那个终端里 export 过的东西。

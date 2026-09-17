@@ -35,7 +35,14 @@ export function setQuotaExhausted(value: boolean): void {
 // Single source for isQuotaExhausted()'s sum AND quotaSnapshot()'s rendering AND
 // the tool report: the camelCase / snake_case key lists used to be retyped in
 // both, and a rename upstream would have had to land in two places.
-export type QuotaBucketKey = "userQuota" | "addOnQuota" | "orgPackage";
+//
+// orgResourcePackage and sharedQuota are separate buckets, not two spellings
+// of one -- the skill script has always rendered them as distinct lines, and
+// they once shared an entry HERE, first-match-wins: a payload carrying both
+// silently lost the shared number, so the tool's "Total left" undercounted the
+// balance actually spendable. Each bucket keeps its own camel/snake pair;
+// nothing merges across buckets.
+export type QuotaBucketKey = "userQuota" | "addOnQuota" | "orgPackage" | "sharedPackage";
 
 const QUOTA_BUCKETS: ReadonlyArray<{
   key: QuotaBucketKey;
@@ -44,11 +51,8 @@ const QUOTA_BUCKETS: ReadonlyArray<{
 }> = [
   { key: "userQuota", label: "plan", keys: ["user_quota", "userQuota"] },
   { key: "addOnQuota", label: "add-on", keys: ["add_on_quota", "addOnQuota"] },
-  {
-    key: "orgPackage",
-    label: "org package",
-    keys: ["org_resource_package", "orgResourcePackage", "shared_quota", "sharedQuota"],
-  },
+  { key: "orgPackage", label: "org package", keys: ["org_resource_package", "orgResourcePackage"] },
+  { key: "sharedPackage", label: "shared", keys: ["shared_quota", "sharedQuota"] },
 ];
 
 export type QuotaBucket = {

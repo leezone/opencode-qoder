@@ -87,6 +87,8 @@ Once loaded, the plugin registers read-only tools that answer account questions 
 | `qoder_tier_list` | See each model's advertised tiers, this conversation's tier, and the active routing policy |
 | `qoder_tier_switch` | Switch the current conversation's context tier (`model` + `tier`; `model: "*"` applies to every model advertising the tier; omit `tier` to restore default) |
 | `qoder_routing_policy` | View or edit the lite→qfmodel auto-escalation policy (no params = show) |
+| `qoder_campaign` | Today's promotional check-in as the server describes it: window, status, reward (read-only; `all` sweeps stored PATs) |
+| `qoder_claim` | The claim POST itself — see [Daily campaign claim](#daily-campaign-claim) |
 
 Reading quota is unmetered: ten consecutive reads leave the usage counters unchanged (verified 2026-09-08). If the numbers move between reads, that is model usage, not these tools.
 
@@ -95,10 +97,14 @@ The plugin also bundles the `qoder-quota` skill (`skills/qoder-quota/`) and regi
 ```bash
 node skills/qoder-quota/scripts/qoder-quota.mjs            # human-readable
 node skills/qoder-quota/scripts/qoder-quota.mjs --json     # structured
-node skills/qoder-quota/scripts/qoder-quota.mjs --refresh  # skip the cached job token
+node skills/qoder-quota/scripts/qoder-quota.mjs --resolve  # which credential layer answers, offline
 ```
 
-The script resolves credentials in the same order the plugin does: `--pat`/`--token`, then `QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`, then `provider.qoder.options.apiKey` in `opencode.jsonc` (expanding `{file:...}`), then `~/.qoderkey_env`, then opencode's own `auth.json`.
+The script is a thin wrapper over the plugin's compiled modules, so it resolves
+credentials with exactly the plugin's precedence: `--pat`/`--token` (an explicit
+CLI act), then the store's switched-to entry, then opencode's `auth.json`, the
+configured `apiKey`, the key file, the store's auto-active entry, and the
+environment (`QODER_PERSONAL_ACCESS_TOKEN`/`QODER_PAT`) last.
 
 ## Authenticate
 
@@ -178,3 +184,43 @@ The tier system can route an over-budget *conversation* to free `lite`, but only
 | **The PAT itself** revoked, or the account's subscription lapsed | only you — `--use-pat` to a healthy backup, or `qoder_pat_add` / re-`/connect` a new PAT |
 
 An `ACCOUNT-INACTIVE` verdict means the whole account is down, so a backup on the *same* account won't help; seed a PAT for a different one with `OPENCODE_QODER_PAT`. Switching to a healthy backup is the entire recovery — `--use-pat` flips the store, the next request picks it up, and you keep working in the now-live chat.
+
+## Daily campaign claim
+
+Qoder runs time-boxed marketing campaigns — usually a daily check-in worth credits — and its own CLI claims them through a server-pushed `/claim` command. The plugin drives the same two endpoints with nothing but a plain Bearer client: no remote code is fetched or executed, and the server stays the authority on eligibility and window (no 12:00 is hardcoded anywhere).
+
+This is a **marketing surface, not part of the provider**. An activity can be withdrawn without notice, so it is built to fail quietly and to leave in one piece: `src/claim.ts` is a leaf — no module on the model, catalog or quota path imports it, and `src/__tests__/claim.test.ts` fails the build if that ever inverts.
+
+| Tool | Behaviour |
+| --- | --- |
+| `qoder_campaign` | Read-only: what the server offers right now, the window, the status, the reward. `all: true` sweeps every stored PAT. |
+| `qoder_claim` | The claim itself — an explicit mutation, `all: true` to sweep accounts. |
+
+A 200 whose list is empty is the ordinary shape of "this activity is not for you right now", so it says exactly that and cools down for *nothing*: `showCampaign` was observed flapping while the daily window was still open, and sleeping on it would walk past the reward. Only a genuinely missing route earns the long cooldown (404/410 → 6 h, so a dead activity stops nagging the gateway); a transient 5xx gets 45 min, and a 409 reads as "outside the window", not "something broke". A public function here never throws — every failure comes back as a verdict.
+
+The campaign skill (`skills-campaign/qoder-claim/`, exposed as `/qoder-claim`) registers only while the surface is enabled, so switching it off takes the command with it:
+
+```bash
+export OPENCODE_QODER_CLAIM=off   # 0 / off / false / none / disable / disabled, case-insensitive
+```
+
+Everything on the campaign path then reports itself switched off and sends no request; the rest of the plugin is untouched. To retire the activity permanently instead, delete `src/claim.ts`, its wiring in `src/index.ts`, and `skills-campaign/`.
+
+For an unattended daily claim, the bundled script prints the recurring-job line for the machine it runs on, with node's and its own absolute paths already filled in — it prints only, you arm it:
+
+```bash
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs           # claim for the active account
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs --status   # just ask what is offered
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs --all      # sweep every stored PAT
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs --schedule # cron / Task Scheduler line
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs --reset    # forget local cooldown state
+```
+
+```bash
+node skills-campaign/qoder-claim/scripts/qoder-claim.mjs --json --all \
+  | jq -r '.attempts[] | "\(.account)\t\(.outcome)\t\(.awarded // 0)"'
+```
+
+Exit `0` means the job ran — including "nothing to claim today" and "cooling down" — so a healthy schedule stays silent; `1` is a verdict needing a human; `2` means the kill switch is off while the schedule still fires, i.e. take the job down. Re-running is safe: a window already claimed from this machine is skipped. `~/.config/opencode/qoder-claim.json` (honours `XDG_CONFIG_HOME`) holds only that dedup record and cooldown state — a local courtesy, never the source of truth.
+
+`--schedule` emits a crontab line on Linux/macOS and a PowerShell `Register-ScheduledTask` on Windows. Task Scheduler does not inherit your shell environment, so arm the Windows job with the credential reachable without one (a user-level variable, `auth.json`, or the key file) rather than relying on what you exported in the terminal you tested from.

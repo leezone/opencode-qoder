@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import { text } from "./coerce.js";
 import {
   DEVICE_TOKEN_TTL_SECONDS,
@@ -16,6 +17,7 @@ import {
 } from "./constants.js";
 import { type CosyCredentials, getMachineId } from "./cosy.js";
 import { jsonHeaders, readErrorBody } from "./http.js";
+import { opencodeDataFile } from "./json-store.js";
 import { keyFileToken } from "./key-file.js";
 import { errorMessage, logPlugin } from "./log.js";
 import { isImportListValue } from "./pat-import.js";
@@ -225,7 +227,9 @@ export function invalidateQoderCredentials(pat: string): void {
   if (cached && !(cached instanceof Promise)) identityByToken.delete(cached.access);
 }
 
-function getEnvPat(): string {
+// Exported for quota-cli.ts: the standalone credential walk must end on this
+// same layer (last), exactly as the table above resolveQoderCredentials() says.
+export function getEnvPat(): string {
   for (const key of QODER_PAT_ENV) {
     const value = process.env[key];
     if (value) return value;
@@ -386,6 +390,26 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
   } catch (error) {
     credentialsCache.delete(pat);
     throw error;
+  }
+}
+
+// What `/connect qoder` persisted, read off opencode's own store. The plugin
+// normally never needs this read -- opencode hands the connection credential to
+// it directly (layer 3 above). The disk form exists for the surfaces opencode
+// does not feed: the capability tools in the legacy realm, and the standalone
+// CLI, which has no realm at all. Best-effort and read-only: a missing file, a
+// different install layout or corrupt JSON all collapse to "", so a report says
+// the credential is absent rather than guessing.
+export function storedConnectionToken(): string {
+  try {
+    const parsed = JSON.parse(readFileSync(opencodeDataFile("auth.json"), "utf8")) as {
+      qoder?: StoredCredential;
+    };
+    const entry = parsed.qoder;
+    if (!entry) return "";
+    return text(entry.key) || text(entry.access);
+  } catch {
+    return "";
   }
 }
 
