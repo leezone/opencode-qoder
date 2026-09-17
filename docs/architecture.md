@@ -2,7 +2,7 @@
 
 > 版本：0.2.1  
 > 更新日期：2026-09-17  
-> 代码总量：~6,800 行 TypeScript（src/）
+> 代码总量：~8,400 行 TypeScript（src/，不含测试）
 
 ## 1. 项目定位
 
@@ -14,7 +14,8 @@ opencode-qoder 是 [opencode](https://opencode.ai/) 的 **Qoder Global provider 
 4. **流式对话**：SSE 解析，tool call / 图片输入 / reasoning 支持
 5. **上下文层级**：per-session context tier 管理
 6. **子代理路由**：自动将 compaction/title 等子代理路由到免费模型
-7. **能力工具**：12 个只读工具供模型查询账户/配额/模型信息
+7. **能力工具**：15 个工具供模型查询账户/配额/模型信息，并管理多 PAT 与上下文层级
+8. **每日活动**：签到/领取奖励（服务端权威，插件不持有时钟判断）
 
 ## 2. 模块总览
 
@@ -29,8 +30,13 @@ src/
 ├── model-catalog.ts      # 动态模型发现，三级缓存
 ├── static-models.ts      # 静态模型回退表加载
 ├── models.json           # 内置模型定义（编译时复制）
-├── quota.ts              # 配额查询（独立于模型列表）
-├── capabilities.ts       # 只读能力报告层（工具的数据源）
+├── quota.ts              # 配额查询（四桶独立：userQuota / addOn / orgPackage / sharedPackage）
+├── quota-cli.ts          # 独立 CLI 面（脚本 skills/qoder-quota 的唯一实现源）
+├── capabilities.ts       # 只读能力报告层（额度/账户/模型/目录/认证状态）
+├── pat-tools.ts          # PAT 四件套工具的报告逻辑（增删改查 + token 形状脱敏）
+├── tier-tools.ts         # 上下文层级 + 子代理路由工具的报告逻辑
+├── claim.ts              # 每日活动面：资格报告 + 领取（服务端权威）
+├── errors.ts             # 上游错误 → APICallError 的叶子模块（模型路径专用）
 ├── pat-store.ts          # 多 PAT 存储（JSON 文件 + globalThis 缓存）
 ├── pat-import.ts         # PAT 批量导入（环境变量 / 密钥文件）
 ├── key-file.ts           # 种子密钥文件（~/.qoderkey_env）
@@ -48,58 +54,69 @@ src/
 
 ## 3. 模块依赖关系
 
+工具注册按"一个产品面一个模块"归口。只读报告在 `capabilities.ts`，
+可变操作各有归属（`pat-tools.ts` / `tier-tools.ts` / `claim.ts`）；
+`index.ts` 只做 schema 声明 + 把报告适配成 `tool()` 形态，不写渲染逻辑。
+
 ```
-                        ┌─────────────┐
-                        │  index.ts   │  ← 插件入口，注册所有钩子和工具
-                        └──────┬──────┘
-                               │
-        ┌──────────────────────┼──────────────────────┐
-        │                      │                      │
-        ▼                      ▼                      ▼
-┌───────────────┐   ┌──────────────────┐   ┌─────────────────┐
-│ language-     │   │ model-catalog.ts │   │ capabilities.ts │
-│ model.ts      │   └────────┬─────────┘   └────────┬────────┘
-└───────┬───────┘            │                      │
-        │                    ▼                      │
-        │           ┌──────────────────┐            │
-        │           │ static-models.ts │            │
-        │           └──────────────────┘            │
-        │                                           │
-        ├──────────────┬──────────────┬─────────────┤
-        │              │              │             │
-        ▼              ▼              ▼             ▼
-┌───────────┐  ┌───────────┐  ┌──────────┐  ┌──────────┐
-│ auth.ts   │  │ cosy.ts   │  │ quota.ts │  │ tier-    │
-└─────┬─────┘  └─────┬─────┘  └────┬─────┘  │ store.ts │
-      │              │             │         └────┬─────┘
-      │              │             │              │
-      ▼              ▼             ▼              ▼
-┌───────────┐  ┌───────────┐  ┌──────────┐  ┌──────────┐
-│ pat-store │  │ encoding  │  │ http.ts  │  │ session- │
-│ key-file  │  │ .ts       │  │          │  │ roots.ts │
-│ pat-import│  └───────────┘  └──────────┘  └────┬─────┘
-└─────┬─────┘                                    │
-      │                                          │
-      └──────────────────┬───────────────────────┘
-                         │
-                         ▼
-                  ┌──────────────┐
-                  │ shared-      │  ← globalThis 跨 realm 通道
-                  │ state.ts     │
-                  └──────┬───────┘
-                         │
-              ┌──────────┼──────────┐
-              ▼          ▼          ▼
-        ┌──────────┐ ┌────────┐ ┌──────────┐
-        │ json-    │ │ log.ts │ │ env.ts   │
-        │ store.ts │ └────────┘ └──────────┘
-        └──────────┘
-              │
-              ▼
-        ┌──────────┐
-        │coerce.ts │  ← 叶子节点，无依赖
-        └──────────┘
+                          ┌─────────────┐
+                          │  index.ts   │  ← 入口：钩子 + 15 工具注册
+                          └──────┬──────┘
+        ┌───────────────┬────────┼──────────┬───────────────┐
+        ▼               ▼        ▼          ▼               ▼
+┌───────────────┐ ┌──────────┐ ┌────────┐ ┌────────────┐ ┌────────┐
+│ language-     │ │capabil-  │ │pat-    │ │tier-tools  │ │claim.ts│
+│ model.ts      │ │ities.ts  │ │tools.ts│ │(tier+路由) │ │(活动)  │
+└───────┬───────┘ └────┬─────┘ └───┬────┘ └─────┬──────┘ └───┬────┘
+        │              │           │            │            │
+        ▼              │           ▼            ▼            │
+┌───────────┐          │      ┌─────────┐  ┌──────────┐      │
+│ errors.ts │          │      │pat-store│  │tier-store│      │
+│(叶子:上游 │          │      │key-file │  │routing-  │      │
+│ 错误→API  │          │      │pat-import│ │ policy   │      │
+│ CallError)│          │      └────┬────┘  └────┬─────┘      │
+└──────┬────┘          │           │            │            │
+       │               ▼           │            │            │
+       │         ┌──────────┐      │            │            │
+       │         │model-    │      │            │            │
+       │         │catalog.ts│      │            │            │
+       │         └────┬─────┘      │            │            │
+       │              ▼            │            │            │
+       │       ┌──────────────┐    │            │            │
+       │       │static-models │    │            │            │
+       │       └──────────────┘    │            │            │
+       ▼                           ▼            ▼            ▼
+┌───────────┐  ┌───────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│ auth.ts   │  │ cosy.ts   │  │ quota.ts │  │ session- │  │ quota-   │
+│           │  │           │  │          │  │ roots.ts │  │ cli.ts   │
+└─────┬─────┘  └─────┬─────┘  └────┬─────┘  └────┬─────┘  │(脚本薄封 │
+      │              │             │             │        │ 装的独立 │
+      │              ▼             ▼             │        │ CLI 面)  │
+      │        ┌───────────┐  ┌──────────┐       │        └────┬─────┘
+      │        │ encoding  │  │ http.ts  │       │             │
+      │        │ .ts       │  └──────────┘       │             │
+      │        └───────────┘                     │             │
+      └──────────────┬───────────────────────────┴─────────────┘
+                     ▼
+              ┌──────────────┐
+              │ shared-      │  ← globalThis 跨 realm 通道
+              │ state.ts     │
+              └──────┬───────┘
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+    ┌──────────┐ ┌────────┐ ┌──────────┐
+    │ json-    │ │ log.ts │ │ env.ts   │
+    │ store.ts │ └────────┘ └──────────┘
+    └────┬─────┘
+         ▼
+    ┌──────────┐
+    │coerce.ts │  ← 叶子节点，无依赖
+    └──────────┘
 ```
+
+`quota-cli.ts`、`pat-tools.ts`、`tier-tools.ts` 复用与工具完全相同的凭证漏斗
+（`auth.ts`）与状态模块，因此脚本、CLI、工具三处看到的账号必然一致。
 
 ## 4. 插件生命周期
 
@@ -138,15 +155,20 @@ opencode 启动
 
 ### 5.1 凭证解析优先级
 
+`auth.ts` 的 `resolveQoderCredentials()` 是唯一的凭证漏斗，优先级从高到低（源码注释即权威）：
+
 ```
-1. 显式 PAT 选择（qoder_pat_switch）     ← pat-store.ts
-2. 密钥文件（~/.qoderkey_env）           ← key-file.ts
-3. 插件选项 apiKey                       ← opencode.json
-4. opencode auth.json 存储               ← auth.ts
-5. 环境变量 QODER_PERSONAL_ACCESS_TOKEN  ← auth.ts
-6. 环境变量 QODER_PAT                    ← auth.ts
-7. PAT store 自动激活条目                ← pat-store.ts
+1. personalAccessToken 选项          ← 显式，最高优先
+2. 显式 store 选择（qoder_pat_switch）← pat-store.ts（自动激活的首个导入不算）
+3. 连接凭证（/connect qoder 落盘）    ← auth.json
+4. 插件选项 apiKey                   ← opencode.json（PAT 列表形态被跳过）
+5. shared apiKey                     ← legacy 实例经 globalThis 发布给 v2
+6. 密钥文件单凭证形态                 ← ~/.qoderkey_env（列表形态交导入器）
+7. PAT store 自动激活条目             ← getActivePatString()
+8. 环境变量 QODER_PERSONAL_ACCESS_TOKEN → QODER_PAT
 ```
+
+`qoder-quota.mjs` 脚本、`quota-cli.ts` CLI 与 `capabilities.ts` 工具都复用同一漏斗（脚本经 `dist/quota-cli.js`，不再是独立实现），三处选择的账号必然一致——这正是之前额度/优先级漂移 bug 的根治点。
 
 ### 5.2 设备登录流程
 
@@ -246,6 +268,8 @@ HTTP 错误 / SSE 内嵌错误
     └── 其他 → APICallError 抛出
 ```
 
+以上归类与转译全部住在 `errors.ts`（叶子模块：模型路径依赖它，它不依赖模型路径）。
+
 ## 7. 模型发现
 
 ### 7.1 三级数据源
@@ -327,22 +351,30 @@ QoderModelDefinition {
 
 ## 9. 工具注册
 
-插件注册 12 个只读工具，供模型查询账户信息：
+插件在 legacy realm 注册 15 个工具（v2 无工具注册面）。注册与描述留在 `index.ts`，
+报告逻辑按"一个产品面一个模块"归口——只读报告在 `capabilities.ts`，
+可变操作各有归属（`pat-tools.ts` / `tier-tools.ts` / `claim.ts`）：
 
-| 工具 | 数据源 | 用途 |
+| 工具 | 实现模块 | 用途 |
 |------|--------|------|
-| `qoder_quota` | `quota.ts` | 查询剩余额度 |
-| `qoder_account` | `auth.ts` | 查询账户信息 |
-| `qoder_models` | `model-catalog.ts` | 列出所有模型 |
-| `qoder_model` | `model-catalog.ts` | 查询单个模型详情 |
-| `qoder_catalog` | `model-catalog.ts` | 模型目录诊断 |
-| `qoder_auth` | `auth.ts` | 认证状态 |
-| `qoder_pat_list` | `pat-store.ts` | 列出存储的 PAT |
-| `qoder_pat_switch` | `pat-store.ts` | 切换活跃 PAT |
-| `qoder_pat_add` | `pat-store.ts` | 添加新 PAT |
-| `qoder_pat_remove` | `pat-store.ts` | 删除 PAT |
-| `qoder_tier_list` | `tier-store.ts` | 列出可用上下文层级 |
-| `qoder_tier_switch` | `tier-store.ts` | 切换上下文层级 |
+| `qoder_quota` | `capabilities.ts` → `quota.ts` | 查询剩余额度 |
+| `qoder_account` | `capabilities.ts` | 查询账户信息 |
+| `qoder_models` | `capabilities.ts` | 列出所有模型 |
+| `qoder_model` | `capabilities.ts` | 查询单个模型详情 |
+| `qoder_catalog` | `capabilities.ts` | 模型目录诊断 |
+| `qoder_auth` | `capabilities.ts` | 认证状态（只报形状不报 token） |
+| `qoder_pat_list` | `pat-tools.ts` → `pat-store.ts` | 列出存储的 PAT |
+| `qoder_pat_switch` | `pat-tools.ts` → `pat-store.ts` | 切换/清除显式选择 |
+| `qoder_pat_add` | `pat-tools.ts` → `pat-store.ts` | 添加新 PAT |
+| `qoder_pat_remove` | `pat-tools.ts` → `pat-store.ts` | 删除 PAT |
+| `qoder_tier_list` | `tier-tools.ts` → `tier-store.ts` | 列出可用上下文层级 |
+| `qoder_tier_switch` | `tier-tools.ts` → `tier-store.ts` | 切换本会话层级（`*` 批量） |
+| `qoder_routing_policy` | `tier-tools.ts` → `routing-policy.ts` | 查看/修改子代理路由策略 |
+| `qoder_campaign` | `claim.ts` | 查看每日活动（只读，不领取） |
+| `qoder_claim` | `claim.ts` | 领取签到奖励（服务端权威） |
+
+`triggerCatalogRefresh`（v2 目录刷新的 globalThis 触发器）留在 `index.ts`，
+以回调形式注入 `reportTierSwitch`——跨 realm 管线不外迁。
 
 ## 10. 子代理路由策略
 
@@ -426,6 +458,14 @@ lite 是免费模型（200K 上下文），用于 title/compaction/plan 等机�
 
 每 60 秒检查 mtime，文件修改后自动重新导入，无需重启。这使得 CI/CD 环境可以动态更新凭证。
 
+### 12.5 为什么每个工具面单独成模块，脚本只是薄封装？
+
+历史教训：`qoder-quota.mjs` 曾独立实现凭证链与配额桶（817 行），与插件产生真实漂移——同一账号在对话里和脚本里显示不同总额、甚至查询不同账号。现在的规则：
+
+- **一个产品面一个模块**：`capabilities.ts` 只读、`pat-tools.ts` / `tier-tools.ts` / `claim.ts` 各自含可变操作；`index.ts` 只声明 schema 并转发。
+- **脚本永不复制逻辑**：`skills/*/scripts/*.mjs` 一律 `import` 编译产物（`dist/quota-cli.js` / `dist/claim.js`），自身只做参数解析与退出码。
+- **凭证漏斗只有一个**（`resolveQoderCredentials`）：任何新面要选凭证，必须复用它——不要就地写 `||` 链。
+
 ## 13. 环境变量
 
 | 变量 | 用途 | 默认值 |
@@ -440,6 +480,8 @@ lite 是免费模型（200K 上下文），用于 title/compaction/plan 等机�
 | `QODER_MODEL_DISK_CACHE` | 覆盖磁盘缓存路径 | - |
 | `QODER_STATIC_MODELS` | 自定义静态模型表 | - |
 | `OPENCODE_QODER_LOG_FILE` | 诊断日志路径 | - |
+| `QODER_REASONING_EFFORT` | 覆盖 thinking 强度（先于选项生效） | - |
+| `OPENCODE_QODER_CLAIM` | 每日活动开关（每次调用读取，不缓存） | 启用 |
 | `QODER_DISABLE_BUNDLED_SKILL` | 禁用内置 skill | - |
 
 ## 14. 测试覆盖
@@ -448,26 +490,29 @@ lite 是免费模型（200K 上下文），用于 title/compaction/plan 等机�
 src/__tests__/
 ├── auth-failure-note.test.ts    # 认证失败处理
 ├── capabilities.test.ts         # 能力报告
-├── credential-precedence.test.ts # 凭证优先级
+├── claim.test.ts              # 每日活动（资格/领取/服务端权威）
+├── credential-precedence.test.ts # 凭证优先级（含 toolOptions 折叠回归）
 ├── discovery.test.ts            # 模型发现
 ├── encoding.test.ts             # COSY 编码
-├── env-isolation.setup.ts       # 环境隔离
+├── env-isolation.setup.ts       # 环境隔离（HOME/XDG 指向空树）
 ├── key-file.test.ts             # 密钥文件
 ├── login-expiry.test.ts         # 登录过期
 ├── log.test.ts                  # 日志
 ├── pat-import.test.ts           # PAT 导入
 ├── pat-store.test.ts            # PAT 存储
+├── quota-cli.test.ts            # 独立 CLI 面（四桶/走序/probePat）
 ├── quota.test.ts                # 配额
 ├── routing-policy.test.ts       # 路由策略
 ├── session-roots.test.ts        # 会话根
 ├── static-models.test.ts        # 静态模型
 ├── stream.test.ts               # SSE 流解析
 ├── tier-store.test.ts           # 层级存储
+├── tools-surfaces.test.ts       # pat-tools/tier-tools 报告面契约
 ├── transform.test.ts            # 请求转换
 └── xdg-paths.test.ts            # XDG 路径
 ```
 
-运行测试：`pnpm test`
+共 206 个用例。运行测试：`pnpm test`
 
 ## 15. 构建与发布
 
@@ -481,7 +526,7 @@ pnpm test           # 运行测试
 
 发布产物：
 - `dist/` — 编译后的 JS + 类型定义
-- `skills/` — 内置 skill（qoder-quota）
+- `skills/` — 内置 skill（qoder-quota、qoder-claim），均为 `dist/` 的薄封装脚本
 - `README.md` / `README.zh-CN.md` — 文档
 - `LICENSE` — MIT
 
