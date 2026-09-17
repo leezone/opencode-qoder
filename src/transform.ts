@@ -39,6 +39,15 @@ export interface TransformedPrompt {
   lastUserText: string;
 }
 
+// How a file part's bytes reach the gateway. Defaults to an inline data URL;
+// language-model.ts substitutes a resolver that publishes the image to the
+// center service first and returns its durable URL, keeping the request small.
+// Returning undefined means "no URL available" and falls back to inline bytes.
+export type ImageUrlResolver = (
+  data: Uint8Array,
+  mediaType: string,
+) => Promise<string | undefined> | string | undefined;
+
 function dataContentToUrl(part: LanguageModelV3FilePart): string {
   if (part.data instanceof URL) return part.data.toString();
   if (typeof part.data === "string") {
@@ -46,6 +55,36 @@ function dataContentToUrl(part: LanguageModelV3FilePart): string {
     return `data:${part.mediaType};base64,${part.data}`;
   }
   return `data:${part.mediaType};base64,${Buffer.from(part.data).toString("base64")}`;
+}
+
+function fileBytes(part: LanguageModelV3FilePart): Uint8Array | undefined {
+  if (typeof part.data === "string") {
+    if (/^(https?:|data:)/i.test(part.data)) return undefined;
+    return Buffer.from(part.data, "base64");
+  }
+  if (part.data instanceof URL) return undefined;
+  return part.data instanceof Uint8Array ? part.data : new Uint8Array(part.data);
+}
+
+// Resolve one image part to its URL: published copy when the resolver yields
+// one, otherwise the inline data URL. An already-absolute URL is passed
+// through untouched -- there is nothing to publish.
+async function resolveImageUrl(
+  part: LanguageModelV3FilePart,
+  resolver?: ImageUrlResolver,
+): Promise<string> {
+  if (resolver) {
+    const bytes = fileBytes(part);
+    if (bytes) {
+      try {
+        const uploaded = await resolver(bytes, part.mediaType);
+        if (uploaded) return uploaded;
+      } catch {
+        // Fail open: a resolver throwing must not fail the model request.
+      }
+    }
+  }
+  return dataContentToUrl(part);
 }
 
 function stringifyToolResultOutput(output: LanguageModelV3ToolResultOutput): string {
@@ -80,9 +119,10 @@ function textFromContent(content: QoderContent | null): string {
   return content.map((part) => (part.type === "text" ? part.text : "")).join("");
 }
 
-function transformUserMessage(
+async function transformUserMessage(
   message: Extract<LanguageModelV3Message, { role: "user" }>,
-): QoderMessage {
+  resolver?: ImageUrlResolver,
+): Promise<QoderMessage> {
   const parts: Array<QoderTextPart | QoderImagePart> = [];
   let hasFile = false;
 
@@ -93,7 +133,10 @@ function transformUserMessage(
     }
     if (part.type === "file" && part.mediaType.startsWith("image/")) {
       hasFile = true;
-      parts.push({ type: "image_url", image_url: { url: dataContentToUrl(part) } });
+      parts.push({
+        type: "image_url",
+        image_url: { url: await resolveImageUrl(part, resolver) },
+      });
     }
   }
 
@@ -198,7 +241,10 @@ function normalizeToolExchanges(messages: QoderMessage[]): QoderMessage[] {
   return normalized;
 }
 
-export function transformPrompt(prompt: LanguageModelV3Prompt): TransformedPrompt {
+export async function transformPrompt(
+  prompt: LanguageModelV3Prompt,
+  resolver?: ImageUrlResolver,
+): Promise<TransformedPrompt> {
   const system: string[] = [];
   const messages: QoderMessage[] = [];
 
@@ -208,7 +254,7 @@ export function transformPrompt(prompt: LanguageModelV3Prompt): TransformedPromp
       continue;
     }
     if (message.role === "user") {
-      messages.push(transformUserMessage(message));
+      messages.push(await transformUserMessage(message, resolver));
       continue;
     }
     if (message.role === "assistant") {

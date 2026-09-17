@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { transformPrompt, transformTools } from "../transform.js";
 
 describe("transformPrompt", () => {
-  it("maps system, user, assistant tool calls, and tool results", () => {
+  it("maps system, user, assistant tool calls, and tool results", async () => {
     const prompt: LanguageModelV3Prompt = [
       { role: "system", content: "You are useful." },
       { role: "user", content: [{ type: "text", text: "hi" }] },
@@ -28,7 +28,7 @@ describe("transformPrompt", () => {
       },
     ];
 
-    expect(transformPrompt(prompt)).toEqual({
+    expect(await transformPrompt(prompt)).toEqual({
       system: "You are useful.",
       lastUserText: "hi",
       messages: [
@@ -49,7 +49,7 @@ describe("transformPrompt", () => {
     });
   });
 
-  it("maps image files to OpenAI-compatible image_url parts", () => {
+  it("maps image files to OpenAI-compatible image_url parts", async () => {
     const prompt: LanguageModelV3Prompt = [
       {
         role: "user",
@@ -60,13 +60,65 @@ describe("transformPrompt", () => {
       },
     ];
 
-    expect(transformPrompt(prompt).messages[0]).toEqual({
+    expect((await transformPrompt(prompt)).messages[0]).toEqual({
       role: "user",
       content: [
         { type: "text", text: "look" },
         { type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } },
       ],
     });
+  });
+
+  it("prefers a published URL when the resolver yields one", async () => {
+    const prompt: LanguageModelV3Prompt = [
+      {
+        role: "user",
+        content: [{ type: "file", mediaType: "image/png", data: "aGVsbG8=" }],
+      },
+    ];
+    const resolver = (data: Uint8Array, mediaType: string) => {
+      expect(mediaType).toBe("image/png");
+      expect(Buffer.from(data).toString()).toBe("hello");
+      return "https://cdn.test/published.png";
+    };
+    const { messages } = await transformPrompt(prompt, resolver);
+    expect(messages[0].content).toEqual([
+      { type: "image_url", image_url: { url: "https://cdn.test/published.png" } },
+    ]);
+  });
+
+  it("falls back to the inline data URL when publication fails", async () => {
+    const prompt: LanguageModelV3Prompt = [
+      {
+        role: "user",
+        content: [{ type: "file", mediaType: "image/png", data: "aGVsbG8=" }],
+      },
+    ];
+    const throwing = () => {
+      throw new Error("upload exploded");
+    };
+    const { messages } = await transformPrompt(prompt, throwing);
+    expect(messages[0].content).toEqual([
+      { type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } },
+    ]);
+  });
+
+  it("passes an absolute URL through without invoking the resolver", async () => {
+    const prompt: LanguageModelV3Prompt = [
+      {
+        role: "user",
+        content: [{ type: "file", mediaType: "image/png", data: "https://cdn.test/already.png" }],
+      },
+    ];
+    let called = false;
+    const { messages } = await transformPrompt(prompt, () => {
+      called = true;
+      return undefined;
+    });
+    expect(called).toBe(false);
+    expect(messages[0].content).toEqual([
+      { type: "image_url", image_url: { url: "https://cdn.test/already.png" } },
+    ]);
   });
 });
 

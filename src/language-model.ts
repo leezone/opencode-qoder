@@ -31,12 +31,19 @@ import {
   QoderUpstreamError,
   throwQoderApiError,
 } from "./errors.js";
+import { uploadQoderImage } from "./image-upload.js";
 import { logPlugin } from "./log.js";
 import { getModelDefinition, isValidContextTier } from "./model-catalog.js";
 import { getRoutingPolicy, resolveRouting } from "./routing-policy.js";
 import { resolveRootSession } from "./session-roots.js";
 import { getSelectedTier, getSessionTier } from "./tier-store.js";
-import { type QoderMessage, type QoderTool, transformPrompt, transformTools } from "./transform.js";
+import {
+  type ImageUrlResolver,
+  type QoderMessage,
+  type QoderTool,
+  transformPrompt,
+  transformTools,
+} from "./transform.js";
 
 // ---------------------------------------------------------------------------
 // Response mapping + streaming state
@@ -434,15 +441,16 @@ function resolveRequestRoute(
 
 let routeProbeLogged = false;
 
-function buildRequestBody(
+async function buildRequestBody(
   modelID: string,
   options: LanguageModelV3CallOptions,
   sessionUID: string,
-): { body: Record<string, unknown>; warnings: SharedV3Warning[] } {
+  resolveImage?: ImageUrlResolver,
+): Promise<{ body: Record<string, unknown>; warnings: SharedV3Warning[] }> {
   const route = resolveRequestRoute(modelID, options);
   modelID = route.modelID;
   const model = getModelDefinition(modelID);
-  const transformed = transformPrompt(options.prompt);
+  const transformed = await transformPrompt(options.prompt, resolveImage);
   const { tools, ignoredTools } = transformTools(options.tools);
   const warnings: SharedV3Warning[] = [];
 
@@ -702,7 +710,22 @@ export class QoderLanguageModel implements LanguageModelV3 {
     abortController: AbortController,
     detachAbort: () => void,
   ): Promise<LanguageModelV3StreamResult> {
-    const { body, warnings } = buildRequestBody(this.modelId, options, signingUserID(credentials));
+    // Images are published to the center service before the request body is
+    // built, so the prompt carries URLs rather than base64 bytes. Uploads sign
+    // with the same credential as the chat call, which is why the resolver is
+    // created here and not at module scope.
+    const cosy = cosyCredentialsForSigning(credentials);
+    const resolveImage: ImageUrlResolver = (data, mediaType) =>
+      uploadQoderImage(data, mediaType, {
+        creds: cosy,
+        signal: abortController.signal,
+      });
+    const { body, warnings } = await buildRequestBody(
+      this.modelId,
+      options,
+      signingUserID(credentials),
+      resolveImage,
+    );
     const bodyBytes = Buffer.from(JSON.stringify(body));
     const encodedBody = qoderEncodeBody(bodyBytes);
     const encodedBytes = Buffer.from(encodedBody, "utf8");

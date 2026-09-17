@@ -27,6 +27,7 @@ src/
 ├── cosy.ts               # COSY 请求签名（RSA/AES/机器 ID）
 ├── encoding.ts           # Qoder 自定义 base64 编码（WAF 绕过）
 ├── transform.ts          # AI SDK prompt → Qoder 网关请求体转换
+├── image-upload.ts       # 图片发布到 center 服务换取 URL（失败回落 base64）
 ├── model-catalog.ts      # 动态模型发现，三级缓存
 ├── static-models.ts      # 静态模型回退表加载
 ├── models.json           # 内置模型定义（编译时复制）
@@ -466,6 +467,17 @@ lite 是免费模型（200K 上下文），用于 title/compaction/plan 等机�
 - **脚本永不复制逻辑**：`skills/*/scripts/*.mjs` 一律 `import` 编译产物（`dist/quota-cli.js` / `dist/claim.js`），自身只做参数解析与退出码。
 - **凭证漏斗只有一个**（`resolveQoderCredentials`）：任何新面要选凭证，必须复用它——不要就地写 `||` 链。
 
+### 12.6 图片为什么先上传再引用？
+
+Qoder 的请求体不带栅格字节：客户端把每张图**发布一次**到 center 服务，之后只引用返回的 URL。inline base64 也能跑通，但每轮请求都要重发整段历史，base64 又比原始字节膨胀 ~33%，等于把同一张图反复传。改成"发布一次 + 引用 URL"后请求体变小、上游缓存键也更稳。
+
+两条容易踩的坑（都写在 `image-upload.ts` 注释里）：
+
+- **签名签的是 body 长度字符串**，不是 multipart 原始字节。qodercli 的 `prepareRequest` 收到的是 `String(body.length)`，照抄才能通过校验。
+- **HTTP 路径带 `/algo`，签名路径不带**。`computeSigPath()` 已经会剥掉前缀，所以传完整 URL 即可。
+
+契约是**失败即降级**：上传任何异常都回落到 inline data URL，绝不让上传失败演变成对话失败。
+
 ## 13. 环境变量
 
 | 变量 | 用途 | 默认值 |
@@ -545,7 +557,6 @@ pnpm test           # 运行测试
 - `/api/v3/service/region/endpoints` — 动态区域发现
 - `/algo/api/v2/service/voice/polish` — ASR 后处理
 - `/api/v3/user/status` + `/api/v2/user/plan` — 账户状态
-- `/api/v2/image/upload` — 图片上传
 - `/api/v1/webSearch/*` — 网页搜索
 - `/algo/api/v2/service/pro/imageSearch` — 图片搜索
 - `/algo/api/v2/service/pro/generateImage` — 图片生成

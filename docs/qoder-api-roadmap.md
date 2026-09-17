@@ -45,14 +45,14 @@
 - **价值**: 增强 `qoder_quota` 技能，显示套餐/风控状态
 - **来源**: dsh-provider-qoder 实现
 
-#### 4. 图片上传
-- **端点**: `/api/v2/image/upload` (center 域)
-- **方法**: PUT
-- **说明**: 把本地图片上传换取 URL，避免 base64 直传
-- **请求**: multipart/form-data，带 `request_id` 查询参数
-- **认证**: 需要 COSY 签名
-- **价值**: 图片输入走 URL 而非 base64，省 token、更快
-- **来源**: dsh-provider-qoder 实现
+#### 4. 图片上传 ✅ 已实现（`src/image-upload.ts`）
+- **端点**: `PUT /algo/api/v2/image/upload`（center 域，带 `request_id` 查询参数）
+- **签名**: 签的是 **body 长度字符串**（`String(body.length)`），不是 multipart 原始字节；
+  签名路径去掉 `/algo` 前缀（`computeSigPath` 已处理）
+- **降级**: 任何失败都回落到 inline data URL，绝不因此让对话失败
+- **缓存**: 按内容摘要寻址，单飞合并并发上传；URL 30 分钟 TTL
+  （上游返回的是预签名 OSS URL，实测有效期 30 天，缓存 TTL 取保守值）
+- **来源**: qodercli 图片发布流程 + dsh-provider-qoder 实现
 
 ### 中优先级（可作为 opencode 工具暴露）
 

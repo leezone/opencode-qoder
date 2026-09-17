@@ -30,8 +30,8 @@ describe("assistant content regression (Kimi 400)", () => {
     delete process.env.QODER_REASONING_EFFORT;
   });
 
-  it("emits an empty string instead of null when a tool-call turn has no prose", () => {
-    const { messages } = transformPrompt(assistantWithToolCallOnly);
+  it("emits an empty string instead of null when a tool-call turn has no prose", async () => {
+    const { messages } = await transformPrompt(assistantWithToolCallOnly);
     const assistant = messages.find((message) => message.role === "assistant");
     expect(assistant).toBeDefined();
     // Moonshot rejects assistant tool_calls with content:null ("tool_call_id
@@ -40,7 +40,7 @@ describe("assistant content regression (Kimi 400)", () => {
     expect(assistant!.tool_calls).toHaveLength(1);
   });
 
-  it("still keeps reasoning+text prose in the content", () => {
+  it("still keeps reasoning+text prose in the content", async () => {
     const prompt: LanguageModelV3Prompt = [
       {
         role: "assistant",
@@ -50,7 +50,7 @@ describe("assistant content regression (Kimi 400)", () => {
         ],
       },
     ];
-    const { messages } = transformPrompt(prompt);
+    const { messages } = await transformPrompt(prompt);
     expect(messages[0].content).toBe("<thinking>hmm</thinking>\n\ndoing it");
   });
 });
