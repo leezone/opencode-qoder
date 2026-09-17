@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { type QoderRegion, sharedKey, stateFiles } from "./constants.js";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
 import { errorMessage, logPlugin } from "./log.js";
 import { readShared, writeShared } from "./shared-state.js";
@@ -18,9 +19,6 @@ import { readShared, writeShared } from "./shared-state.js";
 // their defaults, unknown fields are ignored, and a broken file never blocks
 // a request. The same globalThis-cache + mtime-reread pattern as tier-store so
 // a policy set through the tool is instantly visible to the request realm.
-
-const STORE_FILENAME = "qoder-routing.json";
-const CACHE_KEY = "__opencode_qoder_routing_policy";
 
 export interface RoutingPolicy {
   /** master switch; false keeps every request on its selected model */
@@ -64,12 +62,17 @@ interface Cache {
   loadedAt: number;
 }
 
-function storePath(): string {
-  return opencodeConfigFile(STORE_FILENAME);
+// One cache slot per region: the two providers share this process.
+function cacheKey(region: QoderRegion): string {
+  return sharedKey("routing_policy", region);
 }
 
-function cached(): Cache | undefined {
-  return readShared<Cache>(CACHE_KEY);
+function storePath(region: QoderRegion): string {
+  return opencodeConfigFile(stateFiles(region).routing);
+}
+
+function cached(region: QoderRegion): Cache | undefined {
+  return readShared<Cache>(cacheKey(region));
 }
 
 function sanitize(raw: unknown): RoutingPolicy {
@@ -94,8 +97,11 @@ function sanitize(raw: unknown): RoutingPolicy {
   return out;
 }
 
-function readPolicyFile(): { policy: RoutingPolicy; mtimeMs: number } {
-  const path = storePath();
+function readPolicyFile(region: QoderRegion = "global"): {
+  policy: RoutingPolicy;
+  mtimeMs: number;
+} {
+  const path = storePath(region);
   let mtimeMs: number;
   try {
     mtimeMs = statSync(path).mtimeMs;
@@ -110,7 +116,7 @@ function readPolicyFile(): { policy: RoutingPolicy; mtimeMs: number } {
     }
     return { policy: sanitize(null), mtimeMs: -1 };
   }
-  const previous = cached();
+  const previous = cached(region);
   if (previous && previous.mtimeMs === mtimeMs) {
     return { policy: previous.policy, mtimeMs };
   }
@@ -119,29 +125,32 @@ function readPolicyFile(): { policy: RoutingPolicy; mtimeMs: number } {
   return { policy: sanitize(readJsonFile("routing-policy", path) ?? null), mtimeMs };
 }
 
-export function getRoutingPolicy(): RoutingPolicy {
-  const { policy, mtimeMs } = readPolicyFile();
-  setCachedPolicy(policy, mtimeMs);
+export function getRoutingPolicy(region: QoderRegion = "global"): RoutingPolicy {
+  const { policy, mtimeMs } = readPolicyFile(region);
+  setCachedPolicy(region, policy, mtimeMs);
   return policy;
 }
 
-function setCachedPolicy(policy: RoutingPolicy, mtimeMs: number): void {
-  writeShared(CACHE_KEY, {
+function setCachedPolicy(region: QoderRegion, policy: RoutingPolicy, mtimeMs: number): void {
+  writeShared(cacheKey(region), {
     policy,
     mtimeMs,
     loadedAt: Date.now(),
   } satisfies Cache);
 }
 
-export function updateRoutingPolicy(patch: Partial<RoutingPolicy>): RoutingPolicy {
-  const merged = sanitize({ ...getRoutingPolicy(), ...patch });
-  const path = storePath();
+export function updateRoutingPolicy(
+  patch: Partial<RoutingPolicy>,
+  region: QoderRegion = "global",
+): RoutingPolicy {
+  const merged = sanitize({ ...getRoutingPolicy(region), ...patch });
+  const path = storePath(region);
   if (writeJsonFile("routing-policy", path, merged)) {
     try {
-      setCachedPolicy(merged, statSync(path).mtimeMs);
+      setCachedPolicy(region, merged, statSync(path).mtimeMs);
     } catch {
       // The write landed; a stat race only costs one extra reread next call.
-      setCachedPolicy(merged, -1);
+      setCachedPolicy(region, merged, -1);
     }
     logPlugin(
       `routing-policy: saved (enabled=${merged.enabled}, ${merged.subagentModel}->${merged.target} above ${merged.threshold})`,

@@ -7,13 +7,11 @@ import {
   QODER_DEFAULT_EMAIL,
   QODER_DEFAULT_NAME,
   QODER_DEFAULT_USER_ID,
-  QODER_EXCHANGE_URL,
-  QODER_OPENAPI_URL,
   QODER_PAT_ENV,
-  QODER_REFRESH_URL,
-  QODER_USERINFO_URL,
   QODER_VERSION,
+  type QoderRegion,
   REFRESH_SKEW_MS,
+  resolveEndpoints,
 } from "./constants.js";
 import { type CosyCredentials, getMachineId } from "./cosy.js";
 import { jsonHeaders, readErrorBody } from "./http.js";
@@ -44,6 +42,16 @@ export interface QoderProviderOptions {
   qoderEmail?: string;
   qoderName?: string;
   qoderMachineID?: string;
+  // Which Qoder deployment this instance serves. Carried on the options bag
+  // because the same process hosts both providers and module state would
+  // collide. Defaults to "global" wherever it is absent, so a single-region
+  // config and every existing call site keep working unchanged.
+  region?: QoderRegion;
+}
+
+// Reads the region off an options bag, defaulting to the international site.
+export function regionOf(options?: QoderProviderOptions): QoderRegion {
+  return options?.region ?? "global";
 }
 
 // Response shape shared by the token exchange, the device-token poll, and (if
@@ -112,11 +120,17 @@ const identityByToken = new Map<string, { attemptedAt: number; identity: QoderId
 const IDENTITY_RETRY_COOLDOWN_MS = 30 * 1000;
 const IDENTITY_CACHE_MAX = 64;
 
+function identityKey(jobToken: string, region: QoderRegion): string {
+  return `${region}\0${jobToken}`;
+}
+
 function rememberIdentity(
   jobToken: string,
   identity: QoderIdentity | null,
+  region: QoderRegion = "global",
   attemptedAt = Date.now(),
 ): void {
+  jobToken = identityKey(jobToken, region);
   if (identityByToken.size >= IDENTITY_CACHE_MAX && !identityByToken.has(jobToken)) {
     // Oldest-first eviction; Map iteration order is insertion order.
     const oldest = identityByToken.keys().next().value;
@@ -129,17 +143,21 @@ function rememberIdentity(
 // fetchQoderUserInfo() this distinguishes "the lookup worked" from "the account
 // record carries an id", because an empty id is exactly the state that produces
 // a 105 and must be retried rather than papered over with a default.
-export async function fetchQoderIdentity(jobToken: string): Promise<QoderIdentity | null> {
-  const memo = identityByToken.get(jobToken);
+export async function fetchQoderIdentity(
+  jobToken: string,
+  region: QoderRegion = "global",
+): Promise<QoderIdentity | null> {
+  const key = identityKey(jobToken, region);
+  const memo = identityByToken.get(key);
   if (memo) {
     if (memo.identity) return memo.identity;
     if (Date.now() - memo.attemptedAt < IDENTITY_RETRY_COOLDOWN_MS) return null;
   }
 
-  const info = await fetchQoderAccount(jobToken);
+  const info = await fetchQoderAccount(jobToken, region);
   const userID = text(info.id);
   if (!userID) {
-    rememberIdentity(jobToken, null);
+    rememberIdentity(jobToken, null, region);
     return null;
   }
   const identity: QoderIdentity = {
@@ -147,7 +165,7 @@ export async function fetchQoderIdentity(jobToken: string): Promise<QoderIdentit
     email: text(info.email),
     name: text(info.name) || text(info.username),
   };
-  rememberIdentity(jobToken, identity);
+  rememberIdentity(jobToken, identity, region);
   return identity;
 }
 
@@ -155,9 +173,12 @@ export async function fetchQoderIdentity(jobToken: string): Promise<QoderIdentit
 // untouched (and the request free to fail loudly) when it cannot be resolved.
 // Every path that signs a request calls this, so the uid that reaches COSY is
 // either the account's real one or the caller is told why there is none.
-export async function ensureQoderIdentity(creds: QoderCredentials): Promise<QoderCredentials> {
+export async function ensureQoderIdentity(
+  creds: QoderCredentials,
+  region: QoderRegion = "global",
+): Promise<QoderCredentials> {
   if (!identityUnresolved(creds.userID)) return creds;
-  const identity = await fetchQoderIdentity(creds.access);
+  const identity = await fetchQoderIdentity(creds.access, region);
   if (!identity) return creds;
   return {
     ...creds,
@@ -217,14 +238,16 @@ export function cosyCredentialsForSigning(creds: QoderCredentials): CosyCredenti
 // "Login expired" for a token that a single re-exchange would replace.
 // Keyed by PAT (the exchange cache's key); a passthrough token has no cache
 // entry to drop and simply gets re-resolved by the caller.
-export function invalidateQoderCredentials(pat: string): void {
+export function invalidateQoderCredentials(pat: string, region: QoderRegion = "global"): void {
   // Read before deleting: the identity memo is keyed by access token, and once
   // the credential entry is gone that mapping is unrecoverable.
-  const cached = credentialsCache.get(pat);
-  credentialsCache.delete(pat);
+  const cacheKey = `${region}\0${pat}`;
+  const cached = credentialsCache.get(cacheKey);
+  credentialsCache.delete(cacheKey);
   // The next call exchanges for a new job token, so a "cannot resolve" verdict
   // recorded against the old one must not survive to shadow it.
-  if (cached && !(cached instanceof Promise)) identityByToken.delete(cached.access);
+  if (cached && !(cached instanceof Promise))
+    identityByToken.delete(identityKey(cached.access, region));
 }
 
 // Exported for quota-cli.ts: the standalone credential walk must end on this
@@ -294,8 +317,9 @@ function openApiHeaders(token?: string): Record<string, string> {
 // throw, since the token is already valid without it.
 export async function fetchQoderUserInfo(
   jobToken: string,
+  region: QoderRegion = "global",
 ): Promise<{ userID: string; email: string; name: string }> {
-  const info = await fetchQoderAccount(jobToken);
+  const info = await fetchQoderAccount(jobToken, region);
   return {
     userID: text(info.id),
     email: text(info.email),
@@ -308,9 +332,14 @@ export async function fetchQoderUserInfo(
 // plan source and avatar too, and re-listing every field upstream adds would
 // only recreate the camelCase drift this module already fights. Best-effort:
 // an unreachable endpoint answers {} rather than throwing.
-export async function fetchQoderAccount(jobToken: string): Promise<Record<string, unknown>> {
+export async function fetchQoderAccount(
+  jobToken: string,
+  region: QoderRegion = "global",
+): Promise<Record<string, unknown>> {
   try {
-    const res = await fetch(QODER_USERINFO_URL, { headers: openApiHeaders(jobToken) });
+    const res = await fetch(resolveEndpoints(region).userinfo, {
+      headers: openApiHeaders(jobToken),
+    });
     if (!res.ok) return {};
     const body: unknown = await res.json();
     return body && typeof body === "object" ? (body as Record<string, unknown>) : {};
@@ -332,16 +361,22 @@ export function describeTokenShape(value: unknown): string {
   return `opaque(${value.length})`;
 }
 
-export async function credentialsFromPat(pat: string): Promise<QoderCredentials> {
-  const cached = credentialsCache.get(pat);
+export async function credentialsFromPat(
+  pat: string,
+  region: QoderRegion = "global",
+): Promise<QoderCredentials> {
+  // Cache key includes the region: the same PAT string is exchanged against a
+  // different host per region, and the resulting job token is only valid there.
+  const cacheKey = `${region}\0${pat}`;
+  const cached = credentialsCache.get(cacheKey);
   if (cached) {
     const resolved = await cached;
     if (resolved.expires > Date.now()) return resolved;
-    credentialsCache.delete(pat);
+    credentialsCache.delete(cacheKey);
   }
 
   const pending = (async () => {
-    const res = await fetch(QODER_EXCHANGE_URL, {
+    const res = await fetch(resolveEndpoints(region).exchange, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...openApiHeaders() },
       body: JSON.stringify({ personal_token: pat }),
@@ -365,7 +400,7 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
     // it instead of fetching userinfo a second time for the same token. Same
     // endpoint and fields; a null (no usable id) is the same "" uid, only
     // remembered.
-    const identity = await fetchQoderIdentity(data.token);
+    const identity = await fetchQoderIdentity(data.token, region);
     const rawProfile = {
       userID: identity?.userID ?? "",
       email: identity?.email ?? "",
@@ -382,13 +417,13 @@ export async function credentialsFromPat(pat: string): Promise<QoderCredentials>
     } satisfies QoderCredentials;
   })();
 
-  credentialsCache.set(pat, pending);
+  credentialsCache.set(cacheKey, pending);
   try {
     const resolved = await pending;
-    credentialsCache.set(pat, resolved);
+    credentialsCache.set(cacheKey, resolved);
     return resolved;
   } catch (error) {
-    credentialsCache.delete(pat);
+    credentialsCache.delete(cacheKey);
     throw error;
   }
 }
@@ -456,13 +491,22 @@ export function storedConnectionToken(): string {
 export async function resolveQoderCredentials(
   options: QoderProviderOptions = {},
 ): Promise<QoderCredentials> {
+  const region = regionOf(options);
   const apiKey = options.apiKey && !isImportListValue(options.apiKey) ? options.apiKey : "";
+  // The store layers are region-scoped: a CN instance must not sign with an
+  // international PAT (or vice versa), which is exactly what an unscoped read
+  // would do when both providers are configured.
   const token =
     options.personalAccessToken ||
-    getSelectedPatString() ||
+    getSelectedPatString(region) ||
     apiKey ||
+    // The key file is a USER-designated seed (an explicit path they configure),
+    // not plugin-managed state, so it is shared across regions on purpose: it
+    // is the same kind of input as an environment variable, and pointing both
+    // providers at one secret file is the reasonable default. The stores below
+    // are plugin-managed and therefore region-scoped.
     keyFileToken() ||
-    getActivePatString() ||
+    getActivePatString(region) ||
     getEnvPat();
   if (!token) {
     throw new Error(
@@ -470,7 +514,8 @@ export async function resolveQoderCredentials(
     );
   }
 
-  if (token.startsWith("pt-")) return ensureQoderIdentity(await credentialsFromPat(token));
+  if (token.startsWith("pt-"))
+    return ensureQoderIdentity(await credentialsFromPat(token, region), region);
 
   return ensureQoderIdentity({
     access: token,
@@ -484,7 +529,7 @@ export async function resolveQoderCredentials(
       email: options.qoderEmail,
       name: options.qoderName,
     }),
-    machineID: options.qoderMachineID || getMachineId(),
+    machineID: options.qoderMachineID || getMachineId(region),
   });
 }
 
@@ -528,15 +573,16 @@ export function decodePatRefresh(refresh: string): {
 // as "re-run /connect", never as another silent retry with the dead credential.
 export async function refreshQoderCredentials(
   creds: QoderCredentials,
+  region: QoderRegion = "global",
 ): Promise<QoderCredentials | null> {
   if (isPatRefresh(creds.refresh)) {
     const { pat } = decodePatRefresh(creds.refresh);
     if (!pat) return null;
-    invalidateQoderCredentials(pat);
+    invalidateQoderCredentials(pat, region);
     try {
-      const refreshed = await credentialsFromPat(pat);
+      const refreshed = await credentialsFromPat(pat, region);
       return identityUnresolved(refreshed.userID)
-        ? await ensureQoderIdentity(refreshed)
+        ? await ensureQoderIdentity(refreshed, region)
         : refreshed;
     } catch (error) {
       logRefreshFailure("PAT re-exchange", error);
@@ -548,7 +594,7 @@ export async function refreshQoderCredentials(
   if (!refreshToken) return null;
 
   try {
-    const res = await fetch(QODER_REFRESH_URL, {
+    const res = await fetch(resolveEndpoints(region).refresh, {
       method: "POST",
       headers: openApiHeaders(creds.access),
       body: JSON.stringify({ refreshToken }),
@@ -613,8 +659,9 @@ export async function pollDeviceFlow(
   codeVerifier: string,
   nonce: string,
   machineID: string,
+  region: QoderRegion = "global",
 ): Promise<QoderCredentials> {
-  const pollURL = `${QODER_OPENAPI_URL}/api/v1/deviceToken/poll?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(codeVerifier)}&challenge_method=S256`;
+  const pollURL = `${resolveEndpoints(region).devicePoll}?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(codeVerifier)}&challenge_method=S256`;
 
   for (let attempt = 0; attempt < 90; attempt++) {
     await delay(2000);

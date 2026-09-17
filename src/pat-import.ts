@@ -1,4 +1,4 @@
-import { QODER_PAT_IMPORT_ENV } from "./constants.js";
+import { QODER_PAT_IMPORT_ENV, type QoderRegion } from "./constants.js";
 import { errorMessage, logPlugin } from "./log.js";
 import { addPAT, listPATs } from "./pat-store.js";
 
@@ -106,15 +106,15 @@ export function parseImportValue(value: string): { pats: string[]; invalid: numb
 
 // Add every pt- segment of a value to the store. Shared by the env importer
 // and the key-file importer; the VALUES never reach the log -- counts only.
-export function importPATsFromValue(value: string): ImportResult {
+export function importPATsFromValue(value: string, region: QoderRegion = "global"): ImportResult {
   const result: ImportResult = { imported: 0, duplicates: 0, invalid: 0 };
   const shape = classifyImportValue(value);
   result.invalid = shape.invalid;
   if (shape.pats.length === 0) return result;
-  const before = listPATs().length;
+  const before = listPATs(region).length;
   for (const [offset, pat] of shape.pats.entries()) {
     const label = `Imported ${before + offset + 1}`;
-    const entry = addPAT(pat, label);
+    const entry = addPAT(pat, label, undefined, region);
     if (entry) result.imported += 1;
     else result.duplicates += 1;
   }
@@ -125,21 +125,24 @@ export function importPATsFromValue(value: string): ImportResult {
 // Returns counts for the caller's log. Never throws: a broken store write is
 // already swallowed inside addPAT/saveStore, and a malformed value is simply
 // counted invalid.
-export function importPATsFromEnv(env: NodeJS.ProcessEnv = process.env): ImportResult {
+export function importPATsFromEnv(
+  region: QoderRegion = "global",
+  env: NodeJS.ProcessEnv = process.env,
+): ImportResult {
   const raw = env[QODER_PAT_IMPORT_ENV];
   const value = typeof raw === "string" ? raw.trim() : "";
   if (!value) return { imported: 0, duplicates: 0, invalid: 0 };
-  return importPATsFromValue(value);
+  return importPATsFromValue(value, region);
 }
 
 // The once-per-process startup call. Runs before discovery so a freshly seeded
 // store can authenticate the very first catalog refresh. Logs only when it
 // actually changed something or dropped something, so a steady-state process
 // (variable unset, or every PAT already stored) stays quiet.
-export function maybeImportPATsFromEnv(): void {
+export function maybeImportPATsFromEnv(region: QoderRegion = "global"): void {
   let result: ImportResult;
   try {
-    result = importPATsFromEnv();
+    result = importPATsFromEnv(region);
   } catch (error) {
     logPlugin(`pat-import: failed: ${errorMessage(error)}`);
     return;

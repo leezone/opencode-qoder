@@ -36,17 +36,18 @@ describe("tier-tools", () => {
       calls.push(labelChanged);
       return false;
     };
-    expect(reportTierSwitch({ model: "ghost" }, undefined, refresh).data).toEqual({
+    expect(reportTierSwitch({ model: "ghost" }, undefined, "global", refresh).data).toEqual({
       success: false,
     });
     // 7 is valid against the bundled fallback (no advertised tiers -> any
     // value <= inputWindow passes), so probe refusal with an absurd ceiling.
     expect(
-      reportTierSwitch({ model: "cmodel", tier: 999_999_999_999 }, undefined, refresh).data,
+      reportTierSwitch({ model: "cmodel", tier: 999_999_999_999 }, undefined, "global", refresh)
+        .data,
     ).toEqual({ success: false });
     // The no-session-id case degrades to picker-label mode; the bulk clear
     // fires refresh(false) -- with nothing selected, no label changed.
-    const cleared = reportTierSwitch({ model: "*" }, undefined, refresh);
+    const cleared = reportTierSwitch({ model: "*" }, undefined, "global", refresh);
     expect(cleared.data).toEqual({ success: true, model: "*", cleared: false });
     expect(calls).toEqual([false]);
     expect(getSelectedTier("cmodel")).toBeUndefined();

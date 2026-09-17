@@ -3,10 +3,17 @@ import { dirname } from "node:path";
 import {
   cosyCredentialsForSigning,
   type QoderProviderOptions,
+  regionOf,
   resolveQoderCredentials,
 } from "./auth.js";
 import { normalizeId } from "./coerce.js";
-import { FETCH_TIMEOUT_MS, QODER_MODEL_LIST_URL, type QoderModelDefinition } from "./constants.js";
+import {
+  FETCH_TIMEOUT_MS,
+  type QoderModelDefinition,
+  type QoderRegion,
+  resolveEndpoints,
+  stateFiles,
+} from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
 import { readEnv } from "./env.js";
 import { fetchWithTimeout, jsonHeaders, readErrorBody } from "./http.js";
@@ -82,12 +89,45 @@ type CatalogEntry = Record<string, unknown>;
 type ContextTier = { token_count?: unknown; is_default?: unknown };
 type ThinkingConfig = { enabled?: { efforts?: Record<string, unknown> } };
 
-let liveModels: DiscoveredModel[] = [];
-let fetchedAt = 0;
-let expiresAt = 0;
-let source: CatalogStatus["source"] = "fallback";
-let lastError = "";
-let inflight: Promise<CatalogStatus> | undefined;
+// One catalog state per region, keyed by region rather than held in single
+// module variables: opencode hosts both providers in one process, and a shared
+// variable would have the CN instance answer from (and refresh into) the
+// international table. The per-region Map is the same shape workbuddy uses for
+// the identical reason.
+interface CatalogState {
+  liveModels: DiscoveredModel[];
+  fetchedAt: number;
+  expiresAt: number;
+  source: CatalogStatus["source"];
+  lastError: string;
+  inflight?: Promise<CatalogStatus>;
+  /** Throttle stamps for the disk-cache adopt probe. */
+  lastAdoptProbeAt: number;
+  lastAdoptProbeMtimeMs: number;
+}
+
+function emptyState(): CatalogState {
+  return {
+    liveModels: [],
+    fetchedAt: 0,
+    expiresAt: 0,
+    source: "fallback",
+    lastError: "",
+    lastAdoptProbeAt: 0,
+    lastAdoptProbeMtimeMs: -1,
+  };
+}
+
+const STATES = new Map<QoderRegion, CatalogState>();
+
+function catalogState(region: QoderRegion): CatalogState {
+  let state = STATES.get(region);
+  if (!state) {
+    state = emptyState();
+    STATES.set(region, state);
+  }
+  return state;
+}
 
 function envBool(name: string): boolean {
   const value = readEnv(name).toLowerCase();
@@ -99,9 +139,11 @@ export function discoveryDisabled(): boolean {
   return envBool("QODER_DISABLE_MODEL_DISCOVERY");
 }
 
-// Go: qoderModelListURL() / QODER_MODEL_LIST_URL
-function modelListURL(): string {
-  return readEnv("QODER_MODEL_LIST_URL") || QODER_MODEL_LIST_URL;
+// Go: qoderModelListURL() / QODER_MODEL_LIST_URL. The env override is a
+// single-region escape hatch (a proxy or a staging host); it applies to both
+// regions, which is the right default for a global override.
+function modelListURL(region: QoderRegion): string {
+  return readEnv("QODER_MODEL_LIST_URL") || resolveEndpoints(region).modelList;
 }
 
 // Go: modelCatalogTTL() / QODER_MODEL_CACHE_SECONDS
@@ -110,19 +152,21 @@ function cacheTTLMs(): number {
   return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : DEFAULT_TTL_MS;
 }
 
-function diskCachePath(): string {
+function diskCachePath(region: QoderRegion = "global"): string {
   const override = readEnv("QODER_MODEL_DISK_CACHE");
   if (override) return override;
   // Sits next to opencode's own models.dev cache, under the same
-  // XDG_CACHE_HOME rule opencode uses for it.
-  return opencodeCacheFile("opencode-qoder-models.json");
+  // XDG_CACHE_HOME rule opencode uses for it. One file per region: the two
+  // catalogs share no model ids and a shared file would have one region serve
+  // the other's table on a cold start.
+  return opencodeCacheFile(stateFiles(region).models);
 }
 
 // The path this module reads at import time and writes on every successful
 // refresh. Exported for the capability layer's diagnostics: "why is model X
 // missing" is usually answered by whether this file exists and how stale it is.
-export function catalogCachePath(): string {
-  return diskCachePath();
+export function catalogCachePath(region: QoderRegion = "global"): string {
+  return diskCachePath(region);
 }
 
 function isSaneModel(model: DiscoveredModel): boolean {
@@ -153,9 +197,9 @@ function isSaneModel(model: DiscoveredModel): boolean {
 // additive capability data, so losing them silently disables the tier feature
 // -- a missing field is treated as transport noise, not revocation, and the
 // last known tier table is carried over for up to TIER_PRESERVE_MS.
-function saveDiskCache(models: DiscoveredModel[]): void {
+function saveDiskCache(region: QoderRegion, models: DiscoveredModel[]): void {
   try {
-    const file = diskCachePath();
+    const file = diskCachePath(region);
     mkdirSync(dirname(file), { recursive: true });
     const now = Date.now();
     const persisted = models.map((model) => ({ ...model }));
@@ -211,9 +255,11 @@ function saveDiskCache(models: DiscoveredModel[]): void {
   }
 }
 
-function loadDiskCache(): { models: DiscoveredModel[]; fetchedAt: number } | undefined {
+function loadDiskCache(
+  region: QoderRegion = "global",
+): { models: DiscoveredModel[]; fetchedAt: number } | undefined {
   try {
-    const file = diskCachePath();
+    const file = diskCachePath(region);
     if (!existsSync(file)) return undefined;
     const raw = readFileSync(file, "utf8");
     if (raw.length === 0 || raw.length > DISK_CACHE_MAX_BYTES) return undefined;
@@ -229,16 +275,21 @@ function loadDiskCache(): { models: DiscoveredModel[]; fetchedAt: number } | und
   }
 }
 
-// Seed from disk at import time so the very first catalog build -- which happens
-// before any network round trip -- already uses the last known good data instead
-// of the bundled table.
-const seeded = loadDiskCache();
-if (seeded) {
+// Seed from disk on first use of a region, not at import: which region a module
+// instance serves is only known once a call arrives with its options, so the
+// seed has to be lazy. The very first catalog build -- which happens before any
+// network round trip -- then already uses the last known good data instead of
+// the bundled table.
+function seedFromDisk(region: QoderRegion): void {
+  const state = catalogState(region);
+  if (state.source !== "fallback" || state.liveModels.length > 0) return;
+  const seeded = loadDiskCache(region);
+  if (!seeded) return;
   // Re-stamp origin: these were "qoder" when fetched, but right now they are a
   // persisted snapshot, and catalogStatus() should say so.
-  liveModels = seeded.models.map((model) => ({ ...model, origin: "cache" as const }));
-  fetchedAt = seeded.fetchedAt;
-  source = "cache";
+  state.liveModels = seeded.models.map((model) => ({ ...model, origin: "cache" as const }));
+  state.fetchedAt = seeded.fetchedAt;
+  state.source = "cache";
 }
 
 // opencode loads this module twice in one process: the legacy plugin realm and
@@ -253,35 +304,33 @@ if (seeded) {
 // is cheap and the file is small, but this runs on every request, so it is
 // throttled to one probe per interval and skipped entirely once this realm has
 // live data of its own that is still within TTL.
-let lastAdoptProbeAt = 0;
-let lastAdoptProbeMtimeMs = -1;
-
-function adoptNewerDiskCache(): void {
+function adoptNewerDiskCache(region: QoderRegion): void {
+  const state = catalogState(region);
   const now = Date.now();
   // Own live data, still fresh: nothing on disk could be newer.
-  if (source === "qoder" && now < expiresAt) return;
+  if (state.source === "qoder" && now < state.expiresAt) return;
   // Throttle the stat probe to one per interval. lastAdoptProbeAt starts at 0
   // so the first call always runs; a FAILED probe (no cache file yet) must
   // throttle too -- the old -1 exception re-ran the statSync on every call
   // for the life of a missing file, which is the steady state of a fresh
   // install or a redirected QODER_MODEL_DISK_CACHE.
-  if (now - lastAdoptProbeAt < ADOPT_POLL_MS) return;
-  lastAdoptProbeAt = now;
+  if (now - state.lastAdoptProbeAt < ADOPT_POLL_MS) return;
+  state.lastAdoptProbeAt = now;
   let mtimeMs: number;
   try {
-    mtimeMs = statSync(diskCachePath()).mtimeMs;
+    mtimeMs = statSync(diskCachePath(region)).mtimeMs;
   } catch {
     return; // no cache file yet
   }
-  if (mtimeMs === lastAdoptProbeMtimeMs) return; // unchanged since last probe
-  lastAdoptProbeMtimeMs = mtimeMs;
-  const disk = loadDiskCache();
-  if (!disk || disk.fetchedAt <= fetchedAt) return; // not newer than what we hold
-  liveModels = disk.models.map((model) => ({ ...model, origin: "cache" as const }));
-  fetchedAt = disk.fetchedAt;
-  source = "cache";
+  if (mtimeMs === state.lastAdoptProbeMtimeMs) return; // unchanged since last probe
+  state.lastAdoptProbeMtimeMs = mtimeMs;
+  const disk = loadDiskCache(region);
+  if (!disk || disk.fetchedAt <= state.fetchedAt) return; // not newer than what we hold
+  state.liveModels = disk.models.map((model) => ({ ...model, origin: "cache" as const }));
+  state.fetchedAt = disk.fetchedAt;
+  state.source = "cache";
   logPlugin(
-    `catalog: adopted peer refresh (live=${disk.models.length} fetchedAt=${disk.fetchedAt})`,
+    `catalog: adopted peer refresh [${region}] (live=${disk.models.length} fetchedAt=${disk.fetchedAt})`,
   );
 }
 
@@ -536,11 +585,11 @@ function tierLabel(tokens: number): string {
   return tokens % 1_000_000 === 0 ? `${tokens / 1_000_000}M` : `${Math.round(tokens / 1000)}K`;
 }
 
-export function displayName(model: DiscoveredModel): string {
+export function displayName(model: DiscoveredModel, region: QoderRegion = "global"): string {
   const parts: string[] = [];
   if (typeof model.priceFactor === "number") parts.push(formatFactor(model.priceFactor));
-  if (getQuotaExhausted() && !isZeroCost(model)) parts.push("Unavailable");
-  const tier = getSelectedTier(model.id);
+  if (getQuotaExhausted(region) && !isZeroCost(model)) parts.push("Unavailable");
+  const tier = getSelectedTier(model.id, region);
   if (tier !== undefined && tier !== model.contextWindow && model.contextTiers?.includes(tier)) {
     parts.push(tierLabel(tier));
   }
@@ -550,12 +599,12 @@ export function displayName(model: DiscoveredModel): string {
 // Go: fetchLiveQoderModels()
 async function fetchModels(options: QoderProviderOptions): Promise<DiscoveredModel[]> {
   const credentials = await resolveQoderCredentials(options);
-  const url = modelListURL();
+  const url = modelListURL(regionOf(options));
   // buildAuthHeaders supplies only Cosy-*/Authorization/X-Request-Id, so merging
   // it under jsonHeaders cannot clobber Accept/User-Agent/Accept-Encoding.
   const headers = jsonHeaders({
     "Accept-Encoding": "identity",
-    ...buildAuthHeaders(null, url, cosyCredentialsForSigning(credentials)),
+    ...buildAuthHeaders(null, url, cosyCredentialsForSigning(credentials), regionOf(options)),
   });
   return fetchWithTimeout(url, { headers }, FETCH_TIMEOUT_MS, async (response) => {
     if (!response.ok) {
@@ -572,7 +621,8 @@ export async function refreshModels(
   options: QoderProviderOptions = {},
   force = false,
 ): Promise<CatalogStatus> {
-  if (discoveryDisabled()) return catalogStatus();
+  const region = regionOf(options);
+  if (discoveryDisabled()) return catalogStatus(region);
   // expiresAt is stamped on BOTH success (TTL) and failure (error TTL), so this
   // single check throttles retries too. Go guards with `len(models) > 0` as
   // well, but its cache is seeded with the static table so that is always true;
@@ -580,44 +630,45 @@ export async function refreshModels(
   // error TTL dead code -- a bad PAT would then re-hit the exchange endpoint on
   // every tick. Serving is unaffected either way: catalogModels() falls back to
   // the bundled table while source is not "qoder".
-  if (!force && Date.now() < expiresAt) return catalogStatus();
-  if (inflight) return inflight;
-  inflight = (async () => {
+  const state = catalogState(region);
+  if (!force && Date.now() < state.expiresAt) return catalogStatus(region);
+  if (state.inflight) return state.inflight;
+  state.inflight = (async () => {
     // Quota rides along with the model list on the same cadence. Started before
     // the await so both requests overlap, and awaited after the try/catch so a
     // model-list failure cannot strand the quota result (and vice versa).
     const quota = fetchQuotaExhausted(options);
     try {
       const models = await fetchModels(options);
-      liveModels = models;
-      fetchedAt = Date.now();
-      expiresAt = fetchedAt + cacheTTLMs();
-      source = "qoder";
-      lastError = "";
+      state.liveModels = models;
+      state.fetchedAt = Date.now();
+      state.expiresAt = state.fetchedAt + cacheTTLMs();
+      state.source = "qoder";
+      state.lastError = "";
       // Persist so the NEXT process start begins from known-good data even if
       // the endpoint is down at that moment. Failures here are swallowed by
       // saveDiskCache(); a read-only cache dir must not break discovery.
-      saveDiskCache(models);
+      saveDiskCache(regionOf(options), models);
     } catch (error) {
       // Keep serving whatever we had (live, then disk cache, then bundled);
       // retry sooner than the happy-path TTL.
-      lastError = errorMessage(error);
-      expiresAt = Date.now() + ERROR_TTL_MS;
+      state.lastError = errorMessage(error);
+      state.expiresAt = Date.now() + ERROR_TTL_MS;
     } finally {
-      inflight = undefined;
+      state.inflight = undefined;
     }
-    setQuotaExhausted(await quota);
+    setQuotaExhausted(await quota, regionOf(options));
     // One line per refresh (every REFRESH_INTERVAL_MS, plus on demand). Reports
     // the model-list half; fetchQuotaExhausted() logs the quota half in detail.
     // `source` is what tells a missing multiplier apart from a zero one: names
     // carry no annotation while the bundled fallback is in use.
     logPlugin(
-      `refresh: source=${source} live=${liveModels.length} total=${catalogModels().length} ` +
-        `exhausted=${getQuotaExhausted()}${lastError ? ` error=${lastError}` : ""}`,
+      `refresh: [${region}] source=${state.source} live=${state.liveModels.length} total=${catalogModels(region).length} ` +
+        `exhausted=${getQuotaExhausted(region)}${state.lastError ? ` error=${state.lastError}` : ""}`,
     );
-    return catalogStatus();
+    return catalogStatus(region);
   })();
-  return inflight;
+  return state.inflight;
 }
 
 // The table index.ts registers into opencode's catalog.
@@ -632,23 +683,28 @@ export async function refreshModels(
 // The bundled table still shows whole while discovery is offline (source=
 // "fallback"), which is its job: something usable when there is no live data at
 // all.
-export function catalogModels(): DiscoveredModel[] {
-  adoptNewerDiskCache();
+export function catalogModels(region: QoderRegion = "global"): DiscoveredModel[] {
+  seedFromDisk(region);
+  adoptNewerDiskCache(region);
+  const state = catalogState(region);
   // "cache" (seeded from disk) must be honoured exactly like "qoder"; checking
   // only for "qoder" here would make the persisted snapshot dead weight and drop
   // every restart straight back to the bundled table.
-  if ((source !== "qoder" && source !== "cache") || liveModels.length === 0) {
+  if ((state.source !== "qoder" && state.source !== "cache") || state.liveModels.length === 0) {
     return QODER_MODELS.map(normalizeStatic);
   }
-  return liveModels;
+  return state.liveModels;
 }
 
 // Go: GetModelDefinition() -- live, then the bundled table, then a sane default.
 // constants.ts used to return QODER_MODELS[0] for unknown ids; that behaviour is
 // preserved as the last resort.
-export function getModelDefinition(modelID: string): DiscoveredModel {
+export function getModelDefinition(
+  modelID: string,
+  region: QoderRegion = "global",
+): DiscoveredModel {
   const id = normalizeId(modelID);
-  const found = catalogModels().find((model) => model.id === id);
+  const found = catalogModels(region).find((model) => model.id === id);
   if (found) return found;
   // A pinned model that upstream retired lands here. Say so -- silently
   // re-keying the request onto the default model's limits is indistinguishable
@@ -659,7 +715,7 @@ export function getModelDefinition(modelID: string): DiscoveredModel {
 
 // Cheap equality check so index.ts only reloads opencode's catalog when the
 // table actually changed, instead of on every timer tick.
-export function catalogSignature(): string {
+export function catalogSignature(region: QoderRegion = "global"): string {
   return catalogModels()
     .map((model) =>
       [
@@ -674,19 +730,20 @@ export function catalogSignature(): string {
         // The inputs behind displayName()'s annotation -- name is already signed
         // above, so signing the rendered string too would just repeat it.
         model.priceFactor ?? "",
-        getQuotaExhausted(),
+        getQuotaExhausted(region),
       ].join(":"),
     )
     .join("|");
 }
 
-export function catalogStatus(): CatalogStatus {
+export function catalogStatus(region: QoderRegion = "global"): CatalogStatus {
+  const state = catalogState(region);
   return {
-    source,
-    live: liveModels.length,
-    total: catalogModels().length,
-    fetchedAt,
-    expiresAt,
-    lastError,
+    source: state.source,
+    live: state.liveModels.length,
+    total: catalogModels(region).length,
+    fetchedAt: state.fetchedAt,
+    expiresAt: state.expiresAt,
+    lastError: state.lastError,
   };
 }

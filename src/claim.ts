@@ -1,6 +1,12 @@
-import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
+import { type QoderProviderOptions, regionOf, resolveQoderCredentials } from "./auth.js";
 import { nonEmptyString, text } from "./coerce.js";
-import { QODER_CAMPAIGNS_URL, QODER_CLAIM_ENV, QODER_CLAIM_TIMEOUT_MS } from "./constants.js";
+import {
+  QODER_CLAIM_ENV,
+  QODER_CLAIM_TIMEOUT_MS,
+  type QoderRegion,
+  resolveEndpoints,
+  stateFiles,
+} from "./constants.js";
 import { readEnv } from "./env.js";
 import { fetchWithTimeout, jsonHeaders, readErrorBody } from "./http.js";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
@@ -328,8 +334,6 @@ function toVerdict(error: unknown): {
 // claimed; this file exists so a scheduled run does not re-POST a reward it already
 // collected, and so a withdrawn endpoint is not probed every session. Deleting
 // it costs one extra request and nothing else.
-const STATE_FILENAME = "qoder-claim.json";
-
 interface ClaimState {
   /** campaignId -> last local verdict, so a same-window repeat is skipped */
   claimed: Record<string, { endAt: number | null; at: number; awarded: number | null }>;
@@ -343,12 +347,12 @@ function emptyState(): ClaimState {
   return { claimed: {}, cooldownUntil: 0, goneStreak: 0 };
 }
 
-export function claimStateFile(): string {
-  return opencodeConfigFile(STATE_FILENAME);
+export function claimStateFile(region: QoderRegion = "global"): string {
+  return opencodeConfigFile(stateFiles(region).claim);
 }
 
-function readState(): ClaimState {
-  const raw = asRecord(readJsonFile("claim", claimStateFile()));
+function readState(region: QoderRegion = "global"): ClaimState {
+  const raw = asRecord(readJsonFile("claim", claimStateFile(region)));
   if (!raw) return emptyState();
   const claimed: ClaimState["claimed"] = {};
   for (const [id, entry] of Object.entries(asRecord(raw.claimed) ?? {})) {
@@ -372,8 +376,8 @@ function readState(): ClaimState {
   };
 }
 
-function writeState(state: ClaimState): void {
-  writeJsonFile("claim", claimStateFile(), state);
+function writeState(state: ClaimState, region: QoderRegion = "global"): void {
+  writeJsonFile("claim", claimStateFile(region), state);
 }
 
 // Drop verdicts for windows that have already closed; without this the file
@@ -386,9 +390,9 @@ function prune(state: ClaimState, nowMs: number): ClaimState {
   return { ...state, claimed: keep };
 }
 
-export function resetClaimState(): boolean {
+export function resetClaimState(region: QoderRegion = "global"): boolean {
   try {
-    writeState(emptyState());
+    writeState(emptyState(), region);
     return true;
   } catch (error) {
     logPlugin(`claim: state reset failed (${errorMessage(error)})`);
@@ -398,12 +402,12 @@ export function resetClaimState(): boolean {
 
 // --- transport ---------------------------------------------------------------
 
-function campaignsUrl(): string {
-  return QODER_CAMPAIGNS_URL;
+function campaignsUrl(region: QoderRegion): string {
+  return resolveEndpoints(region).campaigns;
 }
 
-function claimUrl(campaignId: string): string {
-  return `${campaignsUrl()}/${encodeURIComponent(campaignId)}/claim`;
+function claimUrl(region: QoderRegion, campaignId: string): string {
+  return `${campaignsUrl(region)}/${encodeURIComponent(campaignId)}/claim`;
 }
 
 // Bearer-only, exactly like fetchQuotaUsage(): the COSY signature the chat
@@ -444,7 +448,12 @@ async function fetchCampaigns(
   options: QoderProviderOptions,
 ): Promise<{ list: CampaignList; account: string }> {
   const credentials = await resolveQoderCredentials(options);
-  const payload = await campaignRequest(options, campaignsUrl(), "GET", "campaign list");
+  const payload = await campaignRequest(
+    options,
+    campaignsUrl(regionOf(options)),
+    "GET",
+    "campaign list",
+  );
   return {
     list: shapeCampaignList(payload),
     account: accountLabel(credentials.email),
@@ -455,7 +464,9 @@ async function postClaim(
   options: QoderProviderOptions,
   campaignId: string,
 ): Promise<{ status: string; amount: number | null }> {
-  return shapeClaimResult(await campaignRequest(options, claimUrl(campaignId), "POST", "claim"));
+  return shapeClaimResult(
+    await campaignRequest(options, claimUrl(regionOf(options), campaignId), "POST", "claim"),
+  );
 }
 
 // --- rendering ---------------------------------------------------------------
@@ -732,7 +743,7 @@ async function sweep(
   return sweeps;
 }
 
-function renderStatus(sweeps: AccountSweep[], nowMs: number): string {
+function renderStatus(sweeps: AccountSweep[], nowMs: number, region: QoderRegion): string {
   const lines: string[] = ["Qoder campaign status (promotional surface, not the provider):"];
   for (const sweep of sweeps) {
     lines.push("", sweep.account);
@@ -755,10 +766,9 @@ function renderStatus(sweeps: AccountSweep[], nowMs: number): string {
   }
   lines.push(
     "",
-    `Read-only: no claim was made. qoder_claim() performs the daily POST for ${QODER_CAMPAIGNS_URL.replace(
-      /\/sash.*/,
-      "",
-    )}.`,
+    `Read-only: no claim was made. qoder_claim() performs the daily POST for ${campaignsUrl(
+      region,
+    ).replace(/\/sash.*/, "")}.`,
   );
   return lines.join("\n");
 }
@@ -822,12 +832,12 @@ export async function reportCampaigns(
 ): Promise<ClaimReport> {
   const nowMs = Date.now();
   if (claimDisabled()) return disabledReport();
-  const state = readState();
+  const state = readState(regionOf(options));
   if (state.cooldownUntil > nowMs) return cooldownReport(state);
   const sweeps = await sweep(options, all, nowMs, false, state);
   const attempts = sweeps.flatMap((sweep) => sweep.attempts);
   return {
-    output: renderStatus(sweeps, nowMs),
+    output: renderStatus(sweeps, nowMs, regionOf(options)),
     data: {
       attempts,
       claimed: 0,
@@ -843,18 +853,19 @@ export async function runClaim(
 ): Promise<ClaimReport> {
   const nowMs = Date.now();
 
+  const region = regionOf(options);
   if (reset) {
-    const cleared = resetClaimState();
+    const cleared = resetClaimState(region);
     return {
       output: cleared
-        ? `Cleared the campaign markers in ${claimStateFile()}. The next call asks the server again.`
-        : `Could not rewrite ${claimStateFile()}; see the plugin log.`,
+        ? `Cleared the campaign markers in ${claimStateFile(region)}. The next call asks the server again.`
+        : `Could not rewrite ${claimStateFile(region)}; see the plugin log.`,
       data: { attempts: [], claimed: 0, cooldownUntil: null, disabled: false },
     };
   }
   if (claimDisabled()) return disabledReport();
 
-  const state = readState();
+  const state = readState(region);
   if (state.cooldownUntil > nowMs) return cooldownReport(state);
 
   const sweeps = await sweep(options, all, nowMs, true, state);
@@ -872,7 +883,7 @@ export async function runClaim(
   const allGone = sweeps.length > 0 && sweeps.every((sweep) => sweep.gone);
   next.cooldownUntil = cooldownMs > 0 ? nowMs + cooldownMs : 0;
   next.goneStreak = allGone ? state.goneStreak + 1 : 0;
-  writeState(next);
+  writeState(next, region);
 
   const goneStreakHint =
     next.goneStreak >= 3

@@ -1,5 +1,6 @@
 import { describeTokenShape } from "./auth.js";
 import type { CapabilityReport } from "./capabilities.js";
+import type { QoderRegion } from "./constants.js";
 import { refreshKeyFile } from "./key-file.js";
 import {
   addPAT,
@@ -47,12 +48,12 @@ function redactPAT(entry: StoredPAT): {
   };
 }
 
-export function reportPatList(): CapabilityReport {
+export function reportPatList(region: QoderRegion = "global"): CapabilityReport {
   // Refresh the seed key file first, so a file the user just edited shows
   // up in this answer rather than only after the next 60s tick.
-  refreshKeyFile();
-  const pats = listPATs();
-  const active = getActivePAT();
+  refreshKeyFile(region);
+  const pats = listPATs(region);
+  const active = getActivePAT(region);
   const output =
     pats.length === 0
       ? "No PATs stored yet. Seed them from the key file (default ~/.qoderkey_env, one " +
@@ -68,9 +69,9 @@ export function reportPatList(): CapabilityReport {
   return { output, data: { accounts: pats.map(redactPAT), activeId: active?.id } };
 }
 
-export function reportPatSwitch(id?: string): CapabilityReport {
+export function reportPatSwitch(id?: string, region: QoderRegion = "global"): CapabilityReport {
   if (id === undefined) {
-    const cleared = followConfig();
+    const cleared = followConfig(region);
     return {
       output: cleared
         ? "Selection cleared. Requests now use the configured credential " +
@@ -79,7 +80,7 @@ export function reportPatSwitch(id?: string): CapabilityReport {
       data: { success: true, cleared },
     };
   }
-  const success = switchPAT(id);
+  const success = switchPAT(id, region);
   const output = success
     ? `Switched to ${id}. This PAT signs all subsequent requests, overriding ` +
       `the configured credential until qoder_pat_switch is called without an id.`
@@ -87,16 +88,21 @@ export function reportPatSwitch(id?: string): CapabilityReport {
   return { output, data: { success, id } };
 }
 
-export function reportPatAdd(pat: string, label: string, email?: string): CapabilityReport {
-  const entry = addPAT(pat, label, email);
+export function reportPatAdd(
+  pat: string,
+  label: string,
+  email?: string,
+  region: QoderRegion = "global",
+): CapabilityReport {
+  const entry = addPAT(pat, label, email, region);
   const output = entry
     ? `Added ${entry.id} (${entry.label}). ${entry.active ? "This is now the active PAT." : "Use qoder_pat_switch to activate it."}`
     : `PAT already exists (duplicate detected).`;
   return { output, data: { entry: entry ? redactPAT(entry) : null } };
 }
 
-export function reportPatRemove(id: string): CapabilityReport {
-  const success = removePAT(id);
+export function reportPatRemove(id: string, region: QoderRegion = "global"): CapabilityReport {
+  const success = removePAT(id, region);
   const output = success ? `Removed ${id}.` : `PAT ${id} not found.`;
   return { output, data: { success, id } };
 }

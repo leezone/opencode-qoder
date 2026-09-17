@@ -1,4 +1,5 @@
 import { normalizeId } from "./coerce.js";
+import { type QoderRegion, sharedKey, stateFiles } from "./constants.js";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
 import { logPlugin } from "./log.js";
 import { readShared, writeShared } from "./shared-state.js";
@@ -30,9 +31,6 @@ import { readShared, writeShared } from "./shared-state.js";
 // visible to request building in the other. See shared-state.ts for the
 // boundary itself.
 
-const STORE_FILENAME = "qoder-tiers.json";
-const CACHE_KEY = "__opencode_qoder_tier_store";
-
 // Session entries untouched for this long are dropped at the next load. The
 // map would otherwise grow with every chat ever started; the TTL is generous
 // enough that no plausible conversation outlives it.
@@ -49,16 +47,21 @@ function emptyStore(): TierStoreData {
   return { mode: {}, sessions: {} };
 }
 
-function cachedStore(): TierStoreData | undefined {
-  return readShared<TierStoreData>(CACHE_KEY);
+// One cache slot per region: the two providers share this process.
+function cacheKey(region: QoderRegion): string {
+  return sharedKey("tier_store", region);
 }
 
-function setCachedStore(data: TierStoreData): void {
-  writeShared(CACHE_KEY, data);
+function cachedStore(region: QoderRegion): TierStoreData | undefined {
+  return readShared<TierStoreData>(cacheKey(region));
 }
 
-function storePath(): string {
-  return opencodeConfigFile(STORE_FILENAME);
+function setCachedStore(region: QoderRegion, data: TierStoreData): void {
+  writeShared(cacheKey(region), data);
+}
+
+function storePath(region: QoderRegion): string {
+  return opencodeConfigFile(stateFiles(region).tiers);
 }
 
 function readTokens(value: unknown): number | undefined {
@@ -66,10 +69,10 @@ function readTokens(value: unknown): number | undefined {
   return Number.isInteger(count) && count > 0 ? count : undefined;
 }
 
-function loadStore(): TierStoreData {
-  const cached = cachedStore();
+function loadStore(region: QoderRegion = "global"): TierStoreData {
+  const cached = cachedStore(region);
   if (cached) return cached;
-  const path = storePath();
+  const path = storePath(region);
   const data = emptyStore();
   const parsed = readJsonFile("tier-store", path) as Record<string, unknown> | undefined;
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -110,17 +113,17 @@ function loadStore(): TierStoreData {
       // without this rewrite each realm keeps re-loading (and re-dropping)
       // them forever, and the file never converges to what is actually live.
       if (dropped > 0) {
-        setCachedStore(data);
-        saveStore(data);
+        setCachedStore(region, data);
+        saveStore(region, data);
       }
     }
   }
-  setCachedStore(data);
+  setCachedStore(region, data);
   return data;
 }
 
-function saveStore(data: TierStoreData): void {
-  const path = storePath();
+function saveStore(region: QoderRegion, data: TierStoreData): void {
+  const path = storePath(region);
   if (writeJsonFile("tier-store", path, data)) {
     logPlugin(
       `tier-store: saved ${Object.keys(data.mode).length} mode + ${Object.keys(data.sessions).length} session entr(y/ies) to ${path}`,
@@ -133,35 +136,38 @@ function saveStore(data: TierStoreData): void {
 // The tier a model is displayed/registered at, or undefined at default. Note
 // this is deliberately NOT the request-path source any more -- requests ask
 // getSessionTier() for the session's own choice first.
-export function getSelectedTier(modelID: string): number | undefined {
+export function getSelectedTier(
+  modelID: string,
+  region: QoderRegion = "global",
+): number | undefined {
   const id = normalizeId(modelID);
   if (id === "") return undefined;
-  return loadStore().mode[id];
+  return loadStore(region).mode[id];
 }
 
-export function listSelectedTiers(): Record<string, number> {
-  return { ...loadStore().mode };
+export function listSelectedTiers(region: QoderRegion = "global"): Record<string, number> {
+  return { ...loadStore(region).mode };
 }
 
-export function setTier(modelID: string, tokens: number): boolean {
+export function setTier(modelID: string, tokens: number, region: QoderRegion = "global"): boolean {
   const id = normalizeId(modelID);
   if (id === "" || !Number.isInteger(tokens) || tokens <= 0) return false;
-  const data = loadStore();
+  const data = loadStore(region);
   data.mode[id] = tokens;
-  setCachedStore(data);
-  saveStore(data);
+  setCachedStore(region, data);
+  saveStore(region, data);
   logPlugin(`tier-store: mode ${id} -> ${tokens}`);
   return true;
 }
 
-export function clearTier(modelID: string): boolean {
+export function clearTier(modelID: string, region: QoderRegion = "global"): boolean {
   const id = normalizeId(modelID);
   if (id === "") return false;
-  const data = loadStore();
+  const data = loadStore(region);
   if (!(id in data.mode)) return false;
   delete data.mode[id];
-  setCachedStore(data);
-  saveStore(data);
+  setCachedStore(region, data);
+  saveStore(region, data);
   logPlugin(`tier-store: mode ${id} -> default`);
   return true;
 }
@@ -169,12 +175,12 @@ export function clearTier(modelID: string): boolean {
 // Drop every display-mode entry -- called when a NEW root session starts so
 // the picker shows default tiers again ("new conversations default to 200K").
 // Returns true when something was actually cleared (caller may skip a reload).
-export function clearAllTiers(): boolean {
-  const data = loadStore();
+export function clearAllTiers(region: QoderRegion = "global"): boolean {
+  const data = loadStore(region);
   if (Object.keys(data.mode).length === 0) return false;
   data.mode = {};
-  setCachedStore(data);
-  saveStore(data);
+  setCachedStore(region, data);
+  saveStore(region, data);
   logPlugin("tier-store: display mode reset to defaults (new session)");
   return true;
 }
@@ -184,40 +190,47 @@ export function clearAllTiers(): boolean {
 // The tier this conversation runs at, by ROOT session id; undefined means the
 // session never switched and rides the model's default tier. Touching an entry
 // refreshes its TTL timestamp (and persists when it changed in memory).
-export function getSessionTier(sessionID: string): number | undefined {
+export function getSessionTier(
+  sessionID: string,
+  region: QoderRegion = "global",
+): number | undefined {
   const id = normalizeId(sessionID);
   if (id === "") return undefined;
-  const data = loadStore();
+  const data = loadStore(region);
   const entry = data.sessions[id];
   if (!entry) return undefined;
   if (Date.now() - entry.at >= SESSION_TTL_MS) {
     delete data.sessions[id];
-    setCachedStore(data);
-    saveStore(data);
+    setCachedStore(region, data);
+    saveStore(region, data);
     return undefined;
   }
   return entry.tokens;
 }
 
-export function setSessionTier(sessionID: string, tokens: number): boolean {
+export function setSessionTier(
+  sessionID: string,
+  tokens: number,
+  region: QoderRegion = "global",
+): boolean {
   const id = normalizeId(sessionID);
   if (id === "" || !Number.isInteger(tokens) || tokens <= 0) return false;
-  const data = loadStore();
+  const data = loadStore(region);
   data.sessions[id] = { tokens, at: Date.now() };
-  setCachedStore(data);
-  saveStore(data);
+  setCachedStore(region, data);
+  saveStore(region, data);
   logPlugin(`tier-store: session ${id} -> context_length ${tokens}`);
   return true;
 }
 
-export function clearSessionTier(sessionID: string): boolean {
+export function clearSessionTier(sessionID: string, region: QoderRegion = "global"): boolean {
   const id = normalizeId(sessionID);
   if (id === "") return false;
-  const data = loadStore();
+  const data = loadStore(region);
   if (!(id in data.sessions)) return false;
   delete data.sessions[id];
-  setCachedStore(data);
-  saveStore(data);
+  setCachedStore(region, data);
+  saveStore(region, data);
   logPlugin(`tier-store: session ${id} -> default tier`);
   return true;
 }

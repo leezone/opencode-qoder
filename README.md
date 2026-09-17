@@ -2,9 +2,10 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Qoder Global provider plugin for [opencode](https://opencode.ai/). Ported from the global-only pieces of `pi-provider-qoder`: PAT exchange, COSY request signing, Qoder body encoding, chat SSE parsing, reasoning, image input, and tool calls.
+Qoder provider plugin for [opencode](https://opencode.ai/) -- both the international site (`qoder.sh`) and the China site (`qoder.com.cn`). Ported from `pi-provider-qoder`: PAT exchange, COSY request signing, Qoder body encoding, chat SSE parsing, reasoning, image input, and tool calls.
 
-Qoder China endpoints and model aliases are intentionally not included.
+One plugin, two provider instances: configure both regions side by side, each with its own
+credentials, model list and context-tier state.
 
 ## Build
 
@@ -26,6 +27,41 @@ Add the plugin to `opencode.json`, or adjust the path for your config location:
 ```
 
 The plugin registers provider `qoder` and bundles 17 models -- see [Models](#models).
+
+### Both regions at once
+
+Add a second entry naming the CN provider. The two instances are independent: separate
+credential stores, separate model catalogs, separate tier selections.
+
+```jsonc
+{
+  "plugin": [
+    ["opencode-qoder"],                                     // provider "qoder"
+    ["opencode-qoder", { "providerID": "qoder-cn",          // provider "qoder-cn"
+                         "region": "cn" }]
+  ]
+}
+```
+
+Load plugins from `~/.config/opencode/plugin/` instead? Drop in two shims that use the
+exported factory:
+
+```js
+// ~/.config/opencode/plugin/qoder.js
+import { definePlugin } from "opencode-qoder";
+export default definePlugin("global");
+
+// ~/.config/opencode/plugin/qoder-cn.js
+import { definePlugin } from "opencode-qoder";
+export default definePlugin("cn");
+```
+
+Then reference models as `qoder/auto` and `qoder-cn/auto`. The quota script takes
+`--region=cn` to read the CN store:
+
+```bash
+node qoder-quota.mjs --resolve --region=cn
+```
 
 ## Models
 

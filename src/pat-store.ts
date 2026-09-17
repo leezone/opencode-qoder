@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
+import { type QoderRegion, sharedKey, stateFiles } from "./constants.js";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
 import { errorMessage, logPlugin } from "./log.js";
 import { readShared, writeShared } from "./shared-state.js";
@@ -39,8 +40,6 @@ interface PATStoreData {
   entries: StoredPAT[];
 }
 
-const STORE_FILENAME = "qoder-pats.json";
-
 // Cache lives on globalThis, not module state: a PAT switched by a tool in one
 // plugin instance must be visible to credential resolution in the other. The
 // realm-boundary explanation lives once, in shared-state.ts.
@@ -51,34 +50,42 @@ const STORE_FILENAME = "qoder-pats.json";
 // request; when the active PAT is dead, restart-to-apply is exactly the friction
 // the shell escape hatch is supposed to remove. Same mtime-reuse contract as
 // routing-policy.ts.
-const CACHE_KEY = "__opencode_qoder_pat_store";
-
 interface Cache {
   data: PATStoreData;
   mtimeMs: number;
 }
 
-function cachedStore(): Cache | undefined {
-  return readShared<Cache>(CACHE_KEY);
+// One cache slot per region: the two providers share this process, and an
+// unscoped key would let the CN store answer for the international one.
+function cacheKey(region: QoderRegion): string {
+  return sharedKey("pat_store", region);
 }
 
-function setCachedStore(data: PATStoreData | undefined, mtimeMs: number): void {
+function cachedStore(region: QoderRegion): Cache | undefined {
+  return readShared<Cache>(cacheKey(region));
+}
+
+function setCachedStore(
+  region: QoderRegion,
+  data: PATStoreData | undefined,
+  mtimeMs: number,
+): void {
   if (!data) {
-    writeShared(CACHE_KEY, undefined);
+    writeShared(cacheKey(region), undefined);
     return;
   }
-  writeShared(CACHE_KEY, { data, mtimeMs });
+  writeShared(cacheKey(region), { data, mtimeMs });
 }
 
-function storePath(): string {
-  return opencodeConfigFile(STORE_FILENAME);
+function storePath(region: QoderRegion): string {
+  return opencodeConfigFile(stateFiles(region).pats);
 }
 
 // Where the store lives, for a caller that has to name the file to the user --
 // the auth-failure hint in language-model.ts points its shell recovery at this
 // exact path so the two agree with the writer.
-export function patStoreFile(): string {
-  return storePath();
+export function patStoreFile(region: QoderRegion = "global"): string {
+  return storePath(region);
 }
 
 // File mtime, or -1 for a missing file (the normal fresh-install state, quiet)
@@ -98,10 +105,10 @@ function storeMtime(path: string): number {
 // Re-reads only when the file's mtime moved since the last load, so an external
 // `active` flip is honored on the next request while a steady-state process
 // pays one statSync per read and no parse.
-function loadStore(): PATStoreData {
-  const path = storePath();
+function loadStore(region: QoderRegion = "global"): PATStoreData {
+  const path = storePath(region);
   const mtimeMs = storeMtime(path);
-  const cached = cachedStore();
+  const cached = cachedStore(region);
   if (cached && cached.mtimeMs === mtimeMs) return cached.data;
   let data: PATStoreData = { entries: [] };
   if (mtimeMs !== -1) {
@@ -110,15 +117,15 @@ function loadStore(): PATStoreData {
       data = { entries: (parsed as PATStoreData).entries.filter(isValidEntry) };
     }
   }
-  setCachedStore(data, mtimeMs);
+  setCachedStore(region, data, mtimeMs);
   return data;
 }
 
 // Drop the in-memory copy so the next loadStore() re-reads the file. With
 // mtime revalidation this is only needed when a caller wants to force a re-read
 // without a file change; export kept for tests.
-export function invalidateStore(): void {
-  setCachedStore(undefined, -1);
+export function invalidateStore(region: QoderRegion = "global"): void {
+  setCachedStore(region, undefined, -1);
 }
 
 function isValidEntry(value: unknown): value is StoredPAT {
@@ -133,15 +140,15 @@ function isValidEntry(value: unknown): value is StoredPAT {
   );
 }
 
-function saveStore(): void {
-  const cached = cachedStore();
+function saveStore(region: QoderRegion): void {
+  const cached = cachedStore(region);
   if (!cached) return;
-  const path = storePath();
+  const path = storePath(region);
   if (writeJsonFile("pat-store", path, cached.data)) {
     // Re-stamp the cache with the new mtime: this write must not read back as
     // an out-of-band edit on the next load. A stat failure after a successful
     // write leaves the stale stamp, whose only cost is one extra re-parse.
-    setCachedStore(cached.data, storeMtime(path));
+    setCachedStore(region, cached.data, storeMtime(path));
     logPlugin(`pat-store: saved ${cached.data.entries.length} entries to ${path}`);
   }
 }
@@ -158,26 +165,31 @@ function patID(pat: string): string {
 }
 
 // Returns all stored PATs (shape only, never the full token in logs).
-export function listPATs(): StoredPAT[] {
-  return loadStore().entries;
+export function listPATs(region: QoderRegion = "global"): StoredPAT[] {
+  return loadStore(region).entries;
 }
 
 // Returns the currently active PAT, or undefined if none is active.
-export function getActivePAT(): StoredPAT | undefined {
-  return loadStore().entries.find((e) => e.active);
+export function getActivePAT(region: QoderRegion = "global"): StoredPAT | undefined {
+  return loadStore(region).entries.find((e) => e.active);
 }
 
 // Returns the raw PAT string of the active entry, or undefined.
-export function getActivePatString(): string | undefined {
-  const entry = getActivePAT();
+export function getActivePatString(region: QoderRegion = "global"): string | undefined {
+  const entry = getActivePAT(region);
   return entry?.pat;
 }
 
 // Add a new PAT to the store. If it is the first entry, it becomes active
 // automatically. Returns the stored entry, or undefined if the PAT already
 // exists (duplicate detection by the raw token, or by ID).
-export function addPAT(pat: string, label: string, email?: string): StoredPAT | undefined {
-  const store = loadStore();
+export function addPAT(
+  pat: string,
+  label: string,
+  email?: string,
+  region: QoderRegion = "global",
+): StoredPAT | undefined {
+  const store = loadStore(region);
   const id = patID(pat);
 
   // Duplicate check: the raw token is the durable identity (an ID re-derivation
@@ -197,7 +209,7 @@ export function addPAT(pat: string, label: string, email?: string): StoredPAT | 
     active: isFirst,
   };
   store.entries.push(entry);
-  saveStore();
+  saveStore(region);
   logPlugin(`pat-store: added ${id} (${entry.label}), active=${entry.active}`);
   return entry;
 }
@@ -205,12 +217,12 @@ export function addPAT(pat: string, label: string, email?: string): StoredPAT | 
 // Remove a PAT by ID. If the removed entry was active, no other entry becomes
 // active automatically (the user must switch explicitly). Returns true if the
 // entry was found and removed.
-export function removePAT(id: string): boolean {
-  const store = loadStore();
+export function removePAT(id: string, region: QoderRegion = "global"): boolean {
+  const store = loadStore(region);
   const index = store.entries.findIndex((e) => e.id === id);
   if (index === -1) return false;
   const removed = store.entries.splice(index, 1)[0];
-  saveStore();
+  saveStore(region);
   logPlugin(`pat-store: removed ${id} (${removed.label})`);
   return true;
 }
@@ -218,8 +230,8 @@ export function removePAT(id: string): boolean {
 // Switch the active PAT to the entry with the given ID, marking it as the
 // user's explicit choice. Sets active/selected=false on all other entries.
 // Returns true if the ID was found and switched.
-export function switchPAT(id: string): boolean {
-  const store = loadStore();
+export function switchPAT(id: string, region: QoderRegion = "global"): boolean {
+  const store = loadStore(region);
   const target = store.entries.find((e) => e.id === id);
   if (!target) return false;
 
@@ -227,7 +239,7 @@ export function switchPAT(id: string): boolean {
     entry.active = entry.id === id;
     entry.selected = entry.id === id;
   }
-  saveStore();
+  saveStore(region);
   logPlugin(`pat-store: switched to ${id} (${target.label})`);
   return true;
 }
@@ -236,8 +248,8 @@ export function switchPAT(id: string): boolean {
 // that is still active), or undefined when nobody has switched. This is what
 // outranks a passive configured credential in the resolution chain; the
 // auto-activated first import does NOT set it (see StoredPAT.selected).
-export function getSelectedPatString(): string | undefined {
-  const entry = loadStore().entries.find((e) => e.active && e.selected);
+export function getSelectedPatString(region: QoderRegion = "global"): string | undefined {
+  const entry = loadStore(region).entries.find((e) => e.active && e.selected);
   return entry?.pat;
 }
 
@@ -245,8 +257,8 @@ export function getSelectedPatString(): string | undefined {
 // option) by clearing every explicit selection. The `active` flag is left
 // alone: it still names the entry the store layer falls back to. Returns
 // whether anything changed.
-export function followConfig(): boolean {
-  const store = loadStore();
+export function followConfig(region: QoderRegion = "global"): boolean {
+  const store = loadStore(region);
   let changed = false;
   for (const entry of store.entries) {
     if (entry.selected) {
@@ -255,7 +267,7 @@ export function followConfig(): boolean {
     }
   }
   if (changed) {
-    saveStore();
+    saveStore(region);
     logPlugin("pat-store: following the configured credential (selection cleared)");
   }
   return changed;

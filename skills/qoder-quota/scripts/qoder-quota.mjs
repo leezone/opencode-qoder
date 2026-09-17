@@ -19,6 +19,10 @@
 //   node qoder-quota.mjs --use-pat=<id>   validate it, then select + activate it
 //   node qoder-quota.mjs --resolve  which credential layer answers (offline)
 //
+// Add --region=cn to read the China deployment's store and endpoints instead of
+// the international ones; the region is part of the credential chain, so
+// --resolve --region=cn and the default can legitimately disagree.
+//
 // Exit codes: 0 = data fetched (credits may still be spent) / a switch landed;
 // 1 = nothing usable came back, with the reason on stderr.
 
@@ -36,7 +40,7 @@ const option = (name) => {
 if (flag("help")) {
   console.log(
     [
-      "Usage: node qoder-quota.mjs [--json] [--pat=<pt-...>] [--token=<jt-...>]",
+      "Usage: node qoder-quota.mjs [--json] [--pat=<pt-...>] [--token=<jt-...>] [--region=global|cn]",
       "       node qoder-quota.mjs --pats",
       "       node qoder-quota.mjs --use-pat=<id|label> [--force]",
       "       node qoder-quota.mjs --resolve",
@@ -103,10 +107,12 @@ function finish(report) {
   process.exit(report.exitCode);
 }
 
-const cli = { pat: option("pat"), token: option("token"), json: flag("json") };
+const region = option("region") === "cn" ? "cn" : "global";
+const cli = { pat: option("pat"), token: option("token"), json: flag("json"), region };
 
 if (flag("resolve")) finish(runResolveCli(cli));
 if (flag("pats")) finish(await runPatsCli(cli));
 const target = option("use-pat");
-if (target) finish(await runUsePatCli(target, { force: flag("force"), json: cli.json }));
+if (target)
+  finish(await runUsePatCli(target, { force: flag("force"), json: cli.json, region }));
 finish(await runQuotaCli(cli));

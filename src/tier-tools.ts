@@ -1,4 +1,5 @@
 import type { CapabilityReport } from "./capabilities.js";
+import type { QoderRegion } from "./constants.js";
 import { catalogModels, isValidContextTier } from "./model-catalog.js";
 import { getRoutingPolicy, type RoutingPolicy, updateRoutingPolicy } from "./routing-policy.js";
 import { resolveRootSession } from "./session-roots.js";
@@ -23,11 +24,14 @@ import {
 // ctx.catalog.reload(), and the legacy instance reaches it through a globalThis
 // trigger published by setupV2. That cross-realm plumbing stays in index.ts.
 
-export function reportTierList(sessionID?: string): CapabilityReport {
-  const selections = listSelectedTiers();
+export function reportTierList(
+  sessionID?: string,
+  region: QoderRegion = "global",
+): CapabilityReport {
+  const selections = listSelectedTiers(region);
   const root = sessionID ? resolveRootSession(sessionID) : "";
-  const sessionTier = root ? getSessionTier(root) : undefined;
-  const tiers = catalogModels()
+  const sessionTier = root ? getSessionTier(root, region) : undefined;
+  const tiers = catalogModels(region)
     .filter((model) => (model.contextTiers?.length ?? 0) > 0 || model.id in selections)
     .map((model) => ({
       model: model.id,
@@ -59,8 +63,8 @@ export function reportTierList(sessionID?: string): CapabilityReport {
 // helper model's window the routing policy escalates compaction/task requests
 // to a model that advertises the tier, so the whole exchange -- not just the
 // main thread -- fits.
-function routingNote(tier: number): string {
-  const policy = getRoutingPolicy();
+function routingNote(tier: number, region: QoderRegion): string {
+  const policy = getRoutingPolicy(region);
   if (tier <= policy.threshold) return "";
   return policy.enabled
     ? `\n\nPinned subagents (compaction, task children) auto-escalate to ${policy.target} at this tier (policy: qoder_routing_policy).`
@@ -70,7 +74,8 @@ function routingNote(tier: number): string {
 export function reportTierSwitch(
   args: { model: string; tier?: number },
   sessionID: string | undefined,
-  refresh: (labelChanged?: boolean) => boolean,
+  region: QoderRegion = "global",
+  refresh: (labelChanged?: boolean) => boolean = () => false,
 ): CapabilityReport {
   const root = sessionID ? resolveRootSession(sessionID) : "";
   if (args.model === "*") {
@@ -90,11 +95,11 @@ export function reportTierSwitch(
       };
     }
     const tier = args.tier;
-    const matches = catalogModels().filter((model) => model.contextTiers?.includes(tier));
+    const matches = catalogModels(region).filter((model) => model.contextTiers?.includes(tier));
     if (matches.length === 0) {
       const offered = [
         ...new Set(
-          catalogModels()
+          catalogModels(region)
             .flatMap((model) => model.contextTiers ?? [])
             .sort((a, b) => a - b),
         ),
@@ -106,9 +111,9 @@ export function reportTierSwitch(
         data: { success: false, model: "*", tier },
       };
     }
-    if (root) setSessionTier(root, tier);
-    for (const model of matches) setTier(model.id, tier);
-    const unsupported = catalogModels()
+    if (root) setSessionTier(root, tier, region);
+    for (const model of matches) setTier(model.id, tier, region);
+    const unsupported = catalogModels(region)
       .filter((model) => !model.contextTiers?.includes(tier))
       .map((model) => model.id);
     const refreshed = refresh(true);
@@ -125,7 +130,7 @@ export function reportTierSwitch(
         (refreshed
           ? "The picker labels and compaction limits are reloading now."
           : "Restart opencode to update the picker labels and limits.") +
-        routingNote(tier),
+        routingNote(tier, region),
       data: {
         success: true,
         model: "*",
@@ -135,7 +140,7 @@ export function reportTierSwitch(
       },
     };
   }
-  const def = catalogModels().find((model) => model.id === args.model);
+  const def = catalogModels(region).find((model) => model.id === args.model);
   if (!def) {
     return {
       output: `Model "${args.model}" not found. Run qoder_models to list available models.`,
@@ -143,8 +148,8 @@ export function reportTierSwitch(
     };
   }
   if (args.tier === undefined) {
-    const clearedSession = root ? clearSessionTier(root) : false;
-    const clearedMode = clearTier(args.model);
+    const clearedSession = root ? clearSessionTier(root, region) : false;
+    const clearedMode = clearTier(args.model, region);
     refresh(clearedMode);
     return {
       output:
@@ -166,8 +171,8 @@ export function reportTierSwitch(
   // The session binding drives the wire; the mode drives the picker label
   // and the registered (compaction-threshold) limits. A missing root id
   // (no session yet) degrades to the global mode alone.
-  if (root) setSessionTier(root, args.tier);
-  setTier(args.model, args.tier);
+  if (root) setSessionTier(root, args.tier, region);
+  setTier(args.model, args.tier, region);
   const refreshed = refresh(true);
   return {
     output:
@@ -175,7 +180,7 @@ export function reportTierSwitch(
       (refreshed
         ? "The picker label and compaction limits are reloading now."
         : "Restart opencode to update the picker label and limits.") +
-      routingNote(args.tier),
+      routingNote(args.tier, region),
     data: { success: true, model: args.model, tier: args.tier, session: root || null },
   };
 }
@@ -189,13 +194,16 @@ function describePolicy(policy: RoutingPolicy): string {
   );
 }
 
-export function reportRoutingPolicy(args: {
-  enabled?: boolean;
-  subagentModel?: string;
-  target?: string;
-  threshold?: number;
-  exemptAgents?: string[];
-}): CapabilityReport {
+export function reportRoutingPolicy(
+  args: {
+    enabled?: boolean;
+    subagentModel?: string;
+    target?: string;
+    threshold?: number;
+    exemptAgents?: string[];
+  },
+  region: QoderRegion = "global",
+): CapabilityReport {
   const patch: Partial<RoutingPolicy> = {};
   if (typeof args.enabled === "boolean") patch.enabled = args.enabled;
   if (args.subagentModel) patch.subagentModel = args.subagentModel;
@@ -203,8 +211,8 @@ export function reportRoutingPolicy(args: {
   if (args.threshold !== undefined) patch.threshold = args.threshold;
   if (args.exemptAgents) patch.exemptAgents = args.exemptAgents;
   const changed = Object.keys(patch).length > 0;
-  const policy = changed ? updateRoutingPolicy(patch) : getRoutingPolicy();
-  if (changed && args.target && !catalogModels().some((m) => m.id === args.target)) {
+  const policy = changed ? updateRoutingPolicy(patch, region) : getRoutingPolicy(region);
+  if (changed && args.target && !catalogModels(region).some((m) => m.id === args.target)) {
     return {
       output: `Target "${args.target}" is not a known model. Policy left as: ${describePolicy(policy)}.`,
       data: { success: false, policy },

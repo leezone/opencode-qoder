@@ -29,10 +29,16 @@ import { claimDisabled, reportCampaigns, runClaim } from "./claim.js";
 import { nonEmptyString } from "./coerce.js";
 import {
   PROVIDER_ID,
+  PROVIDER_ID_CN,
   PROVIDER_NAME,
-  QODER_BASE_URL,
-  QODER_MANAGE_URL,
+  PROVIDER_NAME_CN,
+  providerIDForRegion,
+  providerNameForRegion,
   QODER_PAT_ENV,
+  type QoderRegion,
+  regionOfProviderID,
+  resolveEndpoints,
+  sharedKey,
   ZERO_COST,
 } from "./constants.js";
 import { getMachineId } from "./cosy.js";
@@ -61,6 +67,8 @@ export { createQoder, QoderLanguageModel };
 
 type QoderPluginOptions = PluginOptions & {
   providerID?: string;
+  // "global" (default) or "cn"; an alternative to naming the provider qoder-cn.
+  region?: QoderRegion;
   setDefault?: boolean;
   apiKey?: string;
   // Path to the seed key file (see key-file.ts). Relative paths resolve from
@@ -78,13 +86,13 @@ const KEY_FILE_CHECK_INTERVAL_MS = 60 * 1000;
 // from whichever opencode version is driving. `source` is the field that
 // distinguishes a bundled fallback -- where no name carries a multiplier,
 // because the static table has no priceFactor -- from live or cached data.
-function logCatalogRegistration(path: "legacy" | "v2"): void {
-  const status = catalogStatus();
+function logCatalogRegistration(path: "legacy" | "v2", region: QoderRegion): void {
+  const status = catalogStatus(region);
   // pid tells whether the legacy and v2 hooks share a process -- if they do not,
   // anything captured in one is invisible to the other.
   logPlugin(
     `catalog[${path}]: pid=${process.pid} registered ${status.total} models ` +
-      `(source=${status.source}, live=${status.live})`,
+      `(source=${status.source}, live=${status.live}, region=${region})`,
   );
 }
 
@@ -104,24 +112,34 @@ function optionString(
 // ctx.catalog.reload(). setupV2 publishes its force-refresh closure here; the
 // tools call it when present so a switch takes effect without waiting out the
 // 15-minute refresh timer (whose non-forced path is also TTL-throttled).
-const REFRESH_TRIGGER_KEY = "__opencode_qoder_refresh_trigger";
+//
+// Every one of these keys is region-scoped: both providers share globalThis,
+// so an unscoped trigger would have a CN tier switch force-refresh the
+// international catalog (and reload the wrong model list).
+function refreshTriggerKey(region: QoderRegion): string {
+  return sharedKey("refresh_trigger", region);
+}
 // Marks that the DISPLAY mode just changed (a tier switch/clear), before the
 // next refreshCatalog(). The picker labels are rendered from getSelectedTier,
 // while refreshCatalog's change detection compares signatures taken AFTER the
 // mutation already landed -- a tier switch alone therefore always "looks
 // unchanged" and the reload gets suppressed, which is exactly why switching
 // showed nothing until some unrelated refresh or restart happened.
-const LABEL_DIRTY_KEY = "__opencode_qoder_label_dirty";
+function labelDirtyKey(region: QoderRegion): string {
+  return sharedKey("label_dirty", region);
+}
 
 // Once-flag for the OPENCODE_QODER_PAT bootstrap import. opencode loads this
 // plugin twice per process and neither realm sees the other's module state, so
 // the flag lives on globalThis; addPAT's dedup makes a repeat idempotent, the
 // flag only prevents a re-log.
-const PAT_IMPORT_DONE_KEY = "__opencode_qoder_pat_import_done";
+function patImportDoneKey(region: QoderRegion): string {
+  return sharedKey("pat_import_done", region);
+}
 
-function triggerCatalogRefresh(labelChanged = false): boolean {
-  if (labelChanged) writeShared(LABEL_DIRTY_KEY, true);
-  const trigger = readShared(REFRESH_TRIGGER_KEY);
+function triggerCatalogRefresh(region: QoderRegion, labelChanged = false): boolean {
+  if (labelChanged) writeShared(labelDirtyKey(region), true);
+  const trigger = readShared(refreshTriggerKey(region));
   if (typeof trigger !== "function") return false;
   try {
     (trigger as () => void)();
@@ -141,8 +159,24 @@ let onCredentialsCaptured: (() => void) | undefined;
 // Per instance, so the aisdk handler reports once rather than once per request.
 let aisdkHandlerLogged = false;
 
+// Which Qoder deployment this plugin instance serves. Two sources, in order:
+// an explicit `region` option, then the provider id (a CN config names the
+// provider "qoder-cn"). Either way it is resolved per call, never cached in
+// module state -- both instances share this process.
+function regionOfPluginOptions(options?: PluginOptions): QoderRegion {
+  const explicit = optionString(options, "region");
+  if (explicit === "cn" || explicit === "global") return explicit;
+  return regionOfProviderID(optionString(options, "providerID"));
+}
+
 function providerID(options?: PluginOptions): string {
-  return optionString(options, "providerID") || PROVIDER_ID;
+  const explicit = optionString(options, "providerID");
+  if (explicit) return explicit;
+  return regionOfPluginOptions(options) === "cn" ? PROVIDER_ID_CN : PROVIDER_ID;
+}
+
+function providerName(options?: PluginOptions): string {
+  return regionOfPluginOptions(options) === "cn" ? PROVIDER_NAME_CN : PROVIDER_NAME;
 }
 
 function shouldSetDefault(options?: PluginOptions): boolean {
@@ -151,7 +185,10 @@ function shouldSetDefault(options?: PluginOptions): boolean {
 
 // The `limit` triple is identical on both config surfaces; only the v1 legacy
 // path carried the explanation, so the comment now lives with the shape.
-function modelLimit(model: DiscoveredModel): { context: number; input: number; output: number } {
+function modelLimit(
+  model: DiscoveredModel,
+  region: QoderRegion,
+): { context: number; input: number; output: number } {
   // A selected context tier overrides the default-tier limits, so opencode's
   // auto-compaction threshold defers past the default tier instead of
   // compacting at ~180k while the gateway would still accept input at the
@@ -159,7 +196,7 @@ function modelLimit(model: DiscoveredModel): { context: number; input: number; o
   // tiers at switch time; re-checked here because the live table may have
   // changed since (a tier the gateway stopped advertising must not keep
   // driving the registered limits).
-  const tier = getSelectedTier(model.id);
+  const tier = getSelectedTier(model.id, region);
   if (tier !== undefined && isValidContextTier(model, tier)) {
     return { context: tier, input: tier, output: model.maxTokens };
   }
@@ -172,16 +209,16 @@ function modelLimit(model: DiscoveredModel): { context: number; input: number; o
   };
 }
 
-function legacyModelConfig(model: DiscoveredModel) {
+function legacyModelConfig(model: DiscoveredModel, region: QoderRegion) {
   const config: Record<string, unknown> = {
     // Carries the credit multiplier and the exhausted marker -- see
     // displayName(), which explains why it cannot be a description field.
-    name: displayName(model),
+    name: displayName(model, region),
     reasoning: model.reasoning,
     tool_call: true,
     attachment: model.input.includes("image"),
     cost: ZERO_COST,
-    limit: modelLimit(model),
+    limit: modelLimit(model, region),
     modalities: {
       input: model.input,
       output: ["text"],
@@ -253,6 +290,7 @@ interface LegacyConfig {
 
 function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   const id = providerID(options);
+  const region = regionOfPluginOptions(options);
   cfg.provider ??= {};
   if (!cfg.provider[id]) cfg.provider[id] = {};
   const current = cfg.provider[id];
@@ -267,7 +305,7 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
     `legacy: pid=${process.pid} providerOptions=${JSON.stringify(Object.keys(current.options))} ` +
       `apiKey=${tokenShape(current.options.apiKey)}`,
   );
-  current.options.baseURL ??= QODER_BASE_URL;
+  current.options.baseURL ??= resolveEndpoints(regionOfPluginOptions(options)).baseUrl;
   // The seed key file lives here because this hook is the only place that sees
   // the user's provider options. Record the configured path, then run the
   // first check immediately so a list-form file has seeded the store before
@@ -275,7 +313,7 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   {
     const keyFile = optionString(options, "keyFile") ?? optionString(current.options, "keyFile");
     if (keyFile) setKeyFilePath(keyFile);
-    const state = refreshKeyFile();
+    const state = refreshKeyFile(region);
     if (state.kind === "list") {
       logPlugin(`legacy: key file ${state.path} is a PAT list; the pat-store drives auth`);
     }
@@ -299,15 +337,15 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   }
   current.models ??= {};
 
-  for (const model of catalogModels()) {
+  for (const model of catalogModels(region)) {
     current.models[model.id] = {
-      ...legacyModelConfig(model),
+      ...legacyModelConfig(model, region),
       ...(current.models[model.id] ?? {}),
     };
   }
 
   if (shouldSetDefault(options) && !cfg.model) cfg.model = `${id}/auto`;
-  logCatalogRegistration("legacy");
+  logCatalogRegistration("legacy", region);
 
   // Configure subagents to use free/cheap models. This saves quota by using
   // lite (free, 200k) for mechanical tasks -- title generation, compaction,
@@ -358,11 +396,11 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   );
 }
 
-function v2ModelConfig(model: DiscoveredModel) {
+function v2ModelConfig(model: DiscoveredModel, region: QoderRegion) {
   return {
     // ConfigV2.Model has no description field either, so the annotation rides
     // on name exactly as in the legacy path.
-    name: displayName(model),
+    name: displayName(model, region),
     family: model.id,
     api: {
       id: model.id,
@@ -375,7 +413,7 @@ function v2ModelConfig(model: DiscoveredModel) {
       // A file:// package falls through the built-in map to
       // import(package) -> first `create*` export -> createQoder below.
       package: import.meta.url,
-      url: QODER_BASE_URL,
+      url: resolveEndpoints(region).baseUrl,
       settings: {},
     },
     capabilities: {
@@ -398,7 +436,7 @@ function v2ModelConfig(model: DiscoveredModel) {
     // Models upstream explicitly disabled never enter catalogModels() (they are
     // filtered by disabledIDs), so everything registered here is enabled.
     enabled: true,
-    limit: modelLimit(model),
+    limit: modelLimit(model, region),
   };
 }
 
@@ -509,8 +547,11 @@ function registerBundledSkills(ctx: PluginContext): void {
   }
 }
 
-async function setupV2(ctx: PluginContext): Promise<void> {
-  const id = providerID(ctx.options);
+// The region this realm serves. setupV2 is a closure over it because
+// ctx.options is opencode's own bag and cannot be extended by the plugin --
+// the region is known from the plugin entry that constructed this setup.
+async function setupV2(ctx: PluginContext, region: QoderRegion): Promise<void> {
+  const id = providerIDForRegion(region);
   // Key names only. Records what this instance can see for itself -- ctx.options
   // is empty and ctx exposes no config or provider key, which is why the
   // credential has to arrive over the shared channel instead.
@@ -523,17 +564,17 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   // first catalog refresh. The globalThis once-flag keeps a second plugin realm
   // (opencode loads this plugin twice per process) from re-importing and
   // re-logging; addPAT's own dedup makes even a repeat idempotent anyway.
-  if (!readShared<boolean>(PAT_IMPORT_DONE_KEY)) {
-    writeShared(PAT_IMPORT_DONE_KEY, true);
+  if (!readShared<boolean>(patImportDoneKey(region))) {
+    writeShared(patImportDoneKey(region), true);
     // The seed key file first: it is the plugin-owned credential source, and a
     // list-form file must have seeded the store before the env import's log
     // lines (or any discovery request) compare against it.
-    refreshKeyFile();
-    maybeImportPATsFromEnv();
+    refreshKeyFile(region);
+    maybeImportPATsFromEnv(region);
   }
   await ctx.integration.transform((integrations) => {
     integrations.update(id, (integration) => {
-      integration.name = PROVIDER_NAME;
+      integration.name = providerName(ctx.options);
     });
     integrations.method.update({
       integrationID: id,
@@ -547,7 +588,7 @@ async function setupV2(ctx: PluginContext): Promise<void> {
 
   await ctx.catalog.transform((catalog) => {
     catalog.provider.update(id, (provider) => {
-      provider.name = PROVIDER_NAME;
+      provider.name = providerName(ctx.options);
       provider.integrationID = id;
       // package MUST be this plugin's own module URL, NOT "@ai-sdk/openai-compatible".
       //
@@ -565,7 +606,7 @@ async function setupV2(ctx: PluginContext): Promise<void> {
       provider.api = {
         type: "aisdk",
         package: import.meta.url,
-        url: QODER_BASE_URL,
+        url: resolveEndpoints(region).baseUrl,
         settings: {},
       };
       provider.request = { headers: {}, body: {} };
@@ -573,15 +614,15 @@ async function setupV2(ctx: PluginContext): Promise<void> {
       if (apiKey) provider.request.body.apiKey = apiKey;
     });
 
-    for (const model of catalogModels()) {
+    for (const model of catalogModels(region)) {
       catalog.model.update(id, model.id, (draft) => {
-        Object.assign(draft, v2ModelConfig(model));
+        Object.assign(draft, v2ModelConfig(model, region));
       });
     }
 
     if (shouldSetDefault(ctx.options)) catalog.model.default.set(id, "auto");
   });
-  logCatalogRegistration("v2");
+  logCatalogRegistration("v2", region);
 
   // Install the bundled skill alongside the plugin itself: registering the
   // package's skills/ dir as a v2 source means "plugin installed == skill
@@ -658,14 +699,14 @@ async function setupV2(ctx: PluginContext): Promise<void> {
     return resolved;
   };
   const refreshCatalog = async (force: boolean): Promise<void> => {
-    const before = catalogSignature();
+    const before = catalogSignature(region);
     const status = await refreshModels(await discoveryOptions(), force);
     if (status.source !== "qoder") return;
     // Consume the flag only once the reload actually fires; an offline tick
     // leaves it set so the next successful refresh still delivers it.
-    const labelDirty = readShared(LABEL_DIRTY_KEY) === true;
-    if (!labelDirty && catalogSignature() === before) return;
-    writeShared(LABEL_DIRTY_KEY, undefined);
+    const labelDirty = readShared(labelDirtyKey(region)) === true;
+    if (!labelDirty && catalogSignature(region) === before) return;
+    writeShared(labelDirtyKey(region), undefined);
     if (typeof ctx.catalog.reload === "function") {
       // Fires exactly when a rendered name changed -- a new model, an edited
       // multiplier, or the Unavailable suffix appearing/disappearing, since
@@ -686,7 +727,7 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   };
   onCredentialsCaptured = forceRefresh;
   // Published for the legacy instance's tools (see triggerCatalogRefresh).
-  writeShared(REFRESH_TRIGGER_KEY, forceRefresh);
+  writeShared(refreshTriggerKey(region), forceRefresh);
   const warm = setTimeout(() => {
     refreshCatalog(true).catch(logRefreshFailure);
   }, 0);
@@ -701,7 +742,7 @@ async function setupV2(ctx: PluginContext): Promise<void> {
   // once. A list-to-new-member edit lands on the store within one tick; the
   // next request authenticates with it (pat-store reloads by its own mtime).
   const keyFileTimer = setInterval(() => {
-    refreshKeyFile();
+    refreshKeyFile(region);
   }, KEY_FILE_CHECK_INTERVAL_MS);
   keyFileTimer.unref?.();
 }
@@ -715,7 +756,8 @@ async function setupV2(ctx: PluginContext): Promise<void> {
 // globalThis; env and opencode's auth.json are consulted inside capabilities.ts.
 function capabilityOptions(options?: PluginOptions): QoderProviderOptions {
   const apiKey = optionString(options, "apiKey") || readSharedApiKey();
-  return apiKey ? { apiKey } : {};
+  const region = regionOfPluginOptions(options);
+  return apiKey ? { apiKey, region } : { region };
 }
 
 // Wraps a capability so a throw becomes a readable answer instead of a tool
@@ -745,6 +787,7 @@ function capabilityTool(
 // import time, so it is a snapshot rather than a dead fallback; anything that
 // needs a live number (quota, availability) fetches it itself.
 function capabilityTools(options?: PluginOptions): Hooks["tool"] {
+  const region = regionOfPluginOptions(options);
   return {
     // Live credit balance. The one tool that answers "还剩多少额度".
     qoder_quota: tool({
@@ -786,7 +829,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "unknown id resolves to the fallback model and says so. Use when the user asks " +
         "about a specific model's limits or price.",
       args: { id: tool.schema.string().describe("Model id, e.g. cmodel or qmodel_38max") },
-      execute: (args, ctx) => capabilityTool("model", () => reportModel(args.id), ctx),
+      execute: (args, ctx) => capabilityTool("model", () => reportModel(args.id, region), ctx),
     }),
     // Where the model list came from, and why.
     qoder_catalog: tool({
@@ -796,7 +839,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "path; whether discovery is disabled by env. Use when a model is missing, stale, " +
         "or wrong -- this is the answer to 'why do I not see model X'.",
       args: {},
-      execute: (_args, ctx) => capabilityTool("catalog", () => reportCatalog(), ctx),
+      execute: (_args, ctx) => capabilityTool("catalog", () => reportCatalog(region), ctx),
     }),
     // Credential plumbing, shape-only.
     qoder_auth: tool({
@@ -816,7 +859,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "and which one is currently active. Use when the user asks 'which accounts do I have' " +
         "or 'which PAT is active'.",
       args: {},
-      execute: () => Promise.resolve(reportPatList()),
+      execute: () => Promise.resolve(reportPatList(region)),
     }),
     // Multi-PAT management: switch active account.
     qoder_pat_switch: tool({
@@ -832,7 +875,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
           .optional()
           .describe("PAT id from qoder_pat_list; omit to follow the configured credential"),
       },
-      execute: (args) => Promise.resolve(reportPatSwitch(args.id)),
+      execute: (args) => Promise.resolve(reportPatSwitch(args.id, region)),
     }),
     // Multi-PAT management: add a new PAT.
     qoder_pat_add: tool({
@@ -846,7 +889,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         label: tool.schema.string().describe("Human-readable label, e.g. 'Work Account'"),
         email: tool.schema.string().optional().describe("Account email (optional, for display)"),
       },
-      execute: (args) => Promise.resolve(reportPatAdd(args.pat, args.label, args.email)),
+      execute: (args) => Promise.resolve(reportPatAdd(args.pat, args.label, args.email, region)),
     }),
     // Multi-PAT management: remove a PAT.
     qoder_pat_remove: tool({
@@ -855,7 +898,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "If the removed PAT was active, no other PAT becomes active automatically. " +
         "Use when the user says 'remove account X' or 'delete my old PAT'.",
       args: { id: tool.schema.string().describe("PAT id from qoder_pat_list") },
-      execute: (args) => Promise.resolve(reportPatRemove(args.id)),
+      execute: (args) => Promise.resolve(reportPatRemove(args.id, region)),
     }),
     // Context tiers: what each model offers and what is currently selected.
     qoder_tier_list: tool({
@@ -865,7 +908,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         "nothing is selected. Use when the user asks about 上下文档位/1M/long context or " +
         "before switching a model's context window.",
       args: {},
-      execute: (_args, ctx) => Promise.resolve(reportTierList(ctx.sessionID)),
+      execute: (_args, ctx) => Promise.resolve(reportTierList(ctx.sessionID, region)),
     }),
     // Context tiers: select a tier for THIS conversation (or clear it). `model`
     // accepts "*" to fan one tier out over every model that advertises it.
@@ -891,7 +934,11 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
           .describe("Tier in tokens (e.g. 1000000). Omit to restore the default tier."),
       },
       execute: (args, ctx) =>
-        Promise.resolve(reportTierSwitch(args, ctx.sessionID, triggerCatalogRefresh)),
+        Promise.resolve(
+          reportTierSwitch(args, ctx.sessionID, region, (labelChanged) =>
+            triggerCatalogRefresh(region, labelChanged),
+          ),
+        ),
     }),
     // Subagent routing: which model serves pinned helpers above the default tier.
     qoder_routing_policy: tool({
@@ -925,7 +972,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
           .optional()
           .describe("Agents that keep the base model even above the threshold."),
       },
-      execute: (args) => Promise.resolve(reportRoutingPolicy(args)),
+      execute: (args) => Promise.resolve(reportRoutingPolicy(args, region)),
     }),
   };
 }
@@ -976,6 +1023,7 @@ function campaignTools(options?: PluginOptions): Hooks["tool"] {
 
 function legacyHooks(options?: PluginOptions): Hooks {
   const id = providerID(options);
+  const region = regionOfPluginOptions(options);
   return {
     config: async (cfg) => applyLegacyConfig(cfg as unknown as LegacyConfig, options),
     // Identity stamp for the request layer.
@@ -1002,8 +1050,8 @@ function legacyHooks(options?: PluginOptions): Hooks {
         const info = event.properties.info;
         if (info.id === undefined || info.id === "") return;
         recordSessionParent(info.id, info.parentID);
-        if (info.parentID === undefined && clearAllTiers()) {
-          triggerCatalogRefresh(true);
+        if (info.parentID === undefined && clearAllTiers(region)) {
+          triggerCatalogRefresh(region, true);
         }
         return;
       }
@@ -1031,15 +1079,16 @@ function legacyHooks(options?: PluginOptions): Hooks {
           authorize: async () => {
             const { codeVerifier, codeChallenge } = generatePKCE();
             const nonce = crypto.randomUUID();
-            const machineID = getMachineId();
-            const url = `${QODER_MANAGE_URL}/device/selectAccounts?challenge=${codeChallenge}&challenge_method=S256&machine_id=${machineID}&nonce=${nonce}`;
+            const region = regionOfPluginOptions(options);
+            const machineID = getMachineId(region);
+            const url = `${resolveEndpoints(region).manage}/device/selectAccounts?challenge=${codeChallenge}&challenge_method=S256&machine_id=${machineID}&nonce=${nonce}`;
             return {
               url,
               instructions: "Complete the Qoder browser login, then return to opencode.",
               method: "auto" as const,
               callback: async () => {
                 try {
-                  const credential = await pollDeviceFlow(codeVerifier, nonce, machineID);
+                  const credential = await pollDeviceFlow(codeVerifier, nonce, machineID, region);
                   return {
                     type: "success" as const,
                     provider: id,
@@ -1064,10 +1113,32 @@ function legacyHooks(options?: PluginOptions): Hooks {
   };
 }
 
-const plugin = {
-  id: "opencode-qoder",
-  setup: setupV2,
-  server: async (_input: PluginInput, options?: PluginOptions) => legacyHooks(options),
-};
+// Builds one integration point. opencode's auth hook binds exactly one provider
+// per plugin instance, so the international and China deployments are two
+// instances of this module -- two config entries (or two shim files), each with
+// its own provider id, credential store and model catalog. Everything host- or
+// store-specific is resolved from the region at call time; nothing is module
+// state, because both instances share the process.
+//
+// Two ways to select the region, and they must agree:
+//   - `providerID: "qoder-cn"` in the plugin options, or
+//   - `region: "cn"`.
+// The provider id is the primary signal (opencode shows it to the user and uses
+// it to route); `region` exists so a custom provider id can still say which
+// deployment it means.
+export function definePlugin(region: QoderRegion = "global") {
+  const id = providerIDForRegion(region);
+  const name = providerNameForRegion(region);
+  return {
+    // The module id must differ per instance: opencode keys loaded plugins by
+    // it, so two entries sharing one id would collapse into one.
+    id: region === "cn" ? "opencode-qoder-cn" : "opencode-qoder",
+    setup: (ctx: PluginContext) => setupV2(ctx, region),
+    server: async (_input: PluginInput, options?: PluginOptions) =>
+      legacyHooks({ providerID: id, providerName: name, ...(options as object) } as PluginOptions),
+  };
+}
+
+const plugin = definePlugin("global");
 
 export default plugin;

@@ -1,7 +1,12 @@
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { QODER_KEY_FILE_DEFAULT, QODER_KEY_FILE_ENV } from "./constants.js";
+import {
+  QODER_KEY_FILE_DEFAULT,
+  QODER_KEY_FILE_ENV,
+  type QoderRegion,
+  sharedKey,
+} from "./constants.js";
 import { readEnv } from "./env.js";
 import { errorMessage, logPlugin } from "./log.js";
 import { classifyImportValue, importPATsFromValue } from "./pat-import.js";
@@ -51,9 +56,16 @@ export interface KeyFileState {
 // Both caches ride on globalThis (shared-state.ts): opencode loads the plugin
 // twice per process and the instance that checks on its timer is not the one
 // resolving credentials for a request.
+// The configured PATH is shared (one option, one file); the parsed STATE and
+// the mtime memory are per region, because a list-form file seeds each region's
+// OWN pat-store and the two must not fight over one parsed result.
 const PATH_KEY = "__opencode_qoder_key_file_path";
-const STATE_KEY = "__opencode_qoder_key_file_state";
-const MTIMES_KEY = "__opencode_qoder_key_file_mtimes";
+function stateKey(region: QoderRegion): string {
+  return sharedKey("key_file_state", region);
+}
+function mtimesKey(region: QoderRegion): string {
+  return sharedKey("key_file_mtimes", region);
+}
 
 // Recorded once from the provider/plugin options by the legacy config hook --
 // the only realm that ever sees them.
@@ -83,12 +95,12 @@ function fileMtime(path: string): number {
   }
 }
 
-function rememberedMtimes(): Record<string, number> {
-  return readShared<Record<string, number>>(MTIMES_KEY) ?? {};
+function rememberedMtimes(region: QoderRegion): Record<string, number> {
+  return readShared<Record<string, number>>(mtimesKey(region)) ?? {};
 }
 
-function readState(): KeyFileState | undefined {
-  return readShared<KeyFileState>(STATE_KEY);
+function readState(region: QoderRegion): KeyFileState | undefined {
+  return readShared<KeyFileState>(stateKey(region));
 }
 
 // Parse a shell-style env file and extract the value of a specific variable.
@@ -111,23 +123,23 @@ function extractEnvVar(content: string, varName: string): string | undefined {
 // Re-reads and re-imports only when the file's mtime moved since the last
 // check, so a steady-state process pays one statSync per call. Returns the
 // current state; never throws.
-export function refreshKeyFile(): KeyFileState {
+export function refreshKeyFile(region: QoderRegion = "global"): KeyFileState {
   const path = keyFilePath();
   if (!path) {
-    writeShared(STATE_KEY, { path: "", kind: "disabled", token: "" });
-    return readState() as KeyFileState;
+    writeShared(stateKey(region), { path: "", kind: "disabled", token: "" });
+    return readState(region) as KeyFileState;
   }
 
   const mtime = fileMtime(path);
-  const previous = readState();
-  if (previous && previous.path === path && rememberedMtimes()[path] === mtime) {
+  const previous = readState(region);
+  if (previous && previous.path === path && rememberedMtimes(region)[path] === mtime) {
     return previous;
   }
-  writeShared(MTIMES_KEY, { ...rememberedMtimes(), [path]: mtime });
+  writeShared(mtimesKey(region), { ...rememberedMtimes(region), [path]: mtime });
 
   if (mtime === -1) {
     const absent: KeyFileState = { path, kind: "absent", token: "" };
-    writeShared(STATE_KEY, absent);
+    writeShared(stateKey(region), absent);
     return absent;
   }
 
@@ -137,7 +149,7 @@ export function refreshKeyFile(): KeyFileState {
   } catch (error) {
     logPlugin(`key-file: cannot read ${path}: ${errorMessage(error)}`);
     const absent: KeyFileState = { path, kind: "absent", token: "" };
-    writeShared(STATE_KEY, absent);
+    writeShared(stateKey(region), absent);
     return absent;
   }
 
@@ -155,12 +167,12 @@ export function refreshKeyFile(): KeyFileState {
     // An empty (or comment-only) file behaves like no file at all: no
     // credential, nothing to import, quiet -- the layers below it decide.
     const absent: KeyFileState = { path, kind: "absent", token: "" };
-    writeShared(STATE_KEY, absent);
+    writeShared(stateKey(region), absent);
     return absent;
   }
   if (shape.kind === "single") {
     const single: KeyFileState = { path, kind: "single", token: shape.token };
-    writeShared(STATE_KEY, single);
+    writeShared(stateKey(region), single);
     logPlugin(
       `key-file: ${path} is a single credential (shape=${shape.pats.length ? "pat" : "opaque"})`,
     );
@@ -168,10 +180,10 @@ export function refreshKeyFile(): KeyFileState {
   }
 
   const state: KeyFileState = { path, kind: shape.kind, token: "" };
-  writeShared(STATE_KEY, state);
+  writeShared(stateKey(region), state);
   if (shape.kind === "list") {
     try {
-      const result = importPATsFromValue(effectiveContent);
+      const result = importPATsFromValue(effectiveContent, region);
       logPlugin(
         `key-file: ${path} holds a PAT list -- imported ${result.imported}, ` +
           `skipped ${result.duplicates} already stored` +
@@ -192,9 +204,9 @@ export function refreshKeyFile(): KeyFileState {
 // (In opencode the startup hooks make that impossible; a bare script using
 // the plugin's modules directly is the case this covers, and one stat there
 // is cheaper than a credential silently going missing.)
-export function keyFileToken(): string {
-  if (!readState()) refreshKeyFile();
-  const state = readState();
+export function keyFileToken(region: QoderRegion = "global"): string {
+  if (!readState(region)) refreshKeyFile(region);
+  const state = readState(region);
   return state && state.kind === "single" ? state.token : "";
 }
 

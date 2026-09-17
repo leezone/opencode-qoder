@@ -64,39 +64,39 @@ describe("importPATsFromEnv", () => {
   });
 
   it("does nothing when the variable is absent", () => {
-    expect(importPATsFromEnv({})).toEqual({ imported: 0, duplicates: 0, invalid: 0 });
+    expect(importPATsFromEnv("global", {})).toEqual({ imported: 0, duplicates: 0, invalid: 0 });
     expect(listPATs()).toEqual([]);
   });
 
   it("imports each PAT and auto-activates the first (empty store)", () => {
-    const result = importPATsFromEnv({ OPENCODE_QODER_PAT: `${ALPHA},${BETA}` });
+    const result = importPATsFromEnv("global", { OPENCODE_QODER_PAT: `${ALPHA},${BETA}` });
     expect(result).toEqual({ imported: 2, duplicates: 0, invalid: 0 });
     const stored = listPATs();
     expect(stored.map((p) => p.active)).toEqual([true, false]);
   });
 
   it("is idempotent: a second run stores nothing new", () => {
-    importPATsFromEnv({ OPENCODE_QODER_PAT: `${ALPHA},${BETA}` });
-    const again = importPATsFromEnv({ OPENCODE_QODER_PAT: `${ALPHA},${BETA}` });
+    importPATsFromEnv("global", { OPENCODE_QODER_PAT: `${ALPHA},${BETA}` });
+    const again = importPATsFromEnv("global", { OPENCODE_QODER_PAT: `${ALPHA},${BETA}` });
     expect(again).toEqual({ imported: 0, duplicates: 2, invalid: 0 });
     expect(listPATs()).toHaveLength(2);
   });
 
   it("never steals the active flag from an existing account", () => {
-    importPATsFromEnv({ OPENCODE_QODER_PAT: ALPHA });
-    importPATsFromEnv({ OPENCODE_QODER_PAT: BETA });
+    importPATsFromEnv("global", { OPENCODE_QODER_PAT: ALPHA });
+    importPATsFromEnv("global", { OPENCODE_QODER_PAT: BETA });
     const stored = listPATs();
     expect(stored.find((p) => p.pat === ALPHA)?.active).toBe(true);
     expect(stored.find((p) => p.pat === BETA)?.active).toBe(false);
   });
 
   it("counts invalid segments and still imports the valid ones", () => {
-    const result = importPATsFromEnv({ OPENCODE_QODER_PAT: `${ALPHA},oops,${BETA}` });
+    const result = importPATsFromEnv("global", { OPENCODE_QODER_PAT: `${ALPHA},oops,${BETA}` });
     expect(result).toEqual({ imported: 2, duplicates: 0, invalid: 1 });
   });
 
   it("persists to the store file", () => {
-    importPATsFromEnv({ OPENCODE_QODER_PAT: `${ALPHA},${BETA}` });
+    importPATsFromEnv("global", { OPENCODE_QODER_PAT: `${ALPHA},${BETA}` });
     const parsed = JSON.parse(readFileSync(file, "utf8"));
     expect(parsed.entries).toHaveLength(2);
   });

@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { QODER_CLIENT_TYPE, QODER_VERSION } from "./constants.js";
+import { QODER_CLIENT_TYPE, QODER_VERSION, type QoderRegion, stateFiles } from "./constants.js";
 import { legacyOpencodeDataFile, opencodeDataFile } from "./json-store.js";
 
 const qoderRSAPublicKey = `-----BEGIN PUBLIC KEY-----
@@ -78,18 +78,23 @@ function computeSigPath(urlStr: string): string {
 //      fresh one; nothing is ever written here.
 //
 // A miss on all three falls through to a new id, persisted at (2).
-function machineIdCandidates(): { read: string[]; write: string } {
-  const file = opencodeDataFile("qoder-machine-id");
-  const read = [
-    join(homedir(), ".qoder", ".auth", "machine_id"),
-    file,
-    legacyOpencodeDataFile("qoder-machine-id"),
-  ];
+function machineIdCandidates(region: QoderRegion = "global"): {
+  read: string[];
+  write: string;
+} {
+  const filename = stateFiles(region).machineId;
+  // qodercli's own machine id is only a fallback for the international region:
+  // it belongs to the Qoder CLI install, which signs against the international
+  // site. Letting a CN instance adopt it would make both deployments see one
+  // machine identity, which is exactly what the per-region file prevents.
+  const cliFile = join(homedir(), ".qoder", ".auth", "machine_id");
+  const file = opencodeDataFile(filename);
+  const read = region === "cn" ? [file] : [cliFile, file, legacyOpencodeDataFile(filename)];
   return { read: read.filter((path, i) => read.indexOf(path) === i), write: file };
 }
 
-export function getMachineId(): string {
-  const { read, write } = machineIdCandidates();
+export function getMachineId(region: QoderRegion = "global"): string {
+  const { read, write } = machineIdCandidates(region);
 
   for (const path of read) {
     if (!existsSync(path)) continue;
@@ -111,6 +116,7 @@ export function buildAuthHeaders(
   body: Buffer | string | null,
   requestURL: string,
   creds: CosyCredentials,
+  region: QoderRegion = "global",
 ): Record<string, string> {
   if (!creds.userID) throw new Error("qoder: user id is empty");
   if (!creds.authToken) throw new Error("qoder: auth token is empty");
@@ -149,7 +155,7 @@ export function buildAuthHeaders(
   const bodyLen = body
     ? (Buffer.isBuffer(body) ? body.length : Buffer.from(body).length).toString()
     : "0";
-  const machineID = creds.machineID || getMachineId();
+  const machineID = creds.machineID || getMachineId(region);
 
   return {
     Authorization: `Bearer COSY.${payloadB64}.${sig}`,

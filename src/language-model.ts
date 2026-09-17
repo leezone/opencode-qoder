@@ -16,10 +16,11 @@ import {
   type QoderCredentials,
   type QoderProviderOptions,
   refreshQoderCredentials,
+  regionOf,
   resolveQoderCredentials,
   signingUserID,
 } from "./auth.js";
-import { QODER_CHAT_URL, USER_AGENT } from "./constants.js";
+import { type QoderRegion, resolveEndpoints, USER_AGENT } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { readEnv } from "./env.js";
@@ -401,6 +402,7 @@ function resolveReasoningEffort(
 function resolveRequestRoute(
   modelID: string,
   options: LanguageModelV3CallOptions,
+  region: QoderRegion,
 ): { modelID: string; tier: number | undefined; root: string; agent: string; session: string } {
   let agent = "";
   let qoderSession = "";
@@ -414,13 +416,13 @@ function resolveRequestRoute(
   }
   const sessionID = qoderSession !== "" ? qoderSession : nativeSession;
   const root = sessionID === "" ? "" : resolveRootSession(sessionID);
-  const tier = root === "" ? undefined : getSessionTier(root);
+  const tier = root === "" ? undefined : getSessionTier(root, region);
   const decision = resolveRouting({
-    policy: getRoutingPolicy(),
+    policy: getRoutingPolicy(region),
     modelID,
     agent,
     sessionTier: tier,
-    targetSupports: (id, tokens) => isValidContextTier(getModelDefinition(id), tokens),
+    targetSupports: (id, tokens) => isValidContextTier(getModelDefinition(id, region), tokens),
   });
   if (decision.escalated) {
     logPlugin(
@@ -445,11 +447,12 @@ async function buildRequestBody(
   modelID: string,
   options: LanguageModelV3CallOptions,
   sessionUID: string,
+  region: QoderRegion,
   resolveImage?: ImageUrlResolver,
 ): Promise<{ body: Record<string, unknown>; warnings: SharedV3Warning[] }> {
-  const route = resolveRequestRoute(modelID, options);
+  const route = resolveRequestRoute(modelID, options, region);
   modelID = route.modelID;
-  const model = getModelDefinition(modelID);
+  const model = getModelDefinition(modelID, region);
   const transformed = await transformPrompt(options.prompt, resolveImage);
   const { tools, ignoredTools } = transformTools(options.tools);
   const warnings: SharedV3Warning[] = [];
@@ -519,7 +522,7 @@ async function buildRequestBody(
   // tier: a manually edited store file, or a call with no resolvable session.
   // Both are re-validated against the model that ACTUALLY serves the request
   // (post-escalation), so a tier the target does not advertise is never sent.
-  const selectedTier = route.tier ?? getSelectedTier(modelID);
+  const selectedTier = route.tier ?? getSelectedTier(modelID, region);
   if (selectedTier !== undefined && isValidContextTier(model, selectedTier)) {
     parameters.context_length = selectedTier;
     logPlugin(
@@ -718,26 +721,31 @@ export class QoderLanguageModel implements LanguageModelV3 {
     const resolveImage: ImageUrlResolver = (data, mediaType) =>
       uploadQoderImage(data, mediaType, {
         creds: cosy,
+        region: regionOf(this.providerOptions),
         signal: abortController.signal,
       });
     const { body, warnings } = await buildRequestBody(
       this.modelId,
       options,
       signingUserID(credentials),
+      regionOf(this.providerOptions),
       resolveImage,
     );
     const bodyBytes = Buffer.from(JSON.stringify(body));
     const encodedBody = qoderEncodeBody(bodyBytes);
     const encodedBytes = Buffer.from(encodedBody, "utf8");
+    const region = regionOf(this.providerOptions);
+    const chatURL = resolveEndpoints(region).chat;
     const headers = buildAuthHeaders(
       encodedBytes,
-      QODER_CHAT_URL,
+      chatURL,
       cosyCredentialsForSigning(credentials),
+      region,
     );
 
     let response: Response;
     try {
-      response = await fetch(QODER_CHAT_URL, {
+      response = await fetch(chatURL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -760,7 +768,7 @@ export class QoderLanguageModel implements LanguageModelV3 {
     if (!response.ok) {
       detachAbort();
       const errText = await response.text().catch(() => "");
-      throwQoderApiError(response.status, QODER_CHAT_URL, errText);
+      throwQoderApiError(response.status, chatURL, errText);
     }
 
     return {

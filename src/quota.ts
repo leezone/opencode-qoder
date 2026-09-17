@@ -1,8 +1,9 @@
-import { type QoderProviderOptions, resolveQoderCredentials } from "./auth.js";
+import { type QoderProviderOptions, regionOf, resolveQoderCredentials } from "./auth.js";
 import { text } from "./coerce.js";
-import { FETCH_TIMEOUT_MS, QODER_QUOTA_URL } from "./constants.js";
+import { FETCH_TIMEOUT_MS, type QoderRegion, resolveEndpoints, sharedKey } from "./constants.js";
 import { fetchWithTimeout, jsonHeaders, readErrorBody } from "./http.js";
 import { errorMessage, logPlugin } from "./log.js";
+import { readShared, writeShared } from "./shared-state.js";
 
 // --- Credit quota -----------------------------------------------------------
 //
@@ -19,14 +20,19 @@ import { errorMessage, logPlugin } from "./log.js";
 //   fetchQuotaExhausted() -- fails open. For discovery, where an unreachable
 //                          quota endpoint must not paint the catalog unavailable.
 
-let quotaExhausted = false;
-
-export function getQuotaExhausted(): boolean {
-  return quotaExhausted;
+// Scoped per region on globalThis: an exhausted CN account must not paint the
+// international catalog "Unavailable" (nor the reverse), and the two instances
+// would otherwise share whatever this realm last saw.
+function quotaKey(region: QoderRegion): string {
+  return sharedKey("quota_exhausted", region);
 }
 
-export function setQuotaExhausted(value: boolean): void {
-  quotaExhausted = value;
+export function getQuotaExhausted(region: QoderRegion = "global"): boolean {
+  return readShared<boolean>(quotaKey(region)) ?? false;
+}
+
+export function setQuotaExhausted(value: boolean, region: QoderRegion = "global"): void {
+  writeShared(quotaKey(region), value);
 }
 
 // Stable identifiers for the buckets the account can draw on. `key` is what logs
@@ -224,7 +230,7 @@ export function shapeQuota(payload: unknown): QuotaUsage {
 export async function fetchQuotaUsage(options: QoderProviderOptions): Promise<QuotaUsage> {
   const credentials = await resolveQoderCredentials(options);
   const payload: unknown = await fetchWithTimeout(
-    QODER_QUOTA_URL,
+    resolveEndpoints(regionOf(options)).quota,
     { headers: jsonHeaders({ Authorization: `Bearer ${credentials.access}` }) },
     FETCH_TIMEOUT_MS,
     async (response) => {

@@ -10,6 +10,7 @@ import {
 } from "./auth.js";
 import { renderQuota } from "./capabilities.js";
 import { text } from "./coerce.js";
+import type { QoderRegion } from "./constants.js";
 import { opencodeConfigFile } from "./json-store.js";
 import { describeKeyFile, keyFilePath, keyFileToken } from "./key-file.js";
 import { errorMessage } from "./log.js";
@@ -68,24 +69,25 @@ export interface CredentialLayer {
 //     opencode. It is shown for the same reason --resolve shows a layer the
 //     plugin fills later: the table is the diagnosis of "what is NOT here".
 export function credentialLayers(
-  explicit: { personalAccessToken?: string; apiKey?: string } = {},
+  explicit: { personalAccessToken?: string; apiKey?: string; region?: QoderRegion } = {},
 ): CredentialLayer[] {
+  const region = explicit.region ?? "global";
   const keyFile = keyFilePath();
   return [
     { layer: "--pat (CLI)", token: explicit.personalAccessToken ?? "" },
     { layer: "--token (CLI)", token: explicit.apiKey ?? "" },
-    { layer: "pat-store selection", token: getSelectedPatString() ?? "" },
+    { layer: "pat-store selection", token: getSelectedPatString(region) ?? "" },
     { layer: "opencode auth.json", token: storedConnectionToken() },
     { layer: "opencode config apiKey", token: configApiKeyFromDisk() },
     { layer: "shared channel (in-process)", token: readSharedApiKey() ?? "" },
-    { layer: keyFile || "key file (disabled)", token: keyFileToken() },
-    { layer: "pat-store active", token: getActivePatString() ?? "" },
+    { layer: keyFile || "key file (disabled)", token: keyFileToken(region) },
+    { layer: "pat-store active", token: getActivePatString(region) ?? "" },
     { layer: "env (QODER_*)", token: getEnvPat() },
   ];
 }
 
 export function standaloneCredential(
-  explicit: { personalAccessToken?: string; apiKey?: string } = {},
+  explicit: { personalAccessToken?: string; apiKey?: string; region?: QoderRegion } = {},
 ): CredentialLayer | null {
   return credentialLayers(explicit).find((row) => row.token !== "") ?? null;
 }
@@ -153,13 +155,14 @@ export function fingerprint(token: string): string {
 // --- quota -------------------------------------------------------------------
 
 export async function runQuotaCli(
-  opts: { pat?: string; token?: string; json?: boolean } = {},
+  opts: { pat?: string; token?: string; json?: boolean; region?: QoderRegion } = {},
 ): Promise<CliReport> {
+  const region = opts.region ?? "global";
   const explicit = opts.pat
-    ? { personalAccessToken: opts.pat }
+    ? { personalAccessToken: opts.pat, region }
     : opts.token
-      ? { apiKey: opts.token }
-      : {};
+      ? { apiKey: opts.token, region }
+      : { region };
   const chosen = standaloneCredential(explicit);
   if (!chosen) {
     return {
@@ -309,9 +312,12 @@ export async function probePat(pat: string): Promise<ProbeVerdict> {
   }
 }
 
-export async function runPatsCli(opts: { json?: boolean } = {}): Promise<CliReport> {
-  const entries = listPATs();
-  const store = patStoreFile();
+export async function runPatsCli(
+  opts: { json?: boolean; region?: QoderRegion } = {},
+): Promise<CliReport> {
+  const region = opts.region ?? "global";
+  const entries = listPATs(region);
+  const store = patStoreFile(region);
   if (entries.length === 0) {
     return {
       output: "",
@@ -384,10 +390,11 @@ function noStoreGuidance(store: string): string {
 
 export async function runUsePatCli(
   target: string,
-  opts: { force?: boolean; json?: boolean } = {},
+  opts: { force?: boolean; json?: boolean; region?: QoderRegion } = {},
 ): Promise<CliReport> {
-  const entries = listPATs();
-  const store = patStoreFile();
+  const region = opts.region ?? "global";
+  const entries = listPATs(region);
+  const store = patStoreFile(region);
   if (entries.length === 0) {
     return { output: "", stderr: noStoreGuidance(store), data: { store }, exitCode: 1 };
   }
@@ -440,7 +447,7 @@ export async function runUsePatCli(
   // switchPAT marks active AND selected, which is the point: `active` alone is
   // outranked by a configured apiKey or key file, so a recovery flip would look
   // like it worked while requests kept signing with the poisoned credential.
-  switchPAT(entry.id);
+  switchPAT(entry.id, region);
   const note =
     probe.status === "ALIVE"
       ? `validated live, ${probe.remaining} credits left`
@@ -467,14 +474,15 @@ export async function runUsePatCli(
 // plugin's view of the same chain; a disagreement between the two is a bug in
 // one of them, and now there is only one walk to be wrong in.
 export function runResolveCli(
-  opts: { pat?: string; token?: string; json?: boolean } = {},
+  opts: { pat?: string; token?: string; json?: boolean; region?: QoderRegion } = {},
 ): CliReport {
+  const region = opts.region ?? "global";
   const explicit = opts.pat
-    ? { personalAccessToken: opts.pat }
+    ? { personalAccessToken: opts.pat, region }
     : opts.token
-      ? { apiKey: opts.token }
-      : {};
-  const entries = listPATs();
+      ? { apiKey: opts.token, region }
+      : { region };
+  const entries = listPATs(region);
   const rows = credentialLayers(explicit);
   const chosen = standaloneCredential(explicit);
   const data = {

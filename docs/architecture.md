@@ -320,35 +320,49 @@ QoderModelDefinition {
 
 ### 8.1 持久化状态（JSON 文件）
 
-| 文件 | 位置 | 用途 |
-|------|------|------|
-| `qoder-pats.json` | `~/.config/opencode/` | 多 PAT 存储 |
-| `qoder-tiers.json` | `~/.config/opencode/` | 上下文层级选择 |
-| `qoder-routing.json` | `~/.config/opencode/` | 子代理路由策略 |
-| `opencode-qoder-models.json` | `~/.cache/opencode/` | 模型列表磁盘缓存 |
+每个区域一套，文件名由 `stateFiles(region)` 生成（`constants.ts`）：
 
-所有路径遵循 XDG 规范（`XDG_CONFIG_HOME` / `XDG_CACHE_HOME`）。
+| 用途 | 国际站 | 中国站 | 位置 |
+|------|--------|--------|------|
+| 多 PAT 存储 | `qoder-pats.json` | `qoder-cn-pats.json` | `~/.config/opencode/` |
+| 上下文层级选择 | `qoder-tiers.json` | `qoder-cn-tiers.json` | `~/.config/opencode/` |
+| 子代理路由策略 | `qoder-routing.json` | `qoder-cn-routing.json` | `~/.config/opencode/` |
+| 每日活动标记 | `qoder-claim.json` | `qoder-cn-claim.json` | `~/.config/opencode/` |
+| 机器 ID（签名输入） | `qoder-machine-id` | `qoder-cn-machine-id` | `~/.local/share/opencode/` |
+| 模型列表磁盘缓存 | `opencode-qoder-models.json` | `opencode-qoder-cn-models.json` | `~/.cache/opencode/` |
+
+国际站的名字是历史名，**保持不变**，这样升级不会让既有安装的凭证失联。所有路径遵循 XDG 规范。
+
+**密钥文件是唯一共享的**：它是用户显式指定的种子（和 `OPENCODE_QODER_PAT` 同性质），两个区域都读它；列表形态会分别导入各自区域的 pat-store。
 
 ### 8.2 内存状态（globalThis）
 
-| Key | 类型 | 用途 |
+两个 provider 同进程，因此**每个区域一套键**，由 `sharedKey(name, region)` 生成（国际站保留历史拼写）：
+
+| Key（国际 / 中国） | 类型 | 用途 |
 |-----|------|------|
-| `__opencode_qoder_api_key` | string | 跨 realm API Key 传递 |
-| `__opencode_qoder_pat_store` | PATStoreData | PAT store 缓存 |
-| `__opencode_qoder_tier_store` | TierStoreData | tier store 缓存 |
-| `__opencode_qoder_routing_policy` | RoutingPolicy | 路由策略缓存 |
-| `__opencode_qoder_session_parents` | Record<string, string> | 会话父子映射 |
-| `__opencode_qoder_refresh_trigger` | () => void | 强制刷新闭包 |
-| `__opencode_qoder_key_file_*` | various | 密钥文件状态 |
+| `__opencode_qoder_api_key` | string | 跨 realm API Key 传递（共享，无区域概念） |
+| `__opencode_qoder_pat_store` / `__opencode_qoder_cn_pat_store` | PATStoreData | PAT store 缓存 |
+| `__opencode_qoder_tier_store` / `..._cn_tier_store` | TierStoreData | tier store 缓存 |
+| `__opencode_qoder_routing_policy` / `..._cn_routing_policy` | RoutingPolicy | 路由策略缓存 |
+| `__opencode_qoder_quota_exhausted` / `..._cn_quota_exhausted` | boolean | 配额耗尽标记 |
+| `__opencode_qoder_key_file_state` / `..._cn_key_file_state` | KeyFileState | 密钥文件解析结果 |
+| `__opencode_qoder_refresh_trigger` / `..._cn_refresh_trigger` | () => void | 强制刷新闭包 |
+| `__opencode_qoder_label_dirty` / `..._cn_label_dirty` | boolean | picker 标签待刷新 |
+| `__opencode_qoder_pat_import_done` / `..._cn_pat_import_done` | boolean | 启动导入一次性标记 |
+| `__opencode_qoder_session_parents` | Record<string, string> | 会话父子映射（共享） |
 
 ### 8.3 模块级状态
 
-| 模块 | 状态 | 用途 |
-|------|------|------|
-| `auth.ts` | `credentialsCache` | job token 缓存（Map） |
-| `model-catalog.ts` | `liveModels`, `fetchedAt`, `expiresAt` | 内存模型列表 |
-| `quota.ts` | `quotaExhausted` | 配额耗尽标记 |
-| `tier-store.ts` | `mode`, `sessions` | 层级选择（内存副本） |
+模块级状态本身是「每个模块实例一份」，而区域是**按调用参数**解析的，所以下列状态要么按区域分行、要么本就按 token 分键：
+
+| 模块 | 状态 | 区域处理 |
+|------|------|----------|
+| `auth.ts` | `credentialsCache` | 键为 `<region>\0<pat>` |
+| `auth.ts` | `identityByToken` | 键为 `<region>\0<token>` |
+| `model-catalog.ts` | `STATES: Map<QoderRegion, CatalogState>` | 每区域一个 CatalogState（含 live/fetchedAt/expiresAt/source/inflight/adopt 节流） |
+| `quota.ts` | 配额耗尽标记 | 见 §8.2（globalThis，按区域） |
+| `tier-store.ts` / `routing-policy.ts` | 内存副本 | 见 §8.2（globalThis，按区域） |
 
 ## 9. 工具注册
 
@@ -496,6 +510,9 @@ Qoder 的请求体不带栅格字节：客户端把每张图**发布一次**到 
 | `OPENCODE_QODER_CLAIM` | 每日活动开关（每次调用读取，不缓存） | 启用 |
 | `QODER_DISABLE_BUNDLED_SKILL` | 禁用内置 skill | - |
 
+区域不通过环境变量选择，而是按插件实例的 `providerID` / `region` 选项解析（见 §18）。
+上述单值环境变量（尤其 `QODER_PERSONAL_ACCESS_TOKEN` / `OPENCODE_QODER_PAT`）**对两个区域都生效**——它们是进程级输入，两个实例都会读到。
+
 ## 14. 测试覆盖
 
 ```
@@ -510,9 +527,11 @@ src/__tests__/
 ├── key-file.test.ts             # 密钥文件
 ├── login-expiry.test.ts         # 登录过期
 ├── log.test.ts                  # 日志
+├── image-upload.test.ts         # 图片发布（multipart/签长度/降级）
 ├── pat-import.test.ts           # PAT 导入
 ├── pat-store.test.ts            # PAT 存储
 ├── quota-cli.test.ts            # 独立 CLI 面（四桶/走序/probePat）
+├── region-isolation.test.ts     # 区域隔离（端点/状态文件/共享键/存储）
 ├── quota.test.ts                # 配额
 ├── routing-policy.test.ts       # 路由策略
 ├── session-roots.test.ts        # 会话根
@@ -524,7 +543,7 @@ src/__tests__/
 └── xdg-paths.test.ts            # XDG 路径
 ```
 
-共 206 个用例。运行测试：`pnpm test`
+共 229 个用例。运行测试：`pnpm test`
 
 ## 15. 构建与发布
 
@@ -544,10 +563,12 @@ pnpm test           # 运行测试
 
 ## 16. 已知限制
 
-1. **仅支持 Global 站**：中国站端点和模型别名未实现
+1. **中国站未做实机验证**：端点表来自社区实现（dsh-provider-qoder / qoder-proxy），
+   Global 站已实测；CN 的 `/api/v1/deviceToken/refresh` 刷新路径、图片上传域尚未验证
 2. **无 TTS**：Qoder 网关不提供语音合成端点
 3. **ASR 仅调研**：WebSocket ASR 端点已识别但未实现
-4. **单进程双实例**：需要 globalThis 通道，增加复杂度
+4. **多实例**：同进程可挂 2 个 provider + 每 provider 双 realm，全靠 globalThis 通道与
+   按区域分键，复杂度集中在这里
 5. **COSY 签名硬编码**：RSA 公钥和算法版本固定
 
 ## 17. 扩展点
@@ -560,3 +581,67 @@ pnpm test           # 运行测试
 - `/api/v1/webSearch/*` — 网页搜索
 - `/algo/api/v2/service/pro/imageSearch` — 图片搜索
 - `/algo/api/v2/service/pro/generateImage` — 图片生成
+
+## 18. 多区域（Global + 中国站）
+
+一个插件注册两组模型列表：同一条代码路径、两个 provider 实例。
+
+```jsonc
+// ~/.config/opencode/opencode.jsonc
+{
+  "plugin": [
+    ["opencode-qoder"],                                    // provider "qoder"
+    ["opencode-qoder", { "providerID": "qoder-cn",        // provider "qoder-cn"
+                         "region": "cn" }]
+  ]
+}
+```
+
+或在使用 `~/.config/opencode/plugin/` 目录时放两个 shim：
+
+```js
+// ~/.config/opencode/plugin/qoder.js
+import { definePlugin } from "opencode-qoder";
+export default definePlugin("global");
+
+// ~/.config/opencode/plugin/qoder-cn.js
+import { definePlugin } from "opencode-qoder";
+export default definePlugin("cn");
+```
+
+### 18.1 工作原理
+
+`definePlugin(region)` 返回一个带独立模块 id / provider id 的插件对象（`index.ts`）。
+opencode 的 auth hook **一个实例只绑定一个 provider**，所以"两组模型"就是两个实例。
+
+区域**从不落在模块状态里**——两个实例同进程共享模块注册表与 globalThis，任何模块级
+region 都会被另一个实例覆盖。因此：
+
+- URL 由 `resolveEndpoints(region)` 现算（`constants.ts`）
+- 状态文件由 `stateFiles(region)` 现算
+- globalThis 键由 `sharedKey(name, region)` 现算
+- `model-catalog.ts` 的目录状态从模块变量改为 `Map<QoderRegion, CatalogState>`
+- 每个需要区域的函数接 `region` 参数（默认 `"global"`，所以单区域配置和旧调用点不变）
+
+### 18.2 区域差异表
+
+| | Global | 中国站 |
+|---|---|---|
+| baseUrl | `api3.qoder.sh/` | `gateway.qoder.com.cn/` |
+| openapi | `openapi.qoder.sh` | `openapi.qoder.com.cn` |
+| center | `center.qoder.sh` | `gateway.qoder.com.cn`（**与 baseUrl 同域**）|
+| refresh | `/algo/api/v3/user/refresh_token` | `/api/v1/deviceToken/refresh` |
+| provider id | `qoder` | `qoder-cn` |
+| store 前缀 | `qoder-*` | `qoder-cn-*` |
+
+### 18.3 实测
+
+同一进程并发调用两个区域，各自命中自己的端点与账号（`dist/quota-cli.js`）：
+
+```
+region=global -> 李维超 / api3.qoder.sh      / qoder-pats.json      / 2667 额度
+region=cn     -> Mengye Gao / gateway.qoder.com.cn / qoder-cn-pats.json /  417 额度
+```
+
+区域隔离由 `src/__tests__/region-isolation.test.ts` 钉住（端点表、状态文件名、共享键、
+PAT/tier 存储互不可见），并做过 mutation 验证。

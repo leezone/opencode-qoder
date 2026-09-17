@@ -6,6 +6,7 @@ import {
   identityUnresolved as identityMissing,
   type QoderCredentials,
   type QoderProviderOptions,
+  regionOf,
 } from "./auth.js";
 import { QODER_ERROR_CODE_LOGIN_EXPIRED, QODER_ERROR_CODE_QUOTA_EXHAUSTED } from "./constants.js";
 import { opencodeConfigFile } from "./json-store.js";
@@ -123,9 +124,10 @@ export function isQoderAuthFailure(error: unknown): boolean {
  * strands a user whose only working session is the one that just errored.
  */
 function patRecoveryNote(options: QoderProviderOptions): string {
+  const region = regionOf(options);
   let backups: { id: string; label: string }[];
   try {
-    backups = listPATs()
+    backups = listPATs(region)
       .filter((entry) => !entry.active && entry.pat)
       .map((entry) => ({ id: entry.id, label: entry.label }));
   } catch {
@@ -150,7 +152,7 @@ function patRecoveryNote(options: QoderProviderOptions): string {
   const script = [copiedScript, bundledScript].find((p) => existsSync(p)) ?? "";
   const shell = script
     ? `from any shell: node ${script} --pats, then --use-pat=<id or label>`
-    : `from any shell: set "active" true on one of those ids in ${patStoreFile()}`;
+    : `from any shell: set "active" true on one of those ids in ${patStoreFile(region)}`;
   const note =
     ` The PAT store has ${backups.length} inactive backup(s): ${listed}.` +
     ` Switch in-chat with qoder_pat_switch(id=...), or -- if no chat works, which is the usual case here --` +

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { type QoderRegion, resolveEndpoints } from "./constants.js";
 import { buildAuthHeaders, type CosyCredentials } from "./cosy.js";
 import { logPlugin } from "./log.js";
 
@@ -138,14 +139,12 @@ export function readQoderImageUrl(payload: unknown): string | undefined {
 export interface ImageUploadContext {
   /** Credential the COSY signature is built from. */
   creds: CosyCredentials;
+  /** Which deployment's center service publishes the image. */
+  region?: QoderRegion;
   signal?: AbortSignal;
   /** Test seam; production uses the global fetch. */
   fetchImpl?: typeof fetch;
 }
-
-// Center service host the upload path hangs off. Defaults to the global center;
-// the China region will pass its own.
-const DEFAULT_CENTER_URL = "https://center.qoder.sh";
 
 /**
  * Publish one image and return its URL, or undefined when publication failed
@@ -159,7 +158,8 @@ async function publish(
 ): Promise<string | undefined> {
   const requestId = crypto.randomUUID();
   const { body, boundary } = buildQoderImageMultipart(data, mediaType);
-  const url = `${DEFAULT_CENTER_URL}${UPLOAD_HTTP_PATH}?request_id=${encodeURIComponent(requestId)}`;
+  const center = resolveEndpoints(context.region ?? "global").center;
+  const url = `${center}${UPLOAD_HTTP_PATH}?request_id=${encodeURIComponent(requestId)}`;
   // The Qoder client signs the body LENGTH, not the body: its prepareRequest
   // receives String(body.length). Signing the raw multipart bytes would be
   // wrong -- and would corrupt them, because the signature input is assembled
@@ -168,7 +168,7 @@ async function publish(
   // computeSigPath() in cosy.ts already strips from the URL given here, while
   // the HTTP URL keeps it.
   const signedBody = Buffer.from(String(body.length), "utf8");
-  const headers = buildAuthHeaders(signedBody, url, context.creds);
+  const headers = buildAuthHeaders(signedBody, url, context.creds, context.region ?? "global");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
   const onAbort = () => controller.abort(context.signal?.reason);

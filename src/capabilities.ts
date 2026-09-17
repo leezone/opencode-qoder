@@ -3,11 +3,12 @@ import {
   fetchQoderAccount,
   identityUnresolved,
   type QoderProviderOptions,
+  regionOf,
   resolveQoderCredentials,
   storedConnectionToken,
 } from "./auth.js";
 import { text } from "./coerce.js";
-import { QODER_PAT_ENV, QODER_VERSION, REFRESH_SKEW_MS } from "./constants.js";
+import { QODER_PAT_ENV, QODER_VERSION, type QoderRegion, REFRESH_SKEW_MS } from "./constants.js";
 import { readEnv } from "./env.js";
 import { describeKeyFile } from "./key-file.js";
 import { errorMessage, logPlugin } from "./log.js";
@@ -137,8 +138,8 @@ export async function reportQuota(explicit?: QoderProviderOptions): Promise<Capa
   const options = toolOptions(explicit);
   const credentials = await resolveQoderCredentials(options);
   const usage = await fetchQuotaUsage(options);
-  setQuotaExhausted(usage.exhausted);
-  const account = await fetchQoderAccount(credentials.access);
+  setQuotaExhausted(usage.exhausted, regionOf(options));
+  const account = await fetchQoderAccount(credentials.access, regionOf(options));
   return { output: renderQuota(usage, account), data: usage };
 }
 
@@ -231,26 +232,27 @@ export function renderModels(models: DiscoveredModel[], status: ReturnType<typeo
 /** Every model opencode is currently offering, with the limits it registered. */
 export async function reportModels(explicit?: QoderProviderOptions): Promise<CapabilityReport> {
   const options = toolOptions(explicit);
+  const region = regionOf(options);
   try {
     const usage = await fetchQuotaUsage(options);
-    setQuotaExhausted(usage.exhausted);
+    setQuotaExhausted(usage.exhausted, region);
   } catch (error) {
     // Availability suffixes then reflect the last known flag rather than live
     // truth. Worth saying: "all models look usable" is exactly what a failed
     // quota call leaves behind.
     logPlugin(`models: quota unavailable, availability may be stale (${errorMessage(error)})`);
   }
-  const models = catalogModels();
+  const models = catalogModels(region);
   return {
-    output: renderModels(models, catalogStatus()),
-    data: { status: catalogStatus(), models: models.map((model) => ({ ...model })) },
+    output: renderModels(models, catalogStatus(region)),
+    data: { status: catalogStatus(region), models: models.map((model) => ({ ...model })) },
   };
 }
 
 /** One model, resolved the way a request would resolve it (live, then bundled, then default). */
-export function reportModel(id: string): CapabilityReport {
-  const model = getModelDefinition(id);
-  const status = catalogStatus();
+export function reportModel(id: string, region: QoderRegion = "global"): CapabilityReport {
+  const model = getModelDefinition(id, region);
+  const status = catalogStatus(region);
   // getModelDefinition() falls through to a default for an unknown id and logs
   // it. The caller must be able to tell that apart from a real hit, because the
   // numbers it prints would otherwise look authoritative.
@@ -260,7 +262,7 @@ export function reportModel(id: string): CapabilityReport {
     ...renderModels([model], status).split("\n").slice(2),
   ];
   lines.push("");
-  lines.push(`  name        ${displayName(model)}`);
+  lines.push(`  name        ${displayName(model, region)}`);
   lines.push(`  input       ${(model.input ?? []).join(", ")}`);
   lines.push(`  reasoning   ${model.reasoning ? "yes" : "no"}`);
   lines.push(`  efforts     ${(model.efforts ?? []).join(", ") || "none"}`);
@@ -283,7 +285,10 @@ export function reportModel(id: string): CapabilityReport {
 
 // --- catalog diagnostics ----------------------------------------------------
 
-export function renderCatalog(status: ReturnType<typeof catalogStatus>): string {
+export function renderCatalog(
+  status: ReturnType<typeof catalogStatus>,
+  region: QoderRegion = "global",
+): string {
   const lines = [
     `source        ${status.source}`,
     `live models   ${status.live}`,
@@ -293,7 +298,7 @@ export function renderCatalog(status: ReturnType<typeof catalogStatus>): string 
     `fetched       ${formatUtc(status.fetchedAt || null)}`,
     `valid until   ${formatUtc(status.expiresAt || null)}`,
     `bundled table ${QODER_MODELS.length} entries (origin=${STATIC_MODELS_ORIGIN})`,
-    `disk cache    ${catalogCachePath()}`,
+    `disk cache    ${catalogCachePath(region)}`,
     `discovery     ${discoveryDisabled() ? "DISABLED (QODER_DISABLE_MODEL_DISCOVERY)" : "on"}`,
     `client ver    ${QODER_VERSION} (pinned to qodercli's)`,
   ];
@@ -305,10 +310,10 @@ export function renderCatalog(status: ReturnType<typeof catalogStatus>): string 
  * Where the model list came from, and why. This is the answer to "why is model X
  * missing" -- the failure that used to require reading a log file.
  */
-export function reportCatalog(): CapabilityReport {
-  const status = catalogStatus();
+export function reportCatalog(region: QoderRegion = "global"): CapabilityReport {
+  const status = catalogStatus(region);
   return {
-    output: renderCatalog(status),
+    output: renderCatalog(status, region),
     data: {
       status,
       env: {
@@ -319,7 +324,7 @@ export function reportCatalog(): CapabilityReport {
           describeTokenShape(readEnv("QODER_STATIC_MODELS")) === "absent" ? "unset" : "set",
       },
       staticOrigin: STATIC_MODELS_ORIGIN,
-      cachePath: catalogCachePath(),
+      cachePath: catalogCachePath(region),
     },
   };
 }

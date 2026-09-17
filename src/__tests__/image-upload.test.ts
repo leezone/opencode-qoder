@@ -104,7 +104,7 @@ describe("uploadQoderImage", () => {
       const headers = new Headers(init?.headers);
       capturedLength = headers.get("Cosy-Bodylength");
       capturedHash = headers.get("Cosy-Bodyhash");
-      sentBytes = (init?.body as Uint8Array).length;
+      sentBytes = (init.body as Uint8Array).length;
       return jsonResponse({ url: "https://cdn.test/x.png" });
     }) as typeof fetch;
 
