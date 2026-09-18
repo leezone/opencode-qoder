@@ -19,6 +19,11 @@ import { clearAllTiers, getSelectedTier, listSelectedTiers, setTier } from "../t
 // not a globalThis cache slot. These tests pin that, because the failure mode
 // is silent -- one region quietly answering with the other's account, catalog
 // or tier selection.
+//
+// Scope note: these assertions check what the CODE does, not that the CN
+// endpoints WORK. Every QODER_CN_* host here is copied from community projects
+// and has never been reached with a real CN account, so a green run says
+// nothing about CN connectivity.
 
 const GLOBAL_PAT = "pt-aaaaaaaaaaaaaaaa";
 const CN_PAT = "pt-bbbbbbbbbbbbbb";

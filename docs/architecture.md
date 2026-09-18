@@ -6,7 +6,7 @@
 
 ## 1. 项目定位
 
-opencode-qoder 是 [opencode](https://opencode.ai/) 的 **Qoder Global provider 插件**，将 Qoder 网关接入 opencode 的 AI SDK 接口。核心职责：
+opencode-qoder 是 [opencode](https://opencode.ai/) 的 **Qoder provider 插件**，将 Qoder 网关接入 opencode 的 AI SDK 接口。**国际站（qoder.sh）是当前唯一验证过的部署**；中国站（qoder.com.cn）有代码支持，但未实机验证（见 §18）。核心职责：
 
 1. **认证**：PAT / 设备登录 / 密钥文件，多账号切换
 2. **请求签名**：COSY 协议（RSA + AES + 自定义 base64 编码）
@@ -563,8 +563,9 @@ pnpm test           # 运行测试
 
 ## 16. 已知限制
 
-1. **中国站未做实机验证**：端点表来自社区实现（dsh-provider-qoder / qoder-proxy），
-   Global 站已实测；CN 的 `/api/v1/deviceToken/refresh` 刷新路径、图片上传域尚未验证
+1. **中国站为实验性支持，未实机验证**：只有国际站账号，CN 端点表来自社区实现
+   （dsh-provider-qoder / qoder-proxy），登录刷新、图片上传、模型发现、配额读取
+   全部未跑通。用国际站 PAT 打 CN 端点**不能**算验证（见 §18.3）
 2. **无 TTS**：Qoder 网关不提供语音合成端点
 3. **ASR 仅调研**：WebSocket ASR 端点已识别但未实现
 4. **多实例**：同进程可挂 2 个 provider + 每 provider 双 realm，全靠 globalThis 通道与
@@ -623,9 +624,9 @@ region 都会被另一个实例覆盖。因此：
 - `model-catalog.ts` 的目录状态从模块变量改为 `Map<QoderRegion, CatalogState>`
 - 每个需要区域的函数接 `region` 参数（默认 `"global"`，所以单区域配置和旧调用点不变）
 
-### 18.2 区域差异表
+### 18.2 区域差异表（⚠️ 中国站来源为社区实现，未实机验证）
 
-| | Global | 中国站 |
+| | Global | 中国站（未验证） |
 |---|---|---|
 | baseUrl | `api3.qoder.sh/` | `gateway.qoder.com.cn/` |
 | openapi | `openapi.qoder.sh` | `openapi.qoder.com.cn` |
@@ -634,14 +635,17 @@ region 都会被另一个实例覆盖。因此：
 | provider id | `qoder` | `qoder-cn` |
 | store 前缀 | `qoder-*` | `qoder-cn-*` |
 
-### 18.3 实测
+这些 CN 端点取自社区项目（dsh-provider-qoder 的区域表、qoder-proxy 的登录刷新路径），
+**没有 CN 账号实测过**。已知未验证的具体路径：登录刷新、图片上传域、模型发现、
+配额读取。在拿到 CN 账号跑通之前，应视 CN 为实验性支持。
 
-同一进程并发调用两个区域，各自命中自己的端点与账号（`dist/quota-cli.js`）：
+### 18.3 验证状态
 
-```
-region=global -> 李维超 / api3.qoder.sh      / qoder-pats.json      / 2667 额度
-region=cn     -> Mengye Gao / gateway.qoder.com.cn / qoder-cn-pats.json /  417 额度
-```
+**已验证**：区域隔离机制本身。`src/__tests__/region-isolation.test.ts` 钉住端点表、
+状态文件名、共享键分域、PAT/tier 存储互不可见，并做过 mutation 验证（把缓存键改回
+共享会让测试变红）。多实例工厂 `definePlugin` 也就绪，模块 id 分别为 `opencode-qoder`
+与 `opencode-qoder-cn`。
 
-区域隔离由 `src/__tests__/region-isolation.test.ts` 钉住（端点表、状态文件名、共享键、
-PAT/tier 存储互不可见），并做过 mutation 验证。
+**未验证**：中国站能否真正跑通。**当前只有国际站账号**，因此 CN 端到端从未测过。
+特别提醒：不要用国际站 PAT 去调 CN 端点——那既不能证明 CN 可用，也不会报出预期外的
+错误，容易被误当成"跑通了"（这个错误已经发生过一次）。

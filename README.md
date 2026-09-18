@@ -2,10 +2,12 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Qoder provider plugin for [opencode](https://opencode.ai/) -- both the international site (`qoder.sh`) and the China site (`qoder.com.cn`). Ported from `pi-provider-qoder`: PAT exchange, COSY request signing, Qoder body encoding, chat SSE parsing, reasoning, image input, and tool calls.
+Qoder provider plugin for [opencode](https://opencode.ai/). Ported from `pi-provider-qoder`: PAT exchange, COSY request signing, Qoder body encoding, chat SSE parsing, reasoning, image input, and tool calls.
 
-One plugin, two provider instances: configure both regions side by side, each with its own
-credentials, model list and context-tier state.
+The international site (`qoder.sh`) is the verified deployment. The China site
+(`qoder.com.cn`) has code support and a second provider instance, but its endpoints come
+from community projects and **have not been exercised against a real CN account** -- treat
+it as experimental. See [Both regions at once](#both-regions-at-once).
 
 ## Build
 
@@ -29,6 +31,10 @@ Add the plugin to `opencode.json`, or adjust the path for your config location:
 The plugin registers provider `qoder` and bundles 17 models -- see [Models](#models).
 
 ### Both regions at once
+
+> **Experimental.** The CN endpoints are unverified -- see the note at the top. Adding this
+> entry is safe for the international provider (they are fully independent), but the CN
+> provider is not known to work.
 
 Add a second entry naming the CN provider. The two instances are independent: separate
 credential stores, separate model catalogs, separate tier selections.

@@ -2,9 +2,11 @@
 
 [English](README.md) | 简体中文
 
-适用于 [opencode](https://opencode.ai/) 的 Qoder 提供商插件，同时支持国际站（`qoder.sh`）和中国站（`qoder.com.cn`）。移植自 `pi-provider-qoder`：PAT 兑换、COSY 请求签名、Qoder 请求体编码、聊天 SSE 解析、推理输出、图片输入与工具调用。
+适用于 [opencode](https://opencode.ai/) 的 Qoder 提供商插件。移植自 `pi-provider-qoder`：PAT 兑换、COSY 请求签名、Qoder 请求体编码、聊天 SSE 解析、推理输出、图片输入与工具调用。
 
-一个插件、两个 provider 实例：可同时配置两个区域，各自独立凭证、模型列表与上下文层级状态。
+**国际站（`qoder.sh`）是当前唯一验证过的部署。** 中国站（`qoder.com.cn`）有代码支持
+和独立的 provider 实例，但端点取自社区项目，**没有用真实 CN 账号跑通过** —— 请当作
+实验性支持。见[同时使用两个区域](#同时使用两个区域)。
 
 ## 构建
 
@@ -28,6 +30,9 @@ pnpm build
 插件注册 `qoder` 提供商，内置 17 个模型——见[模型](#模型)。
 
 ### 同时使用两个区域
+
+> **实验性。** CN 端点未经验证——见文首说明。加这条配置对国际站 provider 无影响
+> （两者完全独立），但 CN provider 能否工作尚无证据。
 
 再加一条配置、指明 CN 的 provider id 即可。两个实例完全独立：各自的凭证存储、
 模型目录与层级选择互不影响。

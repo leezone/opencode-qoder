@@ -14,7 +14,13 @@ export const PROVIDER_NAME_CN = "Qoder (CN)";
 // state: the same process hosts both, so region must always travel as a
 // parameter (see resolveEndpoints / stateFiles).
 //
-// Reference for the CN hosts: dsh-provider-qoder's region table.
+// UNVERIFIED: the international hosts below are exercised in production; every
+// QODER_CN_* host and path is copied from community implementations
+// (dsh-provider-qoder's region table, qoder-proxy's login refresh path) and has
+// never been reached with a real CN account. Treat CN as experimental until
+// someone runs it against one. Do NOT "verify" it with an international PAT --
+// that proves nothing about these endpoints and has already produced one false
+// positive.
 export type QoderRegion = "global" | "cn";
 
 export const QODER_BASE_URL = "https://api3.qoder.sh/";
