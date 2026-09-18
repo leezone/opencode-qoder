@@ -643,9 +643,15 @@ region 都会被另一个实例覆盖。因此：
 
 **已验证**：区域隔离机制本身。`src/__tests__/region-isolation.test.ts` 钉住端点表、
 状态文件名、共享键分域、PAT/tier 存储互不可见，并做过 mutation 验证（把缓存键改回
-共享会让测试变红）。多实例工厂 `definePlugin` 也就绪，模块 id 分别为 `opencode-qoder`
-与 `opencode-qoder-cn`。
+共享会让测试变红）。`quota-cli.test.ts` 另有 4 个测试记录**实际请求的 host**，钉住
+"region 必须进入请求、而不是只用于层级表"。多实例工厂 `definePlugin` 也就绪。
 
-**未验证**：中国站能否真正跑通。**当前只有国际站账号**，因此 CN 端到端从未测过。
-特别提醒：不要用国际站 PAT 去调 CN 端点——那既不能证明 CN 可用，也不会报出预期外的
-错误，容易被误当成"跑通了"（这个错误已经发生过一次）。
+**未验证**：中国站本身。**当前只有国际站账号**，CN 端到端从未真正跑通。反向验证过：
+国际站 PAT 打 CN 端点会被明确拒绝——exchange 返回 `400 BadRequest`，CN job token 打
+CN quota 返回 `401 TOKEN_EXPIRE`。
+
+**这段历史值得记住**：曾有一次"CN 实测成功"的报告，实际是 `runQuotaCli` 在构造请求
+options 时**丢掉了 region**，于是 `--region=cn` 走 CN 的 store、却打国际站的 host——
+正常返回 200，看起来像 CN 通了。只看状态码没发现，是后来记录请求 host 才暴露。
+教训：**跨区域的"成功"必须用 host 断言证明，不能只看返回值**；错误 host 不是错误，
+是貌似合理的成功。

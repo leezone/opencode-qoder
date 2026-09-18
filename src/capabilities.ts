@@ -185,7 +185,7 @@ export function renderAccount(
 export async function reportAccount(explicit?: QoderProviderOptions): Promise<CapabilityReport> {
   const options = toolOptions(explicit);
   const credentials = await resolveQoderCredentials(options);
-  const account = await fetchQoderAccount(credentials.access);
+  const account = await fetchQoderAccount(credentials.access, regionOf(options));
   let userType = "";
   try {
     userType = (await fetchQuotaUsage(options)).userType;

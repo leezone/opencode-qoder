@@ -181,10 +181,14 @@ export async function runQuotaCli(
   try {
     // Resolve once for the bearer token the account call needs, then let
     // fetchQuotaUsage run its own resolve -- auth.ts memoizes the exchange per
-    // PAT in-process, so the second pass is free and stays the single funnel.
-    const credentials = await resolveQoderCredentials({ personalAccessToken: chosen.token });
-    const usage = await fetchQuotaUsage({ personalAccessToken: chosen.token });
-    const account = await fetchQoderAccount(credentials.access);
+    // (region, PAT) in-process, so the second pass is free and stays the single
+    // funnel. Region MUST ride every one of these calls: dropping it here is
+    // exactly how a `--region=cn` run silently answered from the international
+    // host, which is worse than failing -- it looks like CN works.
+    const request = { personalAccessToken: chosen.token, region };
+    const credentials = await resolveQoderCredentials(request);
+    const usage = await fetchQuotaUsage(request);
+    const account = await fetchQoderAccount(credentials.access, region);
     const data = {
       credential: { source: chosen.layer, fingerprint: fingerprint(chosen.token) },
       account: accountProjection(account, usage),
@@ -292,16 +296,16 @@ function classifyProbeError(error: unknown): ProbeStatus {
 // cached job token would keep calling a just-revoked PAT healthy until the
 // cache lapsed -- which is also why the CLI dropped its old on-disk token
 // cache (a second cache meant a second staleness story).
-export async function probePat(pat: string): Promise<ProbeVerdict> {
+export async function probePat(pat: string, region: QoderRegion = "global"): Promise<ProbeVerdict> {
   let credentials: QoderCredentials | undefined;
   try {
-    credentials = await resolveQoderCredentials({ personalAccessToken: pat });
+    credentials = await resolveQoderCredentials({ personalAccessToken: pat, region });
   } catch (error) {
     return { status: classifyProbeError(error), reason: errorMessage(error) };
   }
   try {
-    const usage = await fetchQuotaUsage({ personalAccessToken: credentials.access });
-    const account = await fetchQoderAccount(credentials.access);
+    const usage = await fetchQuotaUsage({ personalAccessToken: credentials.access, region });
+    const account = await fetchQoderAccount(credentials.access, region);
     return {
       status: usage.exhausted ? "EXHAUSTED" : "ALIVE",
       remaining: usage.remainingTotal,
@@ -335,7 +339,7 @@ export async function runPatsCli(
       label: entry.label || "",
       active: !!entry.active,
       email: entry.email || "",
-      ...(await probePat(entry.pat)),
+      ...(await probePat(entry.pat, region)),
     });
   }
   const usable = rows.filter((r) => r.status === "ALIVE" || r.status === "EXHAUSTED");
@@ -421,7 +425,7 @@ export async function runUsePatCli(
     };
   }
   const entry = matches[0];
-  const probe = await probePat(entry.pat);
+  const probe = await probePat(entry.pat, region);
   if (probe.status !== "ALIVE" && !opts.force) {
     const lines = [
       `Refusing to activate ${entry.id} (${entry.label}): ${probe.status}${probe.reason ? ` (${probe.reason})` : ""}.`,

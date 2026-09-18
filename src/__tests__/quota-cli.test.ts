@@ -13,6 +13,7 @@ import { shapeQuota } from "../quota.js";
 import {
   credentialLayers,
   probePat,
+  runQuotaCli,
   runResolveCli,
   runUsePatCli,
   standaloneCredential,
@@ -306,5 +307,73 @@ describe("probePat + runUsePatCli (recovery hatch)", () => {
     expect(ambiguous.exitCode).toBe(1);
     expect(ambiguous.stderr).toContain("several labels");
     expect((await runUsePatCli("anything")).exitCode).toBe(1); // empty-store guidance too
+  });
+
+  // The bug this pins: region was computed and used for the layer TABLE, but
+  // dropped when the options bag for the actual calls was built. So
+  // `--region=cn` walked the CN store and then signed against the
+  // international host -- which answered normally, making CN look verified.
+  // Recording hosts, not just statuses, is the only way to catch it: a wrong
+  // host is not an error, it is a plausible success.
+  describe("region is carried into the request, not just the layer table", () => {
+    function recordingGateway(): { hosts: string[] } {
+      const hosts: string[] = [];
+      vi.stubGlobal("fetch", async (input: unknown) => {
+        const url = new URL(String(input));
+        hosts.push(url.host);
+        if (url.pathname.includes("/jobToken/exchange")) {
+          return Response.json({ token: "jt", expires_in: 86_400 });
+        }
+        if (url.pathname.includes("/userinfo")) {
+          return Response.json({ id: "user-1", email: "u@example.com", name: "U" });
+        }
+        return Response.json({ user_quota: { remaining: 500 } });
+      });
+      return { hosts };
+    }
+
+    it("sends a CN run to the CN hosts", async () => {
+      const { hosts } = recordingGateway();
+      // The entry must live in the CN store, or the CLI refuses before dialing
+      // and the host assertion would pass vacuously.
+      const entry = addPAT(ALPHA, "cn", undefined, "cn")!;
+      await runUsePatCli(entry.id, { region: "cn", force: true });
+      expect(hosts.length).toBeGreaterThan(0);
+      for (const host of hosts) expect(host.endsWith("qoder.com.cn")).toBe(true);
+      expect(hosts).toContain("openapi.qoder.com.cn");
+    });
+
+    it("sends a global run to the international hosts", async () => {
+      const { hosts } = recordingGateway();
+      await runUsePatCli(addPAT(ALPHA, "global")!.id, { region: "global", force: true });
+      for (const host of hosts) expect(host.endsWith("qoder.sh")).toBe(true);
+      expect(hosts).toContain("openapi.qoder.sh");
+    });
+
+    it("probePat follows the region it is given", async () => {
+      const { hosts } = recordingGateway();
+      await probePat(ALPHA, "cn");
+      for (const host of hosts) expect(host.endsWith("qoder.com.cn")).toBe(true);
+    });
+
+    // runQuotaCli is the default path the skill script takes, and it had no
+    // test at all -- which is how the dropped region survived review.
+    it("runQuotaCli sends a CN run to the CN hosts", async () => {
+      const { hosts } = recordingGateway();
+      addPAT(ALPHA, "cn", undefined, "cn");
+      const report = await runQuotaCli({ region: "cn" });
+      expect(hosts.length).toBeGreaterThan(0);
+      for (const host of hosts) expect(host.endsWith("qoder.com.cn")).toBe(true);
+      expect(hosts).toContain("openapi.qoder.com.cn");
+      expect(report.exitCode).toBe(0);
+    });
+
+    it("runQuotaCli sends a global run to the international hosts", async () => {
+      const { hosts } = recordingGateway();
+      addPAT(ALPHA, "global");
+      await runQuotaCli({ region: "global" });
+      for (const host of hosts) expect(host.endsWith("qoder.sh")).toBe(true);
+      expect(hosts).toContain("openapi.qoder.sh");
+    });
   });
 });

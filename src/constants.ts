@@ -18,9 +18,15 @@ export const PROVIDER_NAME_CN = "Qoder (CN)";
 // QODER_CN_* host and path is copied from community implementations
 // (dsh-provider-qoder's region table, qoder-proxy's login refresh path) and has
 // never been reached with a real CN account. Treat CN as experimental until
-// someone runs it against one. Do NOT "verify" it with an international PAT --
-// that proves nothing about these endpoints and has already produced one false
-// positive.
+// someone runs it against one.
+//
+// An international PAT is actively REJECTED by the CN hosts (exchange answers
+// 400, the CN quota endpoint answers 401), so a CN run that succeeds is a red
+// flag, not a green one: it means the region never reached the request. That is
+// exactly what happened once -- `--region=cn` walked the CN store but dialed the
+// international host because region was dropped when the request options were
+// built. Region is not a display setting; it must reach every network call, and
+// quota-cli.test.ts now asserts the HOST for this reason.
 export type QoderRegion = "global" | "cn";
 
 export const QODER_BASE_URL = "https://api3.qoder.sh/";

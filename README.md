@@ -6,8 +6,10 @@ Qoder provider plugin for [opencode](https://opencode.ai/). Ported from `pi-prov
 
 The international site (`qoder.sh`) is the verified deployment. The China site
 (`qoder.com.cn`) has code support and a second provider instance, but its endpoints come
-from community projects and **have not been exercised against a real CN account** -- treat
-it as experimental. See [Both regions at once](#both-regions-at-once).
+from community projects and **have never been exercised against a real CN account** --
+treat it as experimental. (An international PAT is rejected by the CN hosts, so a CN run
+that *succeeds* means the region never reached the request.)
+See [Both regions at once](#both-regions-at-once).
 
 ## Build
 
