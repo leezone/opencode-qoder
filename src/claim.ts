@@ -1,14 +1,17 @@
-import { type QoderProviderOptions, regionOf, resolveQoderCredentials } from "./auth.js";
+import { type QoderCredentials, type QoderProviderOptions, regionOf, resolveQoderCredentials } from "./auth.js";
 import { nonEmptyString, text } from "./coerce.js";
 import {
   QODER_CLAIM_ENV,
   QODER_CLAIM_TIMEOUT_MS,
+  QODER_CLIENT_TYPE,
   type QoderRegion,
+  QODER_VERSION,
   resolveEndpoints,
   stateFiles,
 } from "./constants.js";
+import { getMachineId } from "./cosy.js";
 import { readEnv } from "./env.js";
-import { fetchWithTimeout, jsonHeaders, readErrorBody } from "./http.js";
+import { fetchWithTimeout, readErrorBody } from "./http.js";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
 import { errorMessage, logPlugin } from "./log.js";
 import { listPATs } from "./pat-store.js";
@@ -410,6 +413,37 @@ function claimUrl(region: QoderRegion, campaignId: string): string {
   return `${campaignsUrl(region)}/${encodeURIComponent(campaignId)}/claim`;
 }
 
+// Build headers for campaign requests, matching qodercli's H$n function.
+// The server requires these Cosy-* headers to return campaign data.
+function buildCampaignHeaders(
+  credentials: QoderCredentials,
+  region: QoderRegion,
+): Record<string, string> {
+  const machineId = credentials.machineID || getMachineId(region);
+  // Detect OS dynamically: qodercli uses platform-specific values
+  const platform = process.platform;
+  const arch = process.arch;
+  let machineOs = 'x86_64_unknown';
+  if (platform === 'win32') {
+    machineOs = arch === 'x64' ? 'x86_64_windows' : 'arm64_windows';
+  } else if (platform === 'darwin') {
+    machineOs = arch === 'arm64' ? 'arm64_darwin' : 'x86_64_darwin';
+  } else if (platform === 'linux') {
+    machineOs = arch === 'arm64' ? 'arm64_linux' : 'x86_64_linux';
+  }
+
+  return {
+    Accept: 'application/json',
+    Authorization: `Bearer ${credentials.access}`,
+    'Cosy-Version': QODER_VERSION,
+    'Cosy-ClientType': QODER_CLIENT_TYPE,
+    'Cosy-MachineId': machineId,
+    'Cosy-Machinetoken': machineId,
+    'Cosy-Machinetype': QODER_CLIENT_TYPE,
+    'Cosy-Machineos': machineOs,
+  };
+}
+
 // Bearer-only, exactly like fetchQuotaUsage(): the COSY signature the chat
 // endpoint needs is not part of this surface.
 async function campaignRequest(
@@ -419,9 +453,11 @@ async function campaignRequest(
   label: string,
 ): Promise<unknown> {
   const credentials = await resolveQoderCredentials(options);
+  const region = regionOf(options);
+  const headers = buildCampaignHeaders(credentials, region);
   return fetchWithTimeout(
     url,
-    { method, headers: jsonHeaders({ Authorization: `Bearer ${credentials.access}` }) },
+    { method, headers },
     QODER_CLAIM_TIMEOUT_MS,
     async (response) => {
       if (!response.ok) {
@@ -510,8 +546,12 @@ function benefitLabel(campaign: Campaign): string {
   const kind = benefit.kind ? benefit.kind.toLowerCase() : "reward";
   // The scope stays visible: "2000 credits, one model family only" is exactly
   // the detail a user needs before calling a promo grant a win.
+  // Map known scope keys to friendly names
+  const scopeMap: Record<string, string> = {
+    C_S_U_SERIES: "Sonus",
+  };
   const scope = benefit.scope
-    ? ` for ${benefit.scope.replace(/_/g, " ").replace(/\s+/g, " ").trim().toLowerCase()}`
+    ? ` for ${scopeMap[benefit.scope] || benefit.scope.replace(/_/g, " ").replace(/\s+/g, " ").trim().toLowerCase()}`
     : "";
   return `${amount}${kind}${scope}`;
 }
