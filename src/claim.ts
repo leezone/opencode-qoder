@@ -14,7 +14,7 @@ import { readEnv } from "./env.js";
 import { fetchWithTimeout, readErrorBody } from "./http.js";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
 import { errorMessage, logPlugin } from "./log.js";
-import { listPATs } from "./pat-store.js";
+import { getPatMachineId, listPATs } from "./pat-store.js";
 
 // --- The promotional campaign surface ("签到领积分") --------------------------
 //
@@ -608,6 +608,7 @@ function targets(options: QoderProviderOptions, all: boolean): QoderProviderOpti
   if (pats.length === 0) return [options];
   return pats.map((entry) => ({
     personalAccessToken: entry.pat,
+    qoderMachineID: getPatMachineId(entry.pat),
     ...(entry.email ? { qoderEmail: entry.email } : {}),
   }));
 }

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import crypto, { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { type QoderRegion, sharedKey, stateFiles } from "./constants.js";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
@@ -34,6 +34,10 @@ export interface StoredPAT {
   // above that -- see the precedence table in auth.ts. Cleared by
   // followConfig() to hand control back to the configured credential.
   selected?: boolean;
+  // Per-account machine ID: each PAT gets its own unique machine identity so
+  // the server sees each account as a separate machine. Used by the campaign
+  // claim system to prevent multi-account check-in detection.
+  machineID?: string;
 }
 
 interface PATStoreData {
@@ -117,6 +121,15 @@ function loadStore(region: QoderRegion = "global"): PATStoreData {
       data = { entries: (parsed as PATStoreData).entries.filter(isValidEntry) };
     }
   }
+  // Backfill machineID for legacy entries that predate the per-account field.
+  let changed = false;
+  for (const entry of data.entries) {
+    if (!entry.machineID) {
+      entry.machineID = crypto.randomUUID();
+      changed = true;
+    }
+  }
+  if (changed) saveStore(region);
   setCachedStore(region, data, mtimeMs);
   return data;
 }
@@ -136,7 +149,8 @@ function isValidEntry(value: unknown): value is StoredPAT {
     typeof entry.label === "string" &&
     typeof entry.pat === "string" &&
     typeof entry.active === "boolean" &&
-    (entry.selected === undefined || typeof entry.selected === "boolean")
+    (entry.selected === undefined || typeof entry.selected === "boolean") &&
+    (entry.machineID === undefined || typeof entry.machineID === "string")
   );
 }
 
@@ -207,6 +221,7 @@ export function addPAT(
     pat,
     email,
     active: isFirst,
+    machineID: crypto.randomUUID(),
   };
   store.entries.push(entry);
   saveStore(region);
@@ -271,4 +286,18 @@ export function followConfig(region: QoderRegion = "global"): boolean {
     logPlugin("pat-store: following the configured credential (selection cleared)");
   }
   return changed;
+}
+
+// Returns the per-account machine ID for a PAT. For entries that predate the
+// machineID field, a deterministic UUID is derived from the PAT hash so the
+// value is stable across calls without requiring a migration.
+export function getPatMachineId(pat: string, region: QoderRegion = "global"): string {
+  const store = loadStore(region);
+  const entry = store.entries.find((e) => e.pat === pat);
+  if (entry?.machineID) return entry.machineID;
+  // Fallback: deterministic UUID from PAT hash. Stable per token, unique across
+  // accounts, and does not collide with randomUUID() entries (different version
+  // bits).
+  const hash = createHash("sha256").update(pat).digest("hex");
+  return `00000000-0000-4000-8000-${hash.slice(0, 12)}`;
 }
