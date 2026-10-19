@@ -1,11 +1,16 @@
-import { type QoderCredentials, type QoderProviderOptions, regionOf, resolveQoderCredentials } from "./auth.js";
+import {
+  type QoderCredentials,
+  type QoderProviderOptions,
+  regionOf,
+  resolveQoderCredentials,
+} from "./auth.js";
 import { nonEmptyString, text } from "./coerce.js";
 import {
   QODER_CLAIM_ENV,
   QODER_CLAIM_TIMEOUT_MS,
   QODER_CLIENT_TYPE,
-  type QoderRegion,
   QODER_VERSION,
+  type QoderRegion,
   resolveEndpoints,
   stateFiles,
 } from "./constants.js";
@@ -423,24 +428,24 @@ function buildCampaignHeaders(
   // Detect OS dynamically: qodercli uses platform-specific values
   const platform = process.platform;
   const arch = process.arch;
-  let machineOs = 'x86_64_unknown';
-  if (platform === 'win32') {
-    machineOs = arch === 'x64' ? 'x86_64_windows' : 'arm64_windows';
-  } else if (platform === 'darwin') {
-    machineOs = arch === 'arm64' ? 'arm64_darwin' : 'x86_64_darwin';
-  } else if (platform === 'linux') {
-    machineOs = arch === 'arm64' ? 'arm64_linux' : 'x86_64_linux';
+  let machineOs = "x86_64_unknown";
+  if (platform === "win32") {
+    machineOs = arch === "x64" ? "x86_64_windows" : "arm64_windows";
+  } else if (platform === "darwin") {
+    machineOs = arch === "arm64" ? "arm64_darwin" : "x86_64_darwin";
+  } else if (platform === "linux") {
+    machineOs = arch === "arm64" ? "arm64_linux" : "x86_64_linux";
   }
 
   return {
-    Accept: 'application/json',
+    Accept: "application/json",
     Authorization: `Bearer ${credentials.access}`,
-    'Cosy-Version': QODER_VERSION,
-    'Cosy-ClientType': QODER_CLIENT_TYPE,
-    'Cosy-MachineId': machineId,
-    'Cosy-Machinetoken': machineId,
-    'Cosy-Machinetype': QODER_CLIENT_TYPE,
-    'Cosy-Machineos': machineOs,
+    "Cosy-Version": QODER_VERSION,
+    "Cosy-ClientType": QODER_CLIENT_TYPE,
+    "Cosy-MachineId": machineId,
+    "Cosy-Machinetoken": machineId,
+    "Cosy-Machinetype": QODER_CLIENT_TYPE,
+    "Cosy-Machineos": machineOs,
   };
 }
 
@@ -455,27 +460,22 @@ async function campaignRequest(
   const credentials = await resolveQoderCredentials(options);
   const region = regionOf(options);
   const headers = buildCampaignHeaders(credentials, region);
-  return fetchWithTimeout(
-    url,
-    { method, headers },
-    QODER_CLAIM_TIMEOUT_MS,
-    async (response) => {
-      if (!response.ok) {
-        const detail = await readErrorBody(response, 160);
-        throw new CampaignError(
-          response.status,
-          `${label}: HTTP ${response.status}${detail ? ` ${detail}` : ""}`.trim(),
-        );
-      }
-      const body = await response.text();
-      if (!body) return {};
-      try {
-        return JSON.parse(body);
-      } catch {
-        throw new Error(`${label}: campaign service returned a non-JSON body`);
-      }
-    },
-  );
+  return fetchWithTimeout(url, { method, headers }, QODER_CLAIM_TIMEOUT_MS, async (response) => {
+    if (!response.ok) {
+      const detail = await readErrorBody(response, 160);
+      throw new CampaignError(
+        response.status,
+        `${label}: HTTP ${response.status}${detail ? ` ${detail}` : ""}`.trim(),
+      );
+    }
+    const body = await response.text();
+    if (!body) return {};
+    try {
+      return JSON.parse(body);
+    } catch {
+      throw new Error(`${label}: campaign service returned a non-JSON body`);
+    }
+  });
 }
 
 // The email is already on the credential, so labelling an account costs no

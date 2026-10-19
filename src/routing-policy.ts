@@ -2,15 +2,16 @@ import { statSync } from "node:fs";
 import { type QoderRegion, sharedKey, stateFiles } from "./constants.js";
 import { opencodeConfigFile, readJsonFile, writeJsonFile } from "./json-store.js";
 import { errorMessage, logPlugin } from "./log.js";
+import { resolveSubagentModel } from "./model-catalog.js";
 import { readShared, writeShared } from "./shared-state.js";
 
 // Subagent routing policy: which model serves the plugin's pinned helper
 // agents when the conversation runs on an above-default context tier.
 //
 // The tier, not the agent identity, drives the choice. A conversation on the
-// default tier (200K) fits inside the free `lite` model, so pinned agents
+// default tier (200K) fits inside the free `efficient` model, so pinned agents
 // (plan/general/explore/title/compaction) run there at zero cost. A 400K/1M
-// conversation does NOT fit in lite -- compaction has to read the whole
+// conversation does NOT fit in efficient -- compaction has to read the whole
 // conversation -- so those agents escalate to a cheap model that advertises
 // the session's tier (default target: qfmodel, the cheapest model
 // that advertises it -- its multiplier rides the live catalog).
@@ -36,21 +37,21 @@ export interface RoutingPolicy {
 // Which agents are exempt, and why:
 //   - title is the ONLY one kept on the base model by default. It is driven
 //     from a short prompt (the first user turn) regardless of how long the
-//     conversation grows, it is free (lite), and it fires often -- escalating
+//     conversation grows, it is free (efficient), and it fires often -- escalating
 //     it to a billed model would cost real money for nothing. A 1M conversation
-//     that switches tiers still title-generates on lite at the default window,
+//     that switches tiers still title-generates on efficient at the default window,
 //     which always fits; buildRequestBody drops the session tier from the wire
 //     when the serving model does not advertise it.
 //   - compaction receives the WHOLE conversation and MUST follow the tier:
 //     exempting it is exactly what strands a >200k chat.
 //   - task children (plan/general/explore) resolve to the conversation's tier
 //     too. Their prompts start small, so they usually stay under the threshold
-//     and ride lite free; a long-running child that grows past it escalates
+//     and ride efficient free; a long-running child that grows past it escalates
 //     like compaction. The user explicitly chose this ("subagent uses
 //     flash@1M"); the cost only materialises for a genuinely large child.
 export const DEFAULT_ROUTING_POLICY: RoutingPolicy = {
   enabled: true,
-  subagentModel: "lite",
+  subagentModel: "efficient",
   target: "qfmodel",
   threshold: 200_000,
   exemptAgents: ["title"],
@@ -75,9 +76,12 @@ function cached(region: QoderRegion): Cache | undefined {
   return readShared<Cache>(cacheKey(region));
 }
 
-function sanitize(raw: unknown): RoutingPolicy {
+function sanitize(raw: unknown, region: QoderRegion = "global"): RoutingPolicy {
   const out: RoutingPolicy = {
     ...DEFAULT_ROUTING_POLICY,
+    // Auto-detect the zero-cost model from the catalog instead of hardcoding.
+    // Falls back to "efficient" if no free model is found.
+    subagentModel: resolveSubagentModel(region) ?? "efficient",
     exemptAgents: [...DEFAULT_ROUTING_POLICY.exemptAgents],
   };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
@@ -114,7 +118,7 @@ function readPolicyFile(region: QoderRegion = "global"): {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       logPlugin(`routing-policy: cannot stat ${path} (${errorMessage(error)})`);
     }
-    return { policy: sanitize(null), mtimeMs: -1 };
+    return { policy: sanitize(null, region), mtimeMs: -1 };
   }
   const previous = cached(region);
   if (previous && previous.mtimeMs === mtimeMs) {
@@ -122,7 +126,7 @@ function readPolicyFile(region: QoderRegion = "global"): {
   }
   // A corrupt file logs once inside readJsonFile and answers undefined;
   // sanitize(null) keeps the defaults rather than blocking the request.
-  return { policy: sanitize(readJsonFile("routing-policy", path) ?? null), mtimeMs };
+  return { policy: sanitize(readJsonFile("routing-policy", path) ?? null, region), mtimeMs };
 }
 
 export function getRoutingPolicy(region: QoderRegion = "global"): RoutingPolicy {
@@ -143,7 +147,7 @@ export function updateRoutingPolicy(
   patch: Partial<RoutingPolicy>,
   region: QoderRegion = "global",
 ): RoutingPolicy {
-  const merged = sanitize({ ...getRoutingPolicy(region), ...patch });
+  const merged = sanitize({ ...getRoutingPolicy(region), ...patch }, region);
   const path = storePath(region);
   if (writeJsonFile("routing-policy", path, merged)) {
     try {

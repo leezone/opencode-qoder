@@ -547,6 +547,28 @@ export function parseCatalog(payload: unknown): DiscoveredModel[] {
 // rendering and the catalog signature, and refreshModels() stamps it via
 // setQuotaExhausted() on the shared refresh cadence.
 
+// --- Subagent model resolution ----------------------------------------------
+
+// Auto-detects the zero-cost model from the catalog for use by subagents
+// (compaction, title, plan, etc.). Prefers the first model with priceFactor=0,
+// falls back to a hardcoded list of known free models if the catalog doesn't
+// have any zero-cost entries yet (e.g., during startup before discovery completes).
+//
+// Returns the model id (e.g., "efficient") or undefined if no free model is found.
+export function resolveSubagentModel(region: QoderRegion = "global"): string | undefined {
+  const models = catalogModels(region);
+  // Prefer the first zero-cost model from the live/static catalog.
+  const free = models.find((m) => m.priceFactor === 0);
+  if (free) return free.id;
+  // Fallback: known free model ids in preference order. If the catalog hasn't
+  // loaded yet or doesn't carry a priceFactor, try these in order.
+  const fallbacks = ["efficient", "lite"];
+  for (const id of fallbacks) {
+    if (models.some((m) => m.id === id)) return id;
+  }
+  return undefined;
+}
+
 // --- Display name -----------------------------------------------------------
 
 // Costs nothing, so it keeps working after the credit quota runs out.

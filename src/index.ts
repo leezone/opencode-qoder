@@ -55,6 +55,7 @@ import {
   displayName,
   isValidContextTier,
   refreshModels,
+  resolveSubagentModel,
 } from "./model-catalog.js";
 import { maybeImportPATsFromEnv } from "./pat-import.js";
 import { reportPatAdd, reportPatList, reportPatRemove, reportPatSwitch } from "./pat-tools.js";
@@ -348,9 +349,9 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   logCatalogRegistration("legacy", region);
 
   // Configure subagents to use free/cheap models. This saves quota by using
-  // lite (free, 200k) for mechanical tasks -- title generation, compaction,
-  // plan research, parallel subtasks -- while the main agent keeps the user's
-  // selected model.
+  // the auto-detected zero-cost model for mechanical tasks -- title generation,
+  // compaction, plan research, parallel subtasks -- while the main agent keeps
+  // the user's selected model.
   //
   // Resolution order in opencode 1.18.x (verified in the bundle):
   //   message.model ?? agent.config.model ?? session's current model
@@ -363,9 +364,9 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
   // cfg.agents.X alias means the user configured it -- not touched.
   //
   // Compaction caveat: the compaction agent receives the WHOLE conversation,
-  // and lite caps at 200k. A conversation switched to a higher tier does NOT
-  // strand it -- the routing policy (see routing-policy.ts) escalates that
-  // request, like any non-exempt pinned-agent call, to a model advertising
+  // and the free model caps at 200k. A conversation switched to a higher tier
+  // does NOT strand it -- the routing policy (see routing-policy.ts) escalates
+  // that request, like any non-exempt pinned-agent call, to a model advertising
   // the session tier (default target: the cheap qfmodel). Only with the policy
   // disabled would such a session fail to compact; the pin stays so the
   // common case remains free.
@@ -376,22 +377,26 @@ function applyLegacyConfig(cfg: LegacyConfig, options?: PluginOptions): void {
     agents[name] = value;
   };
 
+  // Auto-detect the zero-cost model from the catalog. Falls back to "efficient"
+  // if no zero-cost model is found (e.g., during startup before discovery).
+  const freeModel = resolveSubagentModel(region) ?? "efficient";
+
   // plan: explores code and writes plans, doesn't execute.
-  ensureAgent("plan", { model: `${id}/lite` });
+  ensureAgent("plan", { model: `${id}/${freeModel}` });
   // general/explore: Task-tool subagents (multi-step work / read-only search).
   // Subagent sessions start fresh, so 200k is plenty.
-  ensureAgent("general", { model: `${id}/lite` });
-  ensureAgent("explore", { model: `${id}/lite` });
+  ensureAgent("general", { model: `${id}/${freeModel}` });
+  ensureAgent("explore", { model: `${id}/${freeModel}` });
   // title: generates session titles from the user prompts -- always small.
-  ensureAgent("title", { model: `${id}/lite` });
-  // compaction: compresses full conversations. Pinned to lite for quota; see
+  ensureAgent("title", { model: `${id}/${freeModel}` });
+  // compaction: compresses full conversations. Pinned to the free model for quota; see
   // the caveat above for sessions exceeding 200k tokens.
-  ensureAgent("compaction", { model: `${id}/lite` });
+  ensureAgent("compaction", { model: `${id}/${freeModel}` });
   // Deliberately untouched: build (main agent, user's model choice), summary
   // (hidden internal agent, safe to inherit the session model).
 
   logPlugin(
-    `legacy: configured subagents (plan/general/explore/title/compaction -> ${id}/lite). ` +
+    `legacy: configured subagents (plan/general/explore/title/compaction -> ${id}/${freeModel}). ` +
       `Set agent.* in opencode.json to override.`,
   );
 }
@@ -958,7 +963,7 @@ function capabilityTools(options?: PluginOptions): Hooks["tool"] {
         subagentModel: tool.schema
           .string()
           .optional()
-          .describe("The pinned helper model this policy escalates (default lite)."),
+          .describe("The pinned helper model this policy escalates (default efficient)."),
         target: tool.schema
           .string()
           .optional()

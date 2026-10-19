@@ -90,7 +90,7 @@ describe("routing-policy", () => {
       expect(policy.enabled).toBe(true);
       expect(policy.target).toBe("qfmodel");
       expect(policy.threshold).toBe(DEFAULT_ROUTING_POLICY.threshold);
-      expect(policy.subagentModel).toBe("lite");
+      expect(policy.subagentModel).toBe("efficient");
       expect(policy.exemptAgents).toEqual(["title"]);
     });
 
@@ -115,12 +115,18 @@ describe("routing-policy", () => {
     ) => resolveRouting({ policy, modelID, agent, sessionTier: tier, targetSupports: supports });
 
     it("keeps the model at or below the threshold and without a tier", () => {
-      expect(call("lite", "build", undefined)).toEqual({ modelID: "lite", escalated: false });
-      expect(call("lite", "build", 200000)).toEqual({ modelID: "lite", escalated: false });
+      expect(call("efficient", "build", undefined)).toEqual({
+        modelID: "efficient",
+        escalated: false,
+      });
+      expect(call("efficient", "build", 200000)).toEqual({
+        modelID: "efficient",
+        escalated: false,
+      });
     });
 
     it("escalates the pinned subagent model above the threshold", () => {
-      expect(call("lite", "compaction", 1000000)).toEqual({
+      expect(call("efficient", "compaction", 1000000)).toEqual({
         modelID: "qfmodel",
         escalated: true,
       });
@@ -131,15 +137,18 @@ describe("routing-policy", () => {
     });
 
     it("honours the exempt agent list", () => {
-      expect(call("lite", "title", 1000000)).toEqual({ modelID: "lite", escalated: false });
+      expect(call("efficient", "title", 1000000)).toEqual({
+        modelID: "efficient",
+        escalated: false,
+      });
     });
 
     it("refuses to escalate onto a target that lacks the tier", () => {
       // supports() rejects qfmodel at this tier -> stay on the selected model
       // rather than send a request the gateway would 400.
       const strict = (id: string, tokens: number) => !(id === "qfmodel") && tokens <= 200_000;
-      expect(call("lite", "compaction", 1000000, strict)).toEqual({
-        modelID: "lite",
+      expect(call("efficient", "compaction", 1000000, strict)).toEqual({
+        modelID: "efficient",
         escalated: false,
       });
     });
@@ -149,12 +158,12 @@ describe("routing-policy", () => {
       expect(
         resolveRouting({
           policy: off,
-          modelID: "lite",
+          modelID: "efficient",
           agent: "compaction",
           sessionTier: 1000000,
           targetSupports: supports1M,
         }),
-      ).toEqual({ modelID: "lite", escalated: false });
+      ).toEqual({ modelID: "efficient", escalated: false });
     });
   });
 });
