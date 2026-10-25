@@ -18,7 +18,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 200000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "performance",
@@ -29,7 +30,8 @@
     "input": ["text", "image"],
     "contextWindow": 272000,
     "inputWindow": 272000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [272000, 400000, 1000000]
   },
   {
     "id": "efficient",
@@ -49,7 +51,8 @@
     "input": ["text"],
     "contextWindow": 200000,
     "inputWindow": 200000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "qmodel_38max",
@@ -60,7 +63,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 180000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "qfmodel",
@@ -71,7 +75,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 180000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "qmodel_latest",
@@ -81,7 +86,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 200000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "qmodel",
@@ -91,7 +97,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 200000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "kmodel_latest",
@@ -102,7 +109,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 180000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "kmodel",
@@ -112,7 +120,8 @@
     "input": ["text", "image"],
     "contextWindow": 256000,
     "inputWindow": 256000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "gmodel",
@@ -123,7 +132,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 180000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "gfmodel",
@@ -134,7 +144,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 200000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "dmodel",
@@ -145,7 +156,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 200000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "dfmodel",
@@ -156,7 +168,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 200000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "mmodel",
@@ -166,7 +179,8 @@
     "input": ["text", "image"],
     "contextWindow": 200000,
     "inputWindow": 200000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   },
   {
     "id": "cmodel",
@@ -176,6 +190,7 @@
     "input": ["text", "image"],
     "contextWindow": 1000000,
     "inputWindow": 1000000,
-    "maxTokens": 32768
+    "maxTokens": 32768,
+    "contextTiers": [200000, 400000, 1000000]
   }
 ]

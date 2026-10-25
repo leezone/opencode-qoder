@@ -128,8 +128,8 @@ export function reportTierSwitch(
           ? `${unsupported.length} model(s) left unchanged (no such tier): ${unsupported.join(", ")}. `
           : "") +
         (refreshed
-          ? "The picker labels and compaction limits are reloading now."
-          : "Restart opencode to update the picker labels and limits.") +
+          ? "Requests use the tier from the next turn and the compaction limits are reloading now; the picker labels are a startup snapshot, so they only redraw after opencode restarts."
+          : "Restart opencode to update the picker labels and the compaction limits.") +
         routingNote(tier, region),
       data: {
         success: true,
@@ -178,8 +178,8 @@ export function reportTierSwitch(
     output:
       `This conversation now runs at the ${args.tier}-token tier on ${args.model} (was ${def.contextWindow}). ` +
       (refreshed
-        ? "The picker label and compaction limits are reloading now."
-        : "Restart opencode to update the picker label and limits.") +
+        ? "Requests use it from the next turn and the compaction limit is reloading now; the picker's context label is a startup snapshot, so it only redraws after opencode restarts."
+        : "Requests use it from the next turn; restart opencode to update the compaction limit and the picker's context label.") +
       routingNote(args.tier, region),
     data: { success: true, model: args.model, tier: args.tier, session: root || null },
   };
