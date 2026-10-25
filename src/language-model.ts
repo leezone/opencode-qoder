@@ -22,6 +22,7 @@ import {
 } from "./auth.js";
 import { type QoderRegion, resolveEndpoints, USER_AGENT } from "./constants.js";
 import { buildAuthHeaders } from "./cosy.js";
+import { collectToolNames, MarkupRepair } from "./dsml.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { readEnv } from "./env.js";
 import {
@@ -793,7 +794,7 @@ export class QoderLanguageModel implements LanguageModelV3 {
     }
 
     return {
-      stream: this.responseToStream(response, warnings, detachAbort),
+      stream: this.responseToStream(response, body, warnings, detachAbort),
       request: { body },
       response: { headers: Object.fromEntries(response.headers.entries()) },
     };
@@ -1000,6 +1001,7 @@ export class QoderLanguageModel implements LanguageModelV3 {
 
   private responseToStream(
     response: Response,
+    body: Record<string, unknown>,
     warnings: SharedV3Warning[],
     detachAbort: () => void,
   ): ReadableStream<LanguageModelV3StreamPart> {
@@ -1046,6 +1048,45 @@ export class QoderLanguageModel implements LanguageModelV3 {
           sawToolCall = true;
         };
 
+        // Native tool-call markup repair (see dsml.ts): the DeepSeek-family
+        // backends sometimes emit calls as ｜｜DSML｜｜ text instead of structured
+        // tool_calls. Active for every turn; permanently retired the moment a
+        // real structured call arrives (the repair must never override one).
+        const repair = new MarkupRepair(collectToolNames(body), true);
+        let repairActive = repair.enabled;
+
+        /** Emits a markup-restored call: complete args in one shot. */
+        const emitRepairedCall = (call: { name: string; arguments: string }): void => {
+          tagParser.finalize();
+          emitter.endReasoning();
+          const id = crypto.randomUUID();
+          controller.enqueue({ type: "tool-input-start", id, toolName: call.name });
+          controller.enqueue({ type: "tool-input-end", id });
+          controller.enqueue({
+            type: "tool-call",
+            toolCallId: id,
+            toolName: call.name,
+            input: call.arguments,
+          });
+          sawToolCall = true;
+        };
+
+        /** Content goes through the repair state machine, then the tag parser. */
+        const emitContent = (delta: string): void => {
+          if (!repairActive) {
+            tagParser.process(delta);
+            return;
+          }
+          const fed = repair.feed(delta);
+          if (fed.text) tagParser.process(fed.text);
+          for (const call of fed.calls) emitRepairedCall(call);
+          if (repair.converted > 0 || repair.rejected > 0) {
+            logPlugin(
+              `dsml: seen=${repair.seen} converted=${repair.converted} rejected=${repair.rejected}`,
+            );
+          }
+        };
+
         let truncatedByGuard = false;
         try {
           while (true) {
@@ -1080,7 +1121,7 @@ export class QoderLanguageModel implements LanguageModelV3 {
               if (!delta) continue;
 
               if (delta.reasoning_content) emitter.reasoning(delta.reasoning_content);
-              if (delta.content) tagParser.process(delta.content);
+              if (delta.content) emitContent(delta.content);
 
               // A tripped guard means the emitted tail went periodic: stop
               // reading upstream immediately, so the finally below cancels the
@@ -1092,6 +1133,15 @@ export class QoderLanguageModel implements LanguageModelV3 {
               }
 
               if (delta.tool_calls) {
+                // Real structured calls arrived: the repair layer must stop
+                // interpreting text (never override a genuine call). Bytes it
+                // is still holding go back through the tag parser verbatim.
+                if (repairActive) {
+                  const tail = repair.retire();
+                  repairActive = false;
+                  if (tail) tagParser.process(tail);
+                  logPlugin("dsml: structured tool_calls seen -- markup repair retired");
+                }
                 tagParser.finalize();
                 emitter.endReasoning();
                 for (const toolCallDelta of delta.tool_calls) {
@@ -1167,6 +1217,13 @@ export class QoderLanguageModel implements LanguageModelV3 {
               providerMetadata: { qoder: {} },
             });
           } else {
+            // Whatever the repair held back belongs to the text stream again
+            // (the guard-truncation branch deliberately skips this: that tail
+            // is periodic garbage the guard already made the call to drop).
+            if (repairActive) {
+              const tail = repair.flush();
+              if (tail) tagParser.process(tail);
+            }
             tagParser.finalize();
             emitter.closeOpenBlocks();
             for (const state of toolCalls) finishToolCall(state);
