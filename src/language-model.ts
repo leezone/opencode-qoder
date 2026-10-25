@@ -35,6 +35,7 @@ import {
 import { uploadQoderImage } from "./image-upload.js";
 import { logPlugin } from "./log.js";
 import { getModelDefinition, isValidContextTier } from "./model-catalog.js";
+import { REPETITION_MARKER, RepetitionGuard, repetitionGuardEnabled } from "./repetition-guard.js";
 import { getRoutingPolicy, resolveRouting } from "./routing-policy.js";
 import { resolveRootSession } from "./session-roots.js";
 import { getSelectedTier, getSessionTier } from "./tier-store.js";
@@ -197,12 +198,31 @@ class StreamEmitter {
   private textID: string | undefined;
   private reasoningID: string | undefined;
   private textIndex = 0;
+  // Loop guards for the two delta kinds; undefined when the guard is disabled
+  // for the process (QODER_REPETITION_GUARD). Fed at this choke point because
+  // every text and reasoning byte -- including the thinking-tag rerouting --
+  // passes through exactly here.
+  readonly textGuard?: RepetitionGuard;
+  readonly reasoningGuard?: RepetitionGuard;
 
-  constructor(private controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>) {}
+  constructor(
+    private controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+    guardEnabled: boolean,
+  ) {
+    if (guardEnabled) {
+      this.textGuard = new RepetitionGuard();
+      this.reasoningGuard = new RepetitionGuard();
+    }
+  }
+
+  get guardTripped(): boolean {
+    return this.textGuard?.tripped === true || this.reasoningGuard?.tripped === true;
+  }
 
   text(delta: string): void {
     if (!delta) return;
     this.endReasoning();
+    this.textGuard?.feed(delta);
     if (!this.textID) {
       this.textID = `txt-${this.textIndex++}`;
       this.controller.enqueue({ type: "text-start", id: this.textID });
@@ -218,6 +238,7 @@ class StreamEmitter {
 
   reasoning(delta: string): void {
     if (!delta) return;
+    this.reasoningGuard?.feed(delta);
     if (!this.reasoningID) {
       this.endText();
       this.reasoningID = "reasoning-0";
@@ -990,7 +1011,7 @@ export class QoderLanguageModel implements LanguageModelV3 {
         if (!reader) throw new Error("Qoder response body is empty");
 
         const decoder = new TextDecoder();
-        const emitter = new StreamEmitter(controller);
+        const emitter = new StreamEmitter(controller, repetitionGuardEnabled());
         const tagParser = new ThinkingTagParser(emitter);
         const toolCalls: ToolCallState[] = [];
         let buffer = "";
@@ -1025,6 +1046,7 @@ export class QoderLanguageModel implements LanguageModelV3 {
           sawToolCall = true;
         };
 
+        let truncatedByGuard = false;
         try {
           while (true) {
             const { done, value } = await reader.read();
@@ -1059,6 +1081,15 @@ export class QoderLanguageModel implements LanguageModelV3 {
 
               if (delta.reasoning_content) emitter.reasoning(delta.reasoning_content);
               if (delta.content) tagParser.process(delta.content);
+
+              // A tripped guard means the emitted tail went periodic: stop
+              // reading upstream immediately, so the finally below cancels the
+              // body and the model stops generating tokens for an answer that
+              // is already garbage.
+              if (emitter.guardTripped) {
+                truncatedByGuard = true;
+                break;
+              }
 
               if (delta.tool_calls) {
                 tagParser.finalize();
@@ -1111,17 +1142,41 @@ export class QoderLanguageModel implements LanguageModelV3 {
                 }
               }
             }
+            if (truncatedByGuard) break;
           }
 
-          tagParser.finalize();
-          emitter.closeOpenBlocks();
-          for (const state of toolCalls) finishToolCall(state);
-          controller.enqueue({
-            type: "finish",
-            finishReason: mapFinishReason(rawFinishReason, sawToolCall),
-            usage: usageFromQoder(rawUsage),
-            providerMetadata: { qoder: {} },
-          });
+          if (truncatedByGuard) {
+            const source = emitter.textGuard?.tripped ? "text" : "reasoning";
+            const chars = (source === "text" ? emitter.textGuard : emitter.reasoningGuard)
+              ?.charsSeen;
+            logPlugin(
+              `repetition guard: ${source} output went periodic after ~${chars} chars ` +
+                `(model ${modelID}) -- truncating the stream`,
+            );
+            emitter.closeOpenBlocks();
+            // Keep the stream well-formed: close any tool call already open.
+            for (const state of toolCalls) {
+              if (state.started && !state.finished) finishToolCall(state);
+            }
+            emitter.text(REPETITION_MARKER);
+            emitter.closeOpenBlocks();
+            controller.enqueue({
+              type: "finish",
+              finishReason: { unified: "length", raw: "repetition" },
+              usage: usageFromQoder(rawUsage),
+              providerMetadata: { qoder: {} },
+            });
+          } else {
+            tagParser.finalize();
+            emitter.closeOpenBlocks();
+            for (const state of toolCalls) finishToolCall(state);
+            controller.enqueue({
+              type: "finish",
+              finishReason: mapFinishReason(rawFinishReason, sawToolCall),
+              usage: usageFromQoder(rawUsage),
+              providerMetadata: { qoder: {} },
+            });
+          }
           controller.close();
         } catch (error) {
           controller.enqueue({ type: "error", error });
