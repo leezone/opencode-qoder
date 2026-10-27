@@ -156,7 +156,15 @@ function transformAssistantMessage(
 
   for (const part of message.content) {
     if (part.type === "text") content += part.text;
-    if (part.type === "reasoning") content += `<thinking>${part.text}</thinking>\n\n`;
+    // Reasoning parts are deliberately NOT replayed.
+    //
+    // They used to be re-sent as `<thinking>…</thinking>` inside content, which
+    // taught the model this markup: Qoder's backends then echoed it back on the
+    // CONTENT channel, and the gateway's own marker handling swallowed half of
+    // it -- stored sessions are full of turns whose text starts with a bare
+    // "<thinking" or ends with an orphan "</thinking>". DeepSeek's API also
+    // forbids sending reasoning_content back. The thought is gone either way;
+    // what matters is not modelling the tag style we then have to scrub.
     if (part.type === "tool-call") {
       toolCalls.push({
         id: part.toolCallId,

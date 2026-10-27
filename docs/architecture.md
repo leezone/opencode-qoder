@@ -27,6 +27,7 @@ src/
 ├── cosy.ts               # COSY 请求签名（RSA/AES/机器 ID）
 ├── encoding.ts           # Qoder 自定义 base64 编码（WAF 绕过）
 ├── transform.ts          # AI SDK prompt → Qoder 网关请求体转换
+├── scratchpad.ts         # 思考标记修复：剥离网关漏出来的标记碎片 / 裸开标签重定向
 ├── image-upload.ts       # 图片发布到 center 服务换取 URL（失败回落 base64）
 ├── model-catalog.ts      # 动态模型发现，三级缓存
 ├── static-models.ts      # 静态模型回退表加载
@@ -492,6 +493,30 @@ Qoder 的请求体不带栅格字节：客户端把每张图**发布一次**到 
 
 契约是**失败即降级**：上传任何异常都回落到 inline data URL，绝不让上传失败演变成对话失败。
 
+### 12.7 为什么正文里要剥思考标记、又为什么默认猜裸开标签？
+
+Qoder 的 DeepSeek 系后端**不保证**把思考放进 `reasoning_content`。存下来的会话里，
+dfmodel 有 101/983 个 text part 以伪标签开头（`<reading>` 27、`<knowledge>` 12、
+`<parameter name="…">` 11、裸 `<thinking` 2…），这些 turn 的 `tokens.reasoning` 全是 0
+——上游根本没归类，整段 scratchpad 从 content 通道出来了。而且标记本身是残缺的：
+网关在切通道时把自己的标记吃掉了一半（`<thinking` 的 `>` 没了，或只剩一个孤儿
+`</thinking>`，qfmodel 有 459 例）。
+
+`ThinkingTagParser` 只能切**成对**的 4 个已知变体，剩下三种残片它是无能为力的，
+于是原样渲染进正文。`scratchpad.ts` 补的就是这三种：
+
+- **孤儿闭合标签 → 直接剥掉**（正文里出现 `</thinking>` 永远是垃圾）；
+- **裸开标签 → 剥掉碎片，正文保留**；
+- **只开不闭 → 按思考处理**（`QODER_SCRATCHPAD_GUESS`，默认启用）。
+
+默认启用的取舍是刻意的：只开不闭的 turn 观察到的都是纯 scratchpad 后跟一次工具调用，
+按思考处理不丢任何用户可见内容；反过来（答案粘在未闭合的思考后面）只会丢掉那一段散文，
+工具调用照样发出。关掉它退回"整段思考当答案显示"，那才是更差的一边。
+
+同时 `transform.ts` 不再把历史 reasoning 渲染成 `<thinking>…</thinking>` 塞回 content：
+那样等于每轮都在教模型这套标记（DeepSeek 官方也禁止回传 `reasoning_content`）。
+反引号/代码块里的标记不动——答案本身在讨论这些标签时，删掉讨论对象比泄漏更糟。
+
 ## 13. 环境变量
 
 | 变量 | 用途 | 默认值 |
@@ -507,6 +532,8 @@ Qoder 的请求体不带栅格字节：客户端把每张图**发布一次**到 
 | `QODER_STATIC_MODELS` | 自定义静态模型表 | - |
 | `OPENCODE_QODER_LOG_FILE` | 诊断日志路径 | - |
 | `QODER_REASONING_EFFORT` | 覆盖 thinking 强度（先于选项生效） | - |
+| `QODER_SCRATCHPAD_GUESS` | 裸开标签（`<thinking` 缺 `>`）当思考起点处理；`0|off|false` 关闭 | 启用 |
+| `QODER_REPETITION_GUARD` | 重复输出截断；`0|off|false` 关闭 | 启用 |
 | `OPENCODE_QODER_CLAIM` | 每日活动开关（每次调用读取，不缓存） | 启用 |
 | `QODER_DISABLE_BUNDLED_SKILL` | 禁用内置 skill | - |
 
@@ -534,6 +561,7 @@ src/__tests__/
 ├── region-isolation.test.ts     # 区域隔离（端点/状态文件/共享键/存储）
 ├── quota.test.ts                # 配额
 ├── routing-policy.test.ts       # 路由策略
+├── scratchpad.test.ts           # 思考标记碎片剥离 + 裸开标签识别
 ├── session-roots.test.ts        # 会话根
 ├── static-models.test.ts        # 静态模型
 ├── stream.test.ts               # SSE 流解析
@@ -543,7 +571,7 @@ src/__tests__/
 └── xdg-paths.test.ts            # XDG 路径
 ```
 
-共 229 个用例。运行测试：`pnpm test`
+共 281 个用例。运行测试：`pnpm test`
 
 ## 15. 构建与发布
 

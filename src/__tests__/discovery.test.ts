@@ -40,7 +40,7 @@ describe("assistant content regression (Kimi 400)", () => {
     expect(assistant!.tool_calls).toHaveLength(1);
   });
 
-  it("still keeps reasoning+text prose in the content", async () => {
+  it("drops reasoning instead of replaying it as <thinking> markup", async () => {
     const prompt: LanguageModelV3Prompt = [
       {
         role: "assistant",
@@ -51,7 +51,7 @@ describe("assistant content regression (Kimi 400)", () => {
       },
     ];
     const { messages } = await transformPrompt(prompt);
-    expect(messages[0].content).toBe("<thinking>hmm</thinking>\n\ndoing it");
+    expect(messages[0].content).toBe("doing it");
   });
 });
 

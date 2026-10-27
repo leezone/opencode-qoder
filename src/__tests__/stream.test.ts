@@ -227,6 +227,94 @@ describe("doStream: thinking-tag extraction", () => {
   });
 });
 
+describe("doStream: scratchpad marker repair", () => {
+  afterEach(() => {
+    delete process.env.QODER_SCRATCHPAD_GUESS;
+  });
+
+  it("reroutes an unclosed opener's scratchpad to reasoning", async () => {
+    // Stored shape (dfmodel, 2026-10-27): the gateway ate the ">" of the open
+    // tag and never sent a close tag, so the whole scratchpad landed in
+    // `content` with `tokens.reasoning` = 0 and rendered as the answer body.
+    const parts = await collect([
+      envelope({ choices: [{ delta: { content: "<thinkingThere IS a web dist." } }] }),
+      envelope({ choices: [{ delta: { content: "\n\nLet me check the run dir." } }] }),
+      envelope({ choices: [{ finish_reason: "stop" }] }),
+    ]);
+
+    expect(of(parts, "text-delta")).toHaveLength(0);
+    expect(
+      of(parts, "reasoning-delta")
+        .map((part) => ("delta" in part ? part.delta : ""))
+        .join(""),
+    ).toBe("There IS a web dist.\n\nLet me check the run dir.");
+  });
+
+  it("reroutes a complete opener of a name the tag parser does not know", async () => {
+    const parts = await collect([
+      envelope({ choices: [{ delta: { content: "<reading>Confirmed: the service is gone." } }] }),
+      envelope({ choices: [{ finish_reason: "stop" }] }),
+    ]);
+
+    expect(of(parts, "text-delta")).toHaveLength(0);
+    expect(
+      of(parts, "reasoning-delta")
+        .map((part) => ("delta" in part ? part.delta : ""))
+        .join(""),
+    ).toBe("Confirmed: the service is gone.");
+  });
+
+  it("closes a known scratchpad block and keeps the answer", async () => {
+    const parts = await collect([
+      envelope({ choices: [{ delta: { content: "<reading>looked at it</reading>Done." } }] }),
+      envelope({ choices: [{ finish_reason: "stop" }] }),
+    ]);
+
+    expect(
+      of(parts, "text-delta")
+        .map((part) => ("delta" in part ? part.delta : ""))
+        .join(""),
+    ).toBe("Done.");
+    expect(
+      of(parts, "reasoning-delta")
+        .map((part) => ("delta" in part ? part.delta : ""))
+        .join(""),
+    ).toBe("looked at it");
+  });
+
+  it("scrubs the fragment when the guess is switched off", async () => {
+    process.env.QODER_SCRATCHPAD_GUESS = "0";
+    const parts = await collect([
+      envelope({ choices: [{ delta: { content: "<thinkingThere IS a web dist." } }] }),
+      envelope({ choices: [{ finish_reason: "stop" }] }),
+    ]);
+
+    // No reclassification, but the raw marker fragment never reaches the body.
+    expect(of(parts, "reasoning-delta")).toHaveLength(0);
+    expect(
+      of(parts, "text-delta")
+        .map((part) => ("delta" in part ? part.delta : ""))
+        .join(""),
+    ).toBe("There IS a web dist.");
+  });
+
+  it("drops an orphan closing tag from the answer body", async () => {
+    // qfmodel shape: the thought came over reasoning_content, but the gateway
+    // left its closing marker on the content channel.
+    const parts = await collect([
+      envelope({ choices: [{ delta: { reasoning_content: "search path is wrong" } }] }),
+      envelope({ choices: [{ delta: { content: "查真实搜索路由：</thinking>\n" } }] }),
+      envelope({ choices: [{ finish_reason: "stop" }] }),
+    ]);
+
+    expect(
+      of(parts, "text-delta")
+        .map((part) => ("delta" in part ? part.delta : ""))
+        .join(""),
+    ).toBe("查真实搜索路由：\n");
+  });
+});
+
 describe("doStream: tool-call state machine", () => {
   it("adopts a late upstream id and flushes buffered argument deltas", async () => {
     // Qoder's Kimi adapter delivers the id in a later chunk than the name.

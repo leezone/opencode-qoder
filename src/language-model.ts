@@ -38,6 +38,7 @@ import { logPlugin } from "./log.js";
 import { getModelDefinition, isValidContextTier } from "./model-catalog.js";
 import { REPETITION_MARKER, RepetitionGuard, repetitionGuardEnabled } from "./repetition-guard.js";
 import { getRoutingPolicy, resolveRouting } from "./routing-policy.js";
+import { leadingScratchpadOpen, MarkerScrubber, scratchpadGuessEnabled } from "./scratchpad.js";
 import { resolveRootSession } from "./session-roots.js";
 import { getSelectedTier, getSessionTier } from "./tier-store.js";
 import {
@@ -199,6 +200,10 @@ class StreamEmitter {
   private textID: string | undefined;
   private reasoningID: string | undefined;
   private textIndex = 0;
+  // Stray scratchpad marker fragments (see scratchpad.ts) are cut here: every
+  // text byte -- including the thinking-tag rerouting below -- passes through
+  // text(), and the scrubber may hold a trailing partial marker across deltas.
+  private readonly scrubber = new MarkerScrubber();
   // Loop guards for the two delta kinds; undefined when the guard is disabled
   // for the process (QODER_REPETITION_GUARD). Fed at this choke point because
   // every text and reasoning byte -- including the thinking-tag rerouting --
@@ -220,9 +225,19 @@ class StreamEmitter {
     return this.textGuard?.tripped === true || this.reasoningGuard?.tripped === true;
   }
 
+  /** Stray scratchpad marker fragments cut out of the answer body. */
+  get scrubbed(): number {
+    return this.scrubber.dropped;
+  }
+
   text(delta: string): void {
     if (!delta) return;
     this.endReasoning();
+    this.pushText(this.scrubber.feed(delta));
+  }
+
+  private pushText(delta: string): void {
+    if (!delta) return;
     this.textGuard?.feed(delta);
     if (!this.textID) {
       this.textID = `txt-${this.textIndex++}`;
@@ -232,6 +247,9 @@ class StreamEmitter {
   }
 
   endText(): void {
+    // Whatever the scrubber still holds is answer text after all; emit it
+    // before closing so a fragment-adjacent tail is never lost.
+    this.pushText(this.scrubber.flush());
     if (!this.textID) return;
     this.controller.enqueue({ type: "text-end", id: this.textID });
     this.textID = undefined;
@@ -265,6 +283,11 @@ class ThinkingTagParser {
   private inThinking = false;
   private thinkingExtracted = false;
   private activeEndTag = THINKING_TAG_VARIANTS[0].close;
+  // Nothing has been emitted yet: only here may a *bare* opener ("<thinking"
+  // with the ">" eaten by the gateway) be read as the start of a scratchpad.
+  // Mid-answer it is left to MarkerScrubber, which drops the fragment without
+  // reclassifying prose the user is already reading.
+  private atStart = true;
 
   constructor(private emitter: StreamEmitter) {}
 
@@ -301,6 +324,27 @@ class ThinkingTagParser {
   }
 
   private processBeforeThinking(): void {
+    if (this.atStart && scratchpadGuessEnabled()) {
+      const leading = leadingScratchpadOpen(this.textBuffer);
+      if (leading === "partial") return; // ends inside the marker: hold
+      // A complete <thinking>/<think>/… is the variant scan's own job (below);
+      // this branch exists for the bare and unknown-name leftovers.
+      const knownVariant =
+        leading !== undefined &&
+        !leading.bare &&
+        THINKING_TAG_VARIANTS.some((variant) => variant.open === `<${leading.name}>`);
+      if (leading && !knownVariant) {
+        logPlugin(
+          `scratchpad: content opens with ${JSON.stringify(this.textBuffer.slice(0, leading.length))} -- routing to reasoning`,
+        );
+        this.textBuffer = this.textBuffer.slice(leading.length);
+        this.activeEndTag = leading.close;
+        this.inThinking = true;
+        this.atStart = false;
+        return;
+      }
+    }
+
     let bestPos = -1;
     let bestVariant: (typeof THINKING_TAG_VARIANTS)[number] | undefined;
     for (const variant of THINKING_TAG_VARIANTS) {
@@ -316,11 +360,13 @@ class ThinkingTagParser {
       this.textBuffer = this.textBuffer.slice(bestPos + bestVariant.open.length);
       this.activeEndTag = bestVariant.close;
       this.inThinking = true;
+      this.atStart = false;
       return;
     }
 
     // Never emit a trailing fragment that could be the start of a tag we have
     // not seen the beginning of yet.
+    const before = this.textBuffer.length;
     this.flushSafePrefix(
       getMaxTrailingPossibleTagPrefixLength(
         this.textBuffer,
@@ -328,6 +374,7 @@ class ThinkingTagParser {
       ),
       (text) => this.emitter.text(text),
     );
+    if (this.textBuffer.length < before) this.atStart = false;
   }
 
   // Emit everything except the last `tailLength` chars, which may still turn
@@ -1226,6 +1273,11 @@ export class QoderLanguageModel implements LanguageModelV3 {
             }
             tagParser.finalize();
             emitter.closeOpenBlocks();
+            if (emitter.scrubbed > 0) {
+              logPlugin(
+                `scratchpad: dropped ${emitter.scrubbed} stray marker fragment(s) from the answer body`,
+              );
+            }
             for (const state of toolCalls) finishToolCall(state);
             controller.enqueue({
               type: "finish",

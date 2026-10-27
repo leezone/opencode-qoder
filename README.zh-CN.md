@@ -111,6 +111,8 @@ credit 倍率、上下文档位与思考档位来自线上发现（下一节）�
 | `QODER_MODEL_DISK_CACHE` | 覆盖磁盘缓存路径 |
 | `QODER_STATIC_MODELS` | 指向自定义静态兜底表（JSON）的路径 |
 | `OPENCODE_QODER_LOG_FILE` | 将诊断信息（credit 配额、目录刷新）追加到该路径。默认未设置，即不记录任何日志 |
+| `QODER_SCRATCHPAD_GUESS` | 答案开头出现裸思考标记（`<thinking` 的 `>` 被网关吃掉）时按思考处理。默认启用，`0`/`off`/`false` 关闭 |
+| `QODER_REPETITION_GUARD` | 截断进入重复循环的响应。默认启用，`0`/`off`/`false` 关闭 |
 
 ## 工具与技能
 

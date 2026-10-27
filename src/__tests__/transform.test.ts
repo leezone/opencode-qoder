@@ -35,7 +35,9 @@ describe("transformPrompt", () => {
         { role: "user", content: "hi" },
         {
           role: "assistant",
-          content: "<thinking>thinking</thinking>\n\nI will call a tool.",
+          // The reasoning part is dropped, not replayed as "<thinking>…":
+          // re-sending it taught the model the markup we then had to scrub.
+          content: "I will call a tool.",
           tool_calls: [
             {
               id: "call_1",
