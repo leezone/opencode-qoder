@@ -37,6 +37,10 @@ for (const key of [
   "QODER_MODEL_LIST_URL",
   "QODER_REASONING_EFFORT",
   "QODER_STATIC_MODELS",
+  // The client version is signed into every request, and an operator override
+  // in the runner's shell would silently win over every fixture expectation.
+  "QODER_CLIENT_VERSION",
+  "QODER_CLIENT_VERSION_CACHE",
 ]) {
   delete process.env[key];
 }

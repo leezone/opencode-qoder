@@ -26,6 +26,7 @@ import {
 // nothing here is on the model/chat/quota path, and claimDisabled() removes both
 // tools and the campaign skill in one switch. See claim.ts for the contract.
 import { claimDisabled, reportCampaigns, runClaim } from "./claim.js";
+import { refreshClientVersion, resolveClientVersion } from "./client-version.js";
 import { nonEmptyString } from "./coerce.js";
 import {
   PROVIDER_ID,
@@ -733,12 +734,29 @@ async function setupV2(ctx: PluginContext, region: QoderRegion): Promise<void> {
   onCredentialsCaptured = forceRefresh;
   // Published for the legacy instance's tools (see triggerCatalogRefresh).
   writeShared(refreshTriggerKey(region), forceRefresh);
+  // Client version first, then the catalog: the model list is filtered by the
+  // version we claim (a model whose minimal_version.cli is above it is simply
+  // absent), so refreshing the catalog before the version settles would fetch
+  // the old, narrower list and cache it for a whole TTL. Both run off the same
+  // warmup tick and neither blocks setup(), so the first request still signs
+  // with a concrete known-good version -- the probe only ever upgrades it.
   const warm = setTimeout(() => {
-    refreshCatalog(true).catch(logRefreshFailure);
+    refreshClientVersion()
+      .then(() => refreshCatalog(true))
+      .catch(logRefreshFailure);
   }, 0);
   warm.unref?.();
+  // One timer for both: the version probe is cheap and self-throttling (its own
+  // day-long TTL, so most ticks do no network at all), and running it on a
+  // SEPARATE interval would double the catalog refreshes for no reason. A
+  // version bump is the one thing that must escalate to a forced reload -- the
+  // list the endpoint returned was filtered by the old value, so the normal TTL
+  // path would keep serving the narrower catalog for another hour.
   const timer = setInterval(() => {
-    refreshCatalog(false).catch(logRefreshFailure);
+    const before = resolveClientVersion();
+    refreshClientVersion()
+      .then((after) => refreshCatalog(after !== before))
+      .catch(logRefreshFailure);
   }, REFRESH_INTERVAL_MS);
   timer.unref?.();
   // The live key-file check. Much faster cadence than the catalog refresh

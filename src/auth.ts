@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
+import { resolveClientVersion } from "./client-version.js";
 import { text } from "./coerce.js";
 import {
   DEVICE_TOKEN_TTL_SECONDS,
@@ -8,7 +9,6 @@ import {
   QODER_DEFAULT_NAME,
   QODER_DEFAULT_USER_ID,
   QODER_PAT_ENV,
-  QODER_VERSION,
   type QoderRegion,
   REFRESH_SKEW_MS,
   resolveEndpoints,
@@ -307,7 +307,7 @@ export function withProfileDefaults(profile: { userID?: string; email?: string; 
 function openApiHeaders(token?: string): Record<string, string> {
   return jsonHeaders({
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    "Cosy-Version": QODER_VERSION,
+    "Cosy-Version": resolveClientVersion(),
     "Cosy-ClientType": QODER_CLIENT_TYPE,
   });
 }

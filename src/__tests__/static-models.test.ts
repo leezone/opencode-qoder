@@ -86,18 +86,24 @@ describe("static models", () => {
     vi.resetModules();
   });
 
-  it("ships 17 entries and excludes the retired preview ids", async () => {
+  it("ships 18 entries and excludes the retired preview ids", async () => {
     // The prefab mirrors the live list. qmodel_preview and gm51model are no
     // longer advertised upstream, so they must not reappear through the fallback
     // path either -- the picker should never offer an unpriced model.
     // Cantus is a frontier model that was added to the bundled prefab.
     const mod = await reload();
     const ids = mod.QODER_MODELS.map((model) => model.id);
-    expect(mod.QODER_MODELS).toHaveLength(17);
+    expect(mod.QODER_MODELS).toHaveLength(18);
     expect(ids).not.toContain("qmodel_preview");
     expect(ids).not.toContain("gm51model");
     expect(ids).toContain("auto");
     expect(ids).toContain("cmodel");
+    // `fast` is gated server-side on minimal_version.cli 1.1.70, and it is the
+    // whole reason the client version is no longer pinned to a literal. If the
+    // live probe or the catalog fails, the fallback table still has to offer
+    // it -- otherwise a discovery outage silently hides a model the account can
+    // use, which is the exact bug the version bump fixed.
+    expect(ids).toContain("fast");
   });
 
   it("ships entries that each pass the same validator a hand-edit must pass", async () => {
@@ -123,7 +129,7 @@ describe("static models", () => {
     writeFileSync(file, "{ this is not json");
     process.env.QODER_STATIC_MODELS = file;
     const mod = await reload();
-    expect(mod.QODER_MODELS).toHaveLength(17);
+    expect(mod.QODER_MODELS).toHaveLength(18);
     expect(mod.STATIC_MODELS_ORIGIN).toBe("shipped");
   });
 

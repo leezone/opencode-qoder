@@ -4,12 +4,12 @@ import {
   regionOf,
   resolveQoderCredentials,
 } from "./auth.js";
+import { resolveClientVersion } from "./client-version.js";
 import { nonEmptyString, text } from "./coerce.js";
 import {
   QODER_CLAIM_ENV,
   QODER_CLAIM_TIMEOUT_MS,
   QODER_CLIENT_TYPE,
-  QODER_VERSION,
   type QoderRegion,
   resolveEndpoints,
   stateFiles,
@@ -440,7 +440,7 @@ function buildCampaignHeaders(
   return {
     Accept: "application/json",
     Authorization: `Bearer ${credentials.access}`,
-    "Cosy-Version": QODER_VERSION,
+    "Cosy-Version": resolveClientVersion(),
     "Cosy-ClientType": QODER_CLIENT_TYPE,
     "Cosy-MachineId": machineId,
     "Cosy-Machinetoken": machineId,

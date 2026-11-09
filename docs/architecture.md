@@ -426,7 +426,7 @@ Qoder 网关要求请求体经过特殊签名，防止 WAF 拦截：
      version: "v2",
      requestId: UUID,
      info: AES-128-CBC(用户信息),
-     cosyVersion: "1.1.42",
+     cosyVersion: resolveClientVersion(),   // 见 client-version.ts
      ideVersion: "1.0.0"
    }
 
@@ -448,7 +448,7 @@ Qoder 网关要求请求体经过特殊签名，防止 WAF 拦截：
 
 4. 请求头：
    Authorization: Bearer <job_token>
-   Cosy-Version: 1.1.42
+   Cosy-Version: <resolveClientVersion()>
    Cosy-Clienttype: 5
    X-Request-Id: UUID
    AI-CLIENT-TIMESTAMP: <unix_seconds>
@@ -530,6 +530,8 @@ dfmodel 有 101/983 个 text part 以伪标签开头（`<reading>` 27、`<knowle
 | `QODER_MODEL_CACHE_SECONDS` | 模型缓存 TTL | 3600 |
 | `QODER_MODEL_DISK_CACHE` | 覆盖磁盘缓存路径 | - |
 | `QODER_STATIC_MODELS` | 自定义静态模型表 | - |
+| `QODER_CLIENT_VERSION` | 覆盖请求签名的 `Cosy-Version`（跳过联网探测） | - |
+| `QODER_CLIENT_VERSION_CACHE` | 覆盖版本号缓存路径 | `~/.cache/opencode/opencode-qoder-client-version.json` |
 | `OPENCODE_QODER_LOG_FILE` | 诊断日志路径 | - |
 | `QODER_REASONING_EFFORT` | 覆盖 thinking 强度（先于选项生效） | - |
 | `QODER_SCRATCHPAD_GUESS` | 裸开标签（`<thinking` 缺 `>`）当思考起点处理；`0|off|false` 关闭 | 启用 |

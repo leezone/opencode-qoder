@@ -114,6 +114,8 @@ Model names carry Qoder's credit multiplier, e.g. `(0.5x)`. Once credits run out
 | `QODER_MODEL_CACHE_SECONDS` | Catalog TTL in seconds (default: 3600) |
 | `QODER_MODEL_DISK_CACHE` | Override the disk cache path |
 | `QODER_STATIC_MODELS` | Path to a custom static fallback table (JSON) |
+| `QODER_CLIENT_VERSION` | Override the `Cosy-Version` sent on requests (skips the registry probe) |
+| `QODER_CLIENT_VERSION_CACHE` | Override the client-version cache path |
 | `OPENCODE_QODER_LOG_FILE` | Append diagnostics (credit quota, catalog refreshes) to this path. Unset by default, which logs nothing |
 | `QODER_SCRATCHPAD_GUESS` | Treat a bare scratchpad opener (`<thinking` with its `>` eaten by the gateway) at the start of an answer as reasoning. On by default; `0`/`off`/`false` disables |
 | `QODER_REPETITION_GUARD` | Cut a response that has gone periodic. On by default; `0`/`off`/`false` disables |

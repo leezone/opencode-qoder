@@ -7,8 +7,9 @@ import {
   resolveQoderCredentials,
   storedConnectionToken,
 } from "./auth.js";
+import { clientVersionCachePath, describeClientVersion } from "./client-version.js";
 import { text } from "./coerce.js";
-import { QODER_PAT_ENV, QODER_VERSION, type QoderRegion, REFRESH_SKEW_MS } from "./constants.js";
+import { QODER_PAT_ENV, type QoderRegion, REFRESH_SKEW_MS } from "./constants.js";
 import { readEnv } from "./env.js";
 import { describeKeyFile } from "./key-file.js";
 import { errorMessage, logPlugin } from "./log.js";
@@ -300,7 +301,8 @@ export function renderCatalog(
     `bundled table ${QODER_MODELS.length} entries (origin=${STATIC_MODELS_ORIGIN})`,
     `disk cache    ${catalogCachePath(region)}`,
     `discovery     ${discoveryDisabled() ? "DISABLED (QODER_DISABLE_MODEL_DISCOVERY)" : "on"}`,
-    `client ver    ${QODER_VERSION} (pinned to qodercli's)`,
+    `client ver    ${describeClientVersion()}`,
+    `version cache ${clientVersionCachePath()}`,
   ];
   if (status.lastError) lines.push(`last error    ${status.lastError}`);
   return lines.join("\n");

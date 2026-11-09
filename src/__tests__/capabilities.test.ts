@@ -141,7 +141,7 @@ describe("renderCatalog", () => {
     };
     const text = renderCatalog(status);
     expect(text).toContain("source        cache");
-    expect(text).toContain("bundled table 17 entries");
+    expect(text).toContain("bundled table 18 entries");
     expect(text).toContain("disk cache    ");
     expect(text).toContain("discovery     on");
   });

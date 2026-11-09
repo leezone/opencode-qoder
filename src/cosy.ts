@@ -2,7 +2,8 @@ import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { QODER_CLIENT_TYPE, QODER_VERSION, type QoderRegion, stateFiles } from "./constants.js";
+import { resolveClientVersion } from "./client-version.js";
+import { QODER_CLIENT_TYPE, type QoderRegion, stateFiles } from "./constants.js";
 import { legacyOpencodeDataFile, opencodeDataFile } from "./json-store.js";
 
 const qoderRSAPublicKey = `-----BEGIN PUBLIC KEY-----
@@ -134,12 +135,17 @@ export function buildAuthHeaders(
   const cosyKey = rsaEncryptBase64(aesKey);
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const requestId = crypto.randomUUID();
+  // Read ONCE: the version appears twice on this request (the signed payload
+  // and the header), and the two must agree or the signature covers a different
+  // claim than the one the gateway gates models on. A local also makes it
+  // obvious that adding an await below cannot split the pair.
+  const clientVersion = resolveClientVersion();
 
   const cosyPayload: CosyPayload = {
     version: "v1",
     requestId,
     info: infoB64,
-    cosyVersion: QODER_VERSION,
+    cosyVersion: clientVersion,
     ideVersion: "",
   };
 
@@ -162,7 +168,7 @@ export function buildAuthHeaders(
     "Cosy-Key": cosyKey,
     "Cosy-User": creds.userID,
     "Cosy-Date": timestamp,
-    "Cosy-Version": QODER_VERSION,
+    "Cosy-Version": clientVersion,
     "Cosy-Machineid": machineID,
     "Cosy-Machinetoken": machineID,
     "Cosy-Machinetype": QoderMachineTypeMagic,

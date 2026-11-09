@@ -249,15 +249,19 @@ export const FETCH_TIMEOUT_MS = 15 * 1000;
 // surface (cosy.ts: header + signed payload field) and the openapi.qoder.sh
 // JSON calls (auth.ts) both consume it.
 //
-// Value pinned to the reference client by reading qodercli's own bundle: it sets
-// `Cosy-Version = <its package version>` (ItA = BSA || "1.1.42") and uses that
-// single value everywhere it injects identity headers — there is no 1.0.x in the
-// real client. The token-exchange POSTs don't send Cosy-Version at all, so it is
-// advisory/telemetry: nothing here gates on it, but matching a current real
-// client is the safe default. Earlier values (1.0.0 on COSY, 1.0.1 on openapi)
-// were stale guesses. Bump this to track qodercli when convenient; it is not a
-// correctness dependency.
-export const QODER_VERSION = "1.1.42";
+// The version is NOT a constant any more: client-version.ts resolves it from
+// QODER_CLIENT_VERSION, then the npm registry's dist-tags for qodercli, then a
+// shipped default -- see resolveClientVersion(). It is a live gate, not
+// telemetry: the model list endpoint filters out entries whose
+// `minimal_version.cli` is above the value sent here, which is why the old
+// literal 1.1.42 hid the `fast` tier from the picker. Callers must read the
+// version at REQUEST time rather than capturing it at import, or a probe that
+// lands later in the same process would never take effect.
+//
+// QODER_CLIENT_TYPE stays a constant: the server accepts 5 (cli) and answered
+// identically for 0 (ide) and 1/3/6/7 in testing, so there is nothing to
+// discover. 5 is what qodercli reports and what every request here has always
+// sent.
 export const QODER_CLIENT_TYPE = "5";
 
 // The model-definition shape shared by the static fallback table
