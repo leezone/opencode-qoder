@@ -47,6 +47,15 @@ import { reportPatAdd, reportPatList, reportPatRemove, reportPatSwitch } from ".
 import { forgetSession, recordSessionParent } from "./session-roots.js";
 import { reportRoutingPolicy, reportTierList, reportTierSwitch } from "./tier-tools.js";
 
+// V2 resolves an AI-SDK provider only when its package carries the `aisdk:`
+// prefix (see AISDKNative.isAISDK in opencode v2.4). Without it the host treats
+// the package as a native @opencode/ai provider and demands model(modelID,
+// settings) return a V2-native LanguageModel -- which is why a plain file://
+// package failed with "Schema validation failed". Marking it aisdk: routes the
+// model through V2's AISDK bridge, where our sdk/language hooks install
+// QoderLanguageModel (an AI SDK v3 language model).
+const SDK_PACKAGE = "aisdk:opencode-qoder";
+
 type Options = Record<string, unknown>;
 type ToolResult = {
   content: string;
@@ -398,7 +407,7 @@ function modelConfigV2(model: DiscoveredModel, region: QoderRegion): Record<stri
     api: {
       id: model.id,
       type: "aisdk",
-      package: import.meta.url,
+      package: SDK_PACKAGE,
       url: resolveEndpoints(region).baseUrl,
       settings: {},
     },
@@ -451,7 +460,7 @@ export async function setupV24(
       // V2 provider carries the SDK package directly; the model-level api below
       // carries the same package plus the base URL, which is what the host reads
       // when resolving the language model.
-      provider.package = import.meta.url;
+      provider.package = SDK_PACKAGE;
       provider.body = {};
       provider.headers = {};
       provider.settings = {};
@@ -471,6 +480,21 @@ export async function setupV24(
 
   registerToolsV2(ctx, region, campaignSpecs);
   registerBundledSkillsV2(ctx, campaignDir);
+
+  // The sdk hook supplies a provider SDK with a languageModel() factory. V2's
+  // AISDK bridge calls it when a language hook does not override the model; it
+  // is also the place the host validates that an AISDK provider actually
+  // returned something usable. Our factory produces the same signed model.
+  await ctx.aisdk.hook(
+    "sdk",
+    (event) => {
+      if (event.model.providerID !== id) return;
+      event.sdk = {
+        languageModel: (modelID: string) => new QoderLanguageModel(modelID, event.options as never),
+      };
+    },
+    { providerID: id },
+  );
 
   await ctx.aisdk.hook(
     "language",

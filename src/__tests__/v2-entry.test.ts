@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { definePlugin } from "../index.js";
+import { definePlugin, model as modelFactory } from "../index.js";
+
+// The fake contexts below only need the transform callbacks to run. A loose
+// editor shape keeps the fixtures readable without importing V2 host internals.
+type Editor = Record<string, (...args: never[]) => unknown> & {
+  update?: (id: string, mutate: (draft: Record<string, string>) => void) => void;
+  default?: { set: (...args: never[]) => void };
+  method?: { update: (...args: never[]) => void };
+};
 
 // One package ships two plugin contracts: OpenCode 1 calls `server()` and its
 // own `setup()` with a catalog-style context; OpenCode 2 calls only `setup()`
@@ -24,6 +32,54 @@ describe("dual V1/V2 plugin entry", () => {
     expect(plugin.id).toBe("opencode-qoder");
     expect(typeof plugin.setup).toBe("function");
     expect(typeof plugin.server).toBe("function");
+  });
+
+  it("exports model(modelID, settings) returning a v3 language model", () => {
+    // OpenCode 2 loads a provider package by calling its `model` export. A
+    // missing one fails before the aisdk language hook can run with
+    // "Provider package ... does not export model(modelID, settings)".
+    expect(typeof modelFactory).toBe("function");
+    const language = modelFactory("efficient", {});
+    expect(language.modelId).toBe("efficient");
+    expect(language.specificationVersion).toBe("v3");
+  });
+
+  it("registers the provider as an AISDK package", async () => {
+    // V2 only bridges AI SDK models when the package carries the `aisdk:`
+    // prefix. A plain file:// package is treated as a native provider and
+    // fails schema validation ("Schema validation failed"), which is why the
+    // package constant must keep this prefix.
+    let registeredPackage = "";
+    const rec = () => Promise.resolve();
+    const ctx = {
+      options: {},
+      provider: {
+        transform: async (cb: (e: Editor) => void) =>
+          cb({
+            update: (_id: string, mutate: (draft: Record<string, string>) => void) => {
+              const draft: Record<string, string> = { package: "" };
+              mutate(draft);
+              registeredPackage = draft.package;
+            },
+          }),
+        reload: rec,
+      },
+      model: {
+        transform: async (cb: (e: Editor) => void) => cb({ update: rec, default: { set: rec } }),
+        reload: rec,
+      },
+      integration: {
+        transform: async (cb: (e: Editor) => void) => cb({ update: rec, method: { update: rec } }),
+        connection: { active: async () => null, resolve: async () => null },
+      },
+      aisdk: { hook: rec },
+      session: { hook: rec },
+      event: { subscribe: () => ({ [Symbol.asyncIterator]: async function* () {} }) },
+      tool: { transform: async (cb: (e: Editor) => void) => cb({ add: rec }) },
+      skill: { transform: async (cb: (e: Editor) => void) => cb({ add: rec }), reload: rec },
+    };
+    await (definePlugin("global").setup as (c: unknown) => Promise<unknown>)(ctx);
+    expect(registeredPackage).toMatch(/^aisdk:/);
   });
 
   it("routes a provider/model context through the V2 setup", async () => {

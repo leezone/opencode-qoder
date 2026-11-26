@@ -72,6 +72,17 @@ import { setupV24, type ToolSpec as V2ToolSpec } from "./v2.js";
 
 export { createQoder, QoderLanguageModel };
 
+// OpenCode 2 resolves a provider's SDK by importing `package` and calling its
+// `model(modelID, settings)` export. 1.x looked for a `create*` export instead,
+// which is why createQoder above was enough there. Without this named export
+// V2 fails before the aisdk "language" hook can run:
+//   "Provider package ... does not export model(modelID, settings)"
+// The returned object is the same LanguageModelV3 our hook installs, so both
+// resolution paths land on the identical request-signing implementation.
+export function model(modelID: string, settings: Record<string, unknown> = {}) {
+  return new QoderLanguageModel(modelID, settings as Parameters<typeof createQoder>[0]);
+}
+
 type QoderPluginOptions = PluginOptions & {
   providerID?: string;
   // "global" (default) or "cn"; an alternative to naming the provider qoder-cn.
