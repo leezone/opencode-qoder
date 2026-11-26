@@ -1198,8 +1198,6 @@ export function definePlugin(region: QoderRegion = "global") {
                   }),
                 ).then((r) => ({
                   content: r.output,
-                  metadata: r.data as Record<string, unknown>,
-                  output: r.data as Record<string, unknown>,
                 })),
             },
             {
@@ -1219,8 +1217,6 @@ export function definePlugin(region: QoderRegion = "global") {
                   }),
                 ).then((r) => ({
                   content: r.output,
-                  metadata: r.data as Record<string, unknown>,
-                  output: r.data as Record<string, unknown>,
                 })),
             },
           ];

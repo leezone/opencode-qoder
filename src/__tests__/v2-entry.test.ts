@@ -44,6 +44,49 @@ describe("dual V1/V2 plugin entry", () => {
     expect(language.specificationVersion).toBe("v3");
   });
 
+  it("registers tools as direct tools that return clean results", async () => {
+    // Two real-host findings on 2.4.2: tools without options.codemode=false are
+    // hidden in Code Mode, and a result carrying output/metadata makes the host
+    // drop it ("Tool result missing"). Both regressions would silently remove
+    // qoder_quota / qoder_pat_switch from the model's reach.
+    type Registered = { name: string; options?: Record<string, unknown> };
+    const registered: Registered[] = [];
+    const rec = () => Promise.resolve();
+    const ctx = {
+      options: {},
+      provider: {
+        transform: async (cb: (e: Editor) => void) => cb({ update: rec }),
+        reload: rec,
+      },
+      model: {
+        transform: async (cb: (e: Editor) => void) => cb({ update: rec, default: { set: rec } }),
+        reload: rec,
+      },
+      integration: {
+        transform: async (cb: (e: Editor) => void) => cb({ update: rec, method: { update: rec } }),
+        connection: { active: async () => null, resolve: async () => null },
+      },
+      aisdk: { hook: rec },
+      session: { hook: rec },
+      event: { subscribe: () => ({ [Symbol.asyncIterator]: async function* () {} }) },
+      tool: {
+        transform: async (cb: (e: { add: (t: Registered) => void }) => void) =>
+          cb({
+            add: (t) => {
+              registered.push(t);
+            },
+          }),
+      },
+      skill: { transform: async (cb: (e: Editor) => void) => cb({ add: rec }), reload: rec },
+    };
+    await (definePlugin("global").setup as (c: unknown) => Promise<unknown>)(ctx);
+    expect(registered.length).toBeGreaterThan(0);
+    expect(registered.some((t) => t.name === "qoder_quota")).toBe(true);
+    for (const tool of registered) {
+      expect(tool.options?.codemode).toBe(false);
+    }
+  });
+
   it("registers the provider as an AISDK package", async () => {
     // V2 only bridges AI SDK models when the package carries the `aisdk:`
     // prefix. A plain file:// package is treated as a native provider and

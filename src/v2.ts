@@ -57,10 +57,13 @@ import { reportRoutingPolicy, reportTierList, reportTierSwitch } from "./tier-to
 const SDK_PACKAGE = "aisdk:opencode-qoder";
 
 type Options = Record<string, unknown>;
+// V2's tool executor rejects a result carrying `output` unless the tool was
+// registered with an output schema. These capability tools declare none (their
+// value is the human-readable `content` plus structured `metadata`), so never
+// set `output` -- V1 needs it, V2 must not see it.
 type ToolResult = {
   content: string;
   metadata?: Record<string, unknown>;
-  output?: Record<string, unknown>;
 };
 
 function optionString(options: Options | undefined, key: string): string | undefined {
@@ -126,8 +129,16 @@ async function connectionOptions(ctx: V2Context, id: string): Promise<QoderProvi
   return credential ? credentialToOptions(credential) : {};
 }
 
-// V2 capability tools: same report functions as V1, different registration and
-// output envelope (V2 Tool.Result = { content, metadata, output }).
+// V2 capability tools reuse V1's report functions but return only `content`.
+//
+// Do NOT pass `metadata` here. Verified on OpenCode 2.4.2: when a tool result
+// carries a metadata object whose values include the quota payload's nested
+// structure (buckets, raw API response), the host drops the whole result and
+// the model sees an empty "Tool result missing" -- even though the quota lookup
+// itself succeeded. The human-readable report already lives in `content`, which
+// is what the model reads, so metadata adds no value here and costs correctness.
+// Also never set `output`: V2 rejects an output without a registered output
+// schema ("Tool result declared output without an output schema").
 function capabilityToolV2(
   name: string,
   run: () => Promise<CapabilityReport> | CapabilityReport,
@@ -135,12 +146,10 @@ function capabilityToolV2(
   return Promise.resolve(run())
     .then((report) => ({
       content: report.output,
-      metadata: report.data as Record<string, unknown>,
-      output: report.data as Record<string, unknown>,
     }))
     .catch((error) => {
       const failed = capabilityError(name, error);
-      return { content: failed.output, metadata: failed.data as Record<string, unknown> };
+      return { content: failed.output };
     });
 }
 
@@ -148,8 +157,6 @@ function capabilityToolV2(
 function reportResult(report: CapabilityReport): ToolResult {
   return {
     content: report.output,
-    metadata: report.data as Record<string, unknown>,
-    output: report.data as Record<string, unknown>,
   };
 }
 
@@ -335,6 +342,12 @@ function registerToolsV2(ctx: V2Context, region: QoderRegion, extraSpecs: ToolSp
           name: spec.name,
           description: spec.description,
           input: spec.input as never,
+          // V2's Tool.snapshot moves every tool whose `options.codemode` is not
+          // explicitly false into Code Mode, where it is reachable only through
+          // the `execute` program rather than as a direct tool the model can
+          // call by name. These capability tools are meant to be called directly
+          // (qoder_quota, qoder_pat_switch, ...), so opt them out.
+          options: { codemode: false },
           execute: async (input: Record<string, unknown>, toolCtx: { sessionID?: string }) =>
             (await spec.run(input, toolCtx.sessionID ?? "")) as never,
         } as never);
