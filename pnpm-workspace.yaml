@@ -1,2 +1,9 @@
 allowBuilds:
   msgpackr-extract: true
+minimumReleaseAgeExclude:
+  - '@opencode/ai@2.4.2'
+  - '@opencode/client@2.4.2'
+  - '@opencode/plugin@2.4.2'
+  - '@opencode/protocol@2.4.2'
+  - '@opencode/schema@2.4.2'
+  - '@opencode/util@2.4.2'

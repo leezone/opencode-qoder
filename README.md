@@ -22,6 +22,18 @@ pnpm build
 
 Add the plugin to `opencode.json`, or adjust the path for your config location:
 
+**OpenCode 2.x** (`plugins`, object form; local paths must be directories):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-qoder"],
+  "model": "qoder/auto"
+}
+```
+
+**OpenCode 1.x** (`plugin`, tuple/string form):
+
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
@@ -29,6 +41,9 @@ Add the plugin to `opencode.json`, or adjust the path for your config location:
   "model": "qoder/auto"
 }
 ```
+
+The single package entry supports both contracts: V1 calls `server()`, V2 calls
+`Plugin.define({ id, setup })`, and `setup()` dispatches by context shape.
 
 The plugin registers provider `qoder` and bundles 17 models -- see [Models](#models).
 
@@ -42,6 +57,14 @@ Add a second entry naming the CN provider. The two instances are independent: se
 credential stores, separate model catalogs, separate tier selections.
 
 ```jsonc
+// OpenCode 2.x
+{
+  "plugins": [
+    "opencode-qoder",
+    { "package": "opencode-qoder", "options": { "providerID": "qoder-cn", "region": "cn" } }
+  ]
+}
+// OpenCode 1.x
 {
   "plugin": [
     ["opencode-qoder"],                                     // provider "qoder"

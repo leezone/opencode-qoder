@@ -1,5 +1,9 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+// OpenCode 2.4 uses a different plugin contract (@opencode/plugin, Plugin.define).
+// Type-only import: the runtime shape is detected so this package still loads
+// under both hosts from one default export.
+import { Plugin as PluginV2 } from "@opencode/plugin";
 import { type Hooks, type PluginInput, type PluginOptions, tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "@opencode-ai/plugin/v2/promise";
 import {
@@ -64,6 +68,7 @@ import { forgetSession, recordSessionParent } from "./session-roots.js";
 import { publishSharedApiKey, readShared, readSharedApiKey, writeShared } from "./shared-state.js";
 import { clearAllTiers, getSelectedTier } from "./tier-store.js";
 import { reportRoutingPolicy, reportTierList, reportTierSwitch } from "./tier-tools.js";
+import { setupV24, type ToolSpec as V2ToolSpec } from "./v2.js";
 
 export { createQoder, QoderLanguageModel };
 
@@ -553,10 +558,10 @@ function registerBundledSkills(ctx: PluginContext): void {
   }
 }
 
-// The region this realm serves. setupV2 is a closure over it because
+// The region this realm serves. setupLegacyV2 is a closure over it because
 // ctx.options is opencode's own bag and cannot be extended by the plugin --
 // the region is known from the plugin entry that constructed this setup.
-async function setupV2(ctx: PluginContext, region: QoderRegion): Promise<void> {
+async function setupLegacyV2(ctx: PluginContext, region: QoderRegion): Promise<void> {
   const id = providerIDForRegion(region);
   // Key names only. Records what this instance can see for itself -- ctx.options
   // is empty and ctx exposes no config or provider key, which is why the
@@ -1152,11 +1157,78 @@ function legacyHooks(options?: PluginOptions): Hooks {
 export function definePlugin(region: QoderRegion = "global") {
   const id = providerIDForRegion(region);
   const name = providerNameForRegion(region);
+  // One default export serves both hosts. V1 calls `server()` and ignores
+  // `setup`; V2 calls `setup()` and ignores `server()`. The V2 context has
+  // `provider`/`model` domains where 1.x had `catalog`, so detect the shape
+  // rather than assuming either API -- a wrong guess would silently register
+  // into the wrong domain and leave the provider broken.
+  const setup = (ctx: PluginContext | PluginV2.Context) => {
+    const v2 = ctx as PluginV2.Context;
+    if (v2.provider && v2.model && !("catalog" in ctx)) {
+      // claim.ts is a leaf reachable only from index.ts (see claim.test.ts).
+      // Build the V2 campaign tool specs here and hand them in, so V2 gets
+      // the same marketing surface without making claim a model-path dep.
+      const campaignSpecs: V2ToolSpec[] = claimDisabled()
+        ? []
+        : [
+            {
+              name: "qoder_campaign",
+              description:
+                "Show the Qoder daily campaign as the server describes it: which accounts see it, window start/end, claim status and reward. Read-only.",
+              input: {
+                type: "object",
+                properties: { all: { type: "boolean" } },
+                additionalProperties: false,
+              },
+              run: (input) =>
+                Promise.resolve(
+                  reportCampaigns(capabilityOptions({ providerID: id } as PluginOptions), {
+                    all: input.all === true,
+                  }),
+                ).then((r) => ({
+                  content: r.output,
+                  metadata: r.data as Record<string, unknown>,
+                  output: r.data as Record<string, unknown>,
+                })),
+            },
+            {
+              name: "qoder_claim",
+              description:
+                "Claim today's Qoder campaign reward(s) for accounts that report CLAIMABLE. Pass all to collect across every stored PAT.",
+              input: {
+                type: "object",
+                properties: { all: { type: "boolean" }, reset: { type: "boolean" } },
+                additionalProperties: false,
+              },
+              run: (input) =>
+                Promise.resolve(
+                  runClaim(capabilityOptions({ providerID: id } as PluginOptions), {
+                    all: input.all === true,
+                    reset: input.reset === true,
+                  }),
+                ).then((r) => ({
+                  content: r.output,
+                  metadata: r.data as Record<string, unknown>,
+                  output: r.data as Record<string, unknown>,
+                })),
+            },
+          ];
+      const campaignDir = claimDisabled()
+        ? undefined
+        : fileURLToPath(new URL("../skills-campaign/", import.meta.url));
+      return setupV24(v2, region, campaignSpecs, campaignDir) as never;
+    }
+    return setupLegacyV2(ctx as PluginContext, region) as never;
+  };
+
   return {
-    // The module id must differ per instance: opencode keys loaded plugins by
-    // it, so two entries sharing one id would collapse into one.
-    id: region === "cn" ? "opencode-qoder-cn" : "opencode-qoder",
-    setup: (ctx: PluginContext) => setupV2(ctx, region),
+    // Spread Plugin.define so V2 reads a formally declared id + setup, while
+    // `server()` keeps V1 working from the same default export. V2 ignores
+    // `server`; V1 ignores `setup`.
+    ...PluginV2.define({
+      id: region === "cn" ? "opencode-qoder-cn" : "opencode-qoder",
+      setup: setup as never,
+    }),
     server: async (_input: PluginInput, options?: PluginOptions) =>
       legacyHooks({ providerID: id, providerName: name, ...(options as object) } as PluginOptions),
   };

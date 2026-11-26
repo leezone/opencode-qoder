@@ -122,6 +122,13 @@ src/
 
 ## 4. 插件生命周期
 
+> **OpenCode 1.x 与 2.x**：一个入口同时支持两代插件契约。V1 调 `server()` 返回 hooks，
+> V2 调 `Plugin.define({ id, setup })`。`setup()` 按 context 形态分流：含 `catalog`
+> 走 `setupLegacyV2()`（1.x 的 v2/promise API），含 `provider`/`model` 走 `setupV24()`
+>（`src/v2.ts`，2.4 的域 API）。V2 忽略 `server()`，所以 provider、模型、工具、skill、
+> session 身份与发现定时器都在 `setupV24()` 里用 `ctx.provider.transform` /
+> `ctx.model.transform` / `ctx.tool.transform` / `ctx.event.subscribe()` 重新注册一遍。
+
 opencode 在单个进程中加载此插件 **两次**（legacy 实例 + v2 实例），两个实例不共享模块状态。
 
 ```
